@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.so
+run.log
+run*.log
+time.log
+uv.lock
+*.ptx
+*.o
+run_*.log
+results*.tsv
