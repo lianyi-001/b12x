@@ -125,6 +125,39 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
+def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q_seqlens = [6, 5, 7, 4]
+    cache_seqlens = [97, 81, 113, 68]
+    page_size = 64
+    q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=q_seqlens,
+        cache_seqlens=cache_seqlens,
+        page_size=page_size,
+        seed=29,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens_t,
+        cu_seqlens_q,
+        causal=True,
+    )
+
+    assert plan.num_batch == len(q_seqlens)
+    assert plan.num_q_heads == 8
+    assert plan.num_kv_heads == 1
+    assert plan.qhead_per_kvhead == 8
+    assert plan.seqlen_q_static == sum(q_seqlens)
+    assert plan.seqlen_k_static == page_size * page_table.shape[1]
+    assert plan.logical_q_rows_static == sum(q_seqlens) * 8
+    assert plan.logical_total_q_rows == sum(q_seqlens) * 8
+
+
 def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
     require_sm120()
     clear_attention_caches()

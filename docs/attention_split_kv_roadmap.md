@@ -566,12 +566,12 @@ The architecture reaches milestone 1 when:
 
 ## Concrete Next Tasks
 
-- [ ] Refactor `b12x/integration/attention.py` to introduce explicit plan and workspace objects.
-- [ ] Fix any contiguous-path regression caused by the new split plumbing so both contiguous and paged paths have a consistent contract.
-- [ ] Finish the logical-dimension cleanup in `b12x/attention/forward.py`.
-- [ ] Make split bucket a planner property instead of a raw runtime argument.
-- [ ] Replace the current runtime split reducer with a compiled combine kernel.
-- [ ] Add split-bucket capture and replay tests.
-- [ ] Add a page-count heuristic for `{1, 2, 4, 8}`.
-- [ ] Re-run the FlashInfer comparison and record the new `fa2/b12x` ratios.
+- [x] Refactor `b12x/integration/attention.py` to introduce explicit plan and workspace objects.
+- [x] Fix any contiguous-path regression caused by the new split plumbing so both contiguous and paged paths have a consistent contract.
+- [x] Finish the logical-dimension cleanup in `b12x/attention/forward.py`.
+- [x] Make split bucket a planner property instead of a raw runtime argument.
+- [x] Replace the current runtime split reducer with a compiled combine kernel.
+- [x] Add split-bucket capture and replay tests.
+- [x] Add a page-count heuristic for `{1, 2, 4, 8}`.
+- [x] Re-run the FlashInfer comparison and record the new `fa2/b12x` ratios.
 - [ ] Start the decode-kernel design once the split-bucket planner is stable.

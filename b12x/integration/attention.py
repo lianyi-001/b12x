@@ -84,6 +84,51 @@ def _seq_dims(shape: tuple[int, ...]) -> tuple[tuple[int, ...], int, int, int]:
     raise ValueError(f"expected rank-3 or rank-4 tensor shape, got {shape}")
 
 
+def _attention_logical_dims(
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+) -> tuple[int, int, int, int, int, int, int, int]:
+    batch_dims, seqlen_q, q_heads, _ = _seq_dims(q_shape)
+    _, seqlen_k, kv_heads, _ = _seq_dims(k_shape)
+    num_batch = batch_dims[0] if batch_dims else 1
+    qhead_per_kvhead = q_heads // kv_heads
+    logical_q_rows_static = seqlen_q * qhead_per_kvhead
+    logical_total_q_rows = logical_q_rows_static * num_batch
+    return (
+        num_batch,
+        q_heads,
+        kv_heads,
+        qhead_per_kvhead,
+        seqlen_q,
+        seqlen_k,
+        logical_q_rows_static,
+        logical_total_q_rows,
+    )
+
+
+def _paged_attention_logical_dims(
+    q_shape: tuple[int, ...],
+    k_cache_shape: tuple[int, ...],
+    page_table_shape: tuple[int, ...],
+) -> tuple[int, int, int, int, int, int, int, int]:
+    total_q, q_heads, _ = q_shape
+    _, page_size, kv_heads, _ = k_cache_shape
+    num_batch, max_pages_per_request = page_table_shape
+    qhead_per_kvhead = q_heads // kv_heads
+    logical_q_rows_static = total_q * qhead_per_kvhead
+    logical_total_q_rows = logical_q_rows_static
+    return (
+        num_batch,
+        q_heads,
+        kv_heads,
+        qhead_per_kvhead,
+        total_q,
+        page_size * max_pages_per_request,
+        logical_q_rows_static,
+        logical_total_q_rows,
+    )
+
+
 def _select_tile_shape(head_dim: int, *, causal: bool) -> tuple[int, int]:
     if head_dim <= 64:
         return (128, 128)
@@ -390,6 +435,14 @@ class AttentionPlanKey:
     causal: bool
     tile_m: int
     tile_n: int
+    num_batch: int
+    num_q_heads: int
+    num_kv_heads: int
+    qhead_per_kvhead: int
+    seqlen_q_static: int
+    seqlen_k_static: int
+    logical_q_rows_static: int
+    logical_total_q_rows: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -406,6 +459,14 @@ class PagedAttentionPlanKey:
     tile_m: int
     tile_n: int
     num_splits: int
+    num_batch: int
+    num_q_heads: int
+    num_kv_heads: int
+    qhead_per_kvhead: int
+    seqlen_q_static: int
+    seqlen_k_static: int
+    logical_q_rows_static: int
+    logical_total_q_rows: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -502,10 +563,19 @@ class _AttentionForwardLaunch:
         self._o_stride = _contiguous_stride(q_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
-        _, _, q_heads, head_dim = _seq_dims(q_shape)
-        _, _, kv_heads, head_dim_k = _seq_dims(k_shape)
+        (
+            self._num_batch,
+            q_heads,
+            kv_heads,
+            qhead_per_kvhead,
+            self._seqlen_q_static,
+            self._seqlen_k_static,
+            self._logical_q_rows_static,
+            self._logical_total_q_rows,
+        ) = _attention_logical_dims(q_shape, k_shape)
+        _, _, _, head_dim = _seq_dims(q_shape)
+        _, _, _, head_dim_k = _seq_dims(k_shape)
         _, _, _, head_dim_v = _seq_dims(v_shape)
-        qhead_per_kvhead = q_heads // kv_heads
         if not SM120ForwardKernel.can_implement(
             self._dtype,
             head_dim,
@@ -560,6 +630,9 @@ class _AttentionForwardLaunch:
             o_tensor,
             lse_tensor,
             softmax_scale,
+            logical_num_batch_static=self._num_batch,
+            logical_seqlen_q_static=self._seqlen_q_static,
+            logical_seqlen_k_static=self._seqlen_k_static,
             stream=current_stream,
         )
 
@@ -598,10 +671,19 @@ class _PagedAttentionForwardLaunch:
         self._o_stride = _contiguous_stride(self._o_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
-        _, q_heads, head_dim = q_shape
-        _, page_size, kv_heads, head_dim_k = k_cache_shape
+        (
+            self._num_batch,
+            q_heads,
+            kv_heads,
+            qhead_per_kvhead,
+            self._seqlen_q_static,
+            self._seqlen_k_static,
+            self._logical_q_rows_static,
+            self._logical_total_q_rows,
+        ) = _paged_attention_logical_dims(q_shape, k_cache_shape, page_table_shape)
+        _, _, head_dim = q_shape
+        _, page_size, _, head_dim_k = k_cache_shape
         _, _, v_heads, head_dim_v = v_cache_shape
-        qhead_per_kvhead = q_heads // kv_heads
         if page_size != tile_n:
             raise TypeError(
                 f"b12x paged attention requires page_size == tile_n, got page_size={page_size}, tile_n={tile_n}"
@@ -687,6 +769,9 @@ class _PagedAttentionForwardLaunch:
             mCuSeqlensQ=cu_seqlens_q_tensor,
             mSeqUsedK=cache_seqlens_tensor,
             mPageTable=page_table_tensor,
+            logical_num_batch_static=self._num_batch,
+            logical_seqlen_q_static=self._seqlen_q_static,
+            logical_seqlen_k_static=self._seqlen_k_static,
             stream=current_stream,
         )
 
@@ -883,6 +968,16 @@ def _get_attention_plan(
     tile_m: int,
     tile_n: int,
 ) -> AttentionPlan:
+    (
+        num_batch,
+        num_q_heads,
+        num_kv_heads,
+        qhead_per_kvhead,
+        seqlen_q_static,
+        seqlen_k_static,
+        logical_q_rows_static,
+        logical_total_q_rows,
+    ) = _attention_logical_dims(q_shape, k_shape)
     return AttentionPlan(
         key=AttentionPlanKey(
             q_shape=q_shape,
@@ -893,6 +988,14 @@ def _get_attention_plan(
             causal=causal,
             tile_m=tile_m,
             tile_n=tile_n,
+            num_batch=num_batch,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            qhead_per_kvhead=qhead_per_kvhead,
+            seqlen_q_static=seqlen_q_static,
+            seqlen_k_static=seqlen_k_static,
+            logical_q_rows_static=logical_q_rows_static,
+            logical_total_q_rows=logical_total_q_rows,
         ),
         compiled=_compile_attention(
             q_shape,
@@ -922,6 +1025,16 @@ def _get_paged_attention_plan(
     tile_n: int,
     num_splits: int,
 ) -> PagedAttentionPlan:
+    (
+        num_batch,
+        num_q_heads,
+        num_kv_heads,
+        qhead_per_kvhead,
+        seqlen_q_static,
+        seqlen_k_static,
+        logical_q_rows_static,
+        logical_total_q_rows,
+    ) = _paged_attention_logical_dims(q_shape, k_cache_shape, page_table_shape)
     return PagedAttentionPlan(
         key=PagedAttentionPlanKey(
             q_shape=q_shape,
@@ -936,6 +1049,14 @@ def _get_paged_attention_plan(
             tile_m=tile_m,
             tile_n=tile_n,
             num_splits=num_splits,
+            num_batch=num_batch,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            qhead_per_kvhead=qhead_per_kvhead,
+            seqlen_q_static=seqlen_q_static,
+            seqlen_k_static=seqlen_k_static,
+            logical_q_rows_static=logical_q_rows_static,
+            logical_total_q_rows=logical_total_q_rows,
         ),
         compiled=_compile_paged_attention(
             q_shape,

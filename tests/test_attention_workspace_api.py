@@ -53,6 +53,23 @@ def test_exact_workspace_matches_reference_for_qwen_like_shape() -> None:
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
+def test_contiguous_plan_exposes_logical_gqa_dimensions() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k, v = _make_gqa_inputs((2, 48, 8, 256), kv_heads=1, seed=5)
+    plan = create_attention_plan(q, k, v, causal=True)
+
+    assert plan.num_batch == 2
+    assert plan.num_q_heads == 8
+    assert plan.num_kv_heads == 1
+    assert plan.qhead_per_kvhead == 8
+    assert plan.seqlen_q_static == 48
+    assert plan.seqlen_k_static == 48
+    assert plan.logical_q_rows_static == 48 * 8
+    assert plan.logical_total_q_rows == 2 * 48 * 8
+
+
 def test_right_aligned_causal_multi_tile_shape_matches_reference() -> None:
     require_sm120()
     clear_attention_caches()

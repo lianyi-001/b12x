@@ -475,6 +475,9 @@ class SM120ForwardKernel:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors=None,
         aux_tensors=None,
+        logical_num_batch_static: Int32 = 1,
+        logical_seqlen_q_static: Int32 = 0,
+        logical_seqlen_k_static: Int32 = 0,
         stream: cuda.CUstream = None,
     ):
         assert mCuSeqlensK is None
@@ -513,28 +516,17 @@ class SM120ForwardKernel:
             LSE_layout_transpose = [2, 1, 0] if const_expr(cute.rank(mLSE) == 3) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
 
-        q_tokens_static = mQ.shape[0]
         q_heads_unpacked = mQ.shape[2]
         kv_heads = mK.shape[2]
         logical_num_head = kv_heads if const_expr(self.pack_gqa) else q_heads_unpacked
-        logical_num_block = cute.ceil_div(
-            cute.size(q_tokens_static)
-            * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1),
-            self.tile_m,
+        logical_q_rows_static = logical_seqlen_q_static * (
+            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
         )
+        logical_num_block = cute.ceil_div(logical_q_rows_static, self.tile_m)
         logical_total_q = (
-            cute.size(q_tokens_static)
-            * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+            logical_q_rows_static
             if const_expr(mCuSeqlensQ is not None)
-            else (
-                cute.size(q_tokens_static)
-                * (
-                    cute.size(mQ.shape[3])
-                    if const_expr(cute.rank(mQ) == 4)
-                    else Int32(1)
-                )
-                * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
-            )
+            else logical_q_rows_static * logical_num_batch_static
         )
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
@@ -575,12 +567,12 @@ class SM120ForwardKernel:
             num_block=logical_num_block,
             num_head=logical_num_head,
             num_batch=(
-                cute.size(mQ.shape[3])
+                logical_num_batch_static
                 if const_expr(mCuSeqlensQ is None)
                 else mCuSeqlensQ.shape[0] - 1
             ),
             num_splits=self.num_splits,
-            seqlen_k=mK.shape[0] if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
+            seqlen_k=logical_seqlen_k_static,
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
             total_q=logical_total_q,
@@ -647,6 +639,8 @@ class SM120ForwardKernel:
             tile_sched_params,
             TileScheduler,
             SharedStorage,
+            logical_seqlen_q_static,
+            logical_seqlen_k_static,
             aux_tensors,
         ).launch(
             grid=grid_dim,
@@ -688,6 +682,8 @@ class SM120ForwardKernel:
         tile_sched_params,
         TileScheduler: cutlass.Constexpr,
         SharedStorage: cutlass.Constexpr,
+        logical_seqlen_q_static: Int32,
+        logical_seqlen_k_static: Int32,
         aux_tensors=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -746,8 +742,8 @@ class SM120ForwardKernel:
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0] if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
+            seqlen_q_static=logical_seqlen_q_static,
+            seqlen_k_static=logical_seqlen_k_static,
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
