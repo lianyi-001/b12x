@@ -193,7 +193,7 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     cols_pad_k = tp_moe.align_up(spec.hidden_size // tp_moe._NVFP4_BLOCK_SIZE, 4)
 
     assert tuple(workspace.token_map.shape) == (rows_padded,)
-    assert tuple(workspace.token_weights_map.shape) == (rows_padded,)
+    assert tuple(workspace.token_weights.shape) == (rows_padded,)
     assert tuple(workspace.packed_input.shape) == (1, rows_padded, spec.hidden_size // 2)
     assert tuple(workspace.packed_input_scale.shape) == (rows_padded, cols_pad_k)
     assert tuple(workspace.expert_write_rows.shape) == (spec.num_experts,)

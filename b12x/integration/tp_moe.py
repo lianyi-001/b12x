@@ -33,9 +33,9 @@ class TPMoEWorkspace:
     num_topk: int
     device: torch.device
     dtype: torch.dtype
-    expert_counts: torch.Tensor
+    row_counts: torch.Tensor
     token_map: torch.Tensor
-    token_weights_map: torch.Tensor
+    token_weights: torch.Tensor
     packed_input: torch.Tensor
     packed_input_scale: torch.Tensor
     barrier_count: torch.Tensor
@@ -117,7 +117,6 @@ _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
-_LAST_STATIC_EXECUTION_ARGS: Tuple = (None, None, None)  # (cache_key, exe_args, adapted_args)
 
 
 def clear_tp_moe_caches() -> None:
@@ -126,14 +125,13 @@ def clear_tp_moe_caches() -> None:
     Explicit workspaces and workspace pools are caller-owned and intentionally
     unaffected by this helper.
     """
-    global _LAST_WEIGHTS, _LAST_KERNEL, _LAST_STATIC_EXECUTION_ARGS
+    global _LAST_WEIGHTS, _LAST_KERNEL
     _WEIGHT_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
     _PLAIN_PARAM_CACHE.clear()
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
-    _LAST_STATIC_EXECUTION_ARGS = (None, None, None)
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -179,10 +177,6 @@ def _get_dynamic_chunk_multiplier() -> int:
     return _DYNAMIC_CHUNK_MULTIPLIER_CACHE
 
 
-def _tensor_arg_key(t: torch.Tensor) -> tuple:
-    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
-
-
 def _flatten_routing_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     flat_ids = topk_ids.view(-1)
     if flat_ids.dtype not in (torch.int32, torch.int64):
@@ -226,58 +220,6 @@ def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None)
     plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
     _PLAIN_PARAM_CACHE[key] = plain
     return plain
-
-
-def _get_cached_static_execution_args(
-    compiled,
-    a: torch.Tensor,
-    flat_ids: torch.Tensor,
-    flat_weights: torch.Tensor,
-    s: TPCompactStaticWorkspace,
-    wv: _WeightViews,
-    input_gs: torch.Tensor,
-    w1_alpha: torch.Tensor,
-    w2_alpha: torch.Tensor,
-    down_input_scale: torch.Tensor,
-    scatter_output: torch.Tensor,
-    mac: int,
-    stream,
-):
-    global _LAST_STATIC_EXECUTION_ARGS
-    cache_key = (
-        id(compiled),
-        _tensor_arg_key(a),
-        _tensor_arg_key(flat_ids),
-        _tensor_arg_key(flat_weights),
-        id(s),
-        id(wv),
-        None if s.global_to_local_expert is None else _tensor_arg_key(s.global_to_local_expert),
-        _tensor_arg_key(input_gs),
-        _tensor_arg_key(w1_alpha),
-        _tensor_arg_key(w2_alpha),
-        _tensor_arg_key(down_input_scale),
-        _tensor_arg_key(scatter_output),
-        mac,
-        int(stream),
-    )
-    last_key, last_exe_args, last_adapted_args = _LAST_STATIC_EXECUTION_ARGS
-    if last_key == cache_key:
-        return last_exe_args, last_adapted_args
-
-    exe_args, adapted_args = compiled.generate_execution_args(
-        a, flat_ids, flat_weights,
-        s.packed_a_view, s.sfa_ptr,
-        s.packed_a_flat, s.scale_flat,
-        s.barrier_count, s.barrier_epoch,
-        wv.w13_fp4, wv.sfb_w13_ptr,
-        wv.down_fp4, wv.sfb_down_ptr,
-        s.expert_counts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert,
-        input_gs, w1_alpha, w2_alpha, down_input_scale,
-        scatter_output, s.token_map, s.token_weights_map,
-        mac, stream,
-    )
-    _LAST_STATIC_EXECUTION_ARGS = (cache_key, exe_args, adapted_args)
-    return exe_args, adapted_args
 
 
 def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
@@ -429,7 +371,7 @@ def _alloc_workspace(
         num_topk=num_topk,
         device=device,
         dtype=dtype,
-        expert_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
+        row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
         barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
         barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
     )
@@ -439,7 +381,7 @@ def _alloc_workspace(
         workspace = TPCompactStaticWorkspace(
             **common_kwargs,
             token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
-            token_weights_map=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
+            token_weights=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
             packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
             packed_input_scale=torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
             active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
@@ -454,7 +396,7 @@ def _alloc_workspace(
     workspace = TPDynamicWorkspace(
         **common_kwargs,
         token_map=torch.zeros(dynamic_rows_padded, dtype=torch.int32, device=device),
-        token_weights_map=torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device),
+        token_weights=torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device),
         packed_input=torch.empty(1, dynamic_rows_padded, k // 2, dtype=torch.uint8, device=device),
         packed_input_scale=torch.empty(dynamic_rows_padded, cols_pad_k, dtype=torch.uint8, device=device),
         expert_write_rows=torch.zeros(state_E, dtype=torch.int32, device=device),
@@ -1113,6 +1055,101 @@ def _get_dynamic_kernel(
     return result
 
 
+def _launch_dynamic(
+    *,
+    workspace: TPDynamicWorkspace,
+    weights: _WeightViews,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    scatter_output: torch.Tensor,
+    E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    stream,
+) -> None:
+    effective_mac = _get_impl_mac("dynamic")
+    if not _dynamic_multicta_enabled():
+        effective_mac = 1
+    compiled, mac = _get_dynamic_kernel(
+        E, m, k, n, num_topk, max_rows,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        mac_override=effective_mac,
+    )
+    compiled(
+        a, flat_ids, flat_weights,
+        workspace.packed_a_view, workspace.sfa_ptr, workspace.packed_a_flat, workspace.scale_flat,
+        workspace.barrier_count, workspace.barrier_epoch,
+        workspace.pair_head, workspace.producers_done_count, workspace.all_work_published,
+        workspace.task_head, workspace.task_tail, workspace.task_ready,
+        workspace.task_expert, workspace.task_m_tile,
+        workspace.task_slice_begin, workspace.task_slice_count, workspace.task_valid_rows,
+        workspace.tile_write_count,
+        weights.w13_fp4, weights.sfb_w13_ptr,
+        weights.down_fp4, weights.sfb_down_ptr,
+        workspace.row_counts, workspace.expert_write_rows, workspace.expert_tile_base,
+        workspace.input_gs, weights.w1_alpha, weights.w2_alpha, workspace.down_input_scale,
+        scatter_output, workspace.token_map, workspace.token_weights,
+        mac, stream,
+    )
+
+
+def _launch_compact_static(
+    *,
+    workspace: TPCompactStaticWorkspace,
+    weights: _WeightViews,
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    state_max_rows: int,
+    routed_rows: int,
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    stream,
+) -> None:
+    static_mac = None
+    if routed_rows < 40:
+        # Tiny compact launches have very little FC2 tile work, so capping
+        # resident clusters avoids idle CTA participation in the barrier phases.
+        static_mac = min(_get_impl_mac("static"), 64)
+    compiled, mac = _get_static_kernel(
+        workspace.state_E, weight_E, m, k, n, num_topk, state_max_rows,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        mac_override=static_mac,
+    )
+    compiled(
+        a, flat_ids, flat_weights,
+        workspace.packed_a_view, workspace.sfa_ptr,
+        workspace.packed_a_flat, workspace.scale_flat,
+        workspace.barrier_count, workspace.barrier_epoch,
+        weights.w13_fp4, weights.sfb_w13_ptr,
+        weights.down_fp4, weights.sfb_down_ptr,
+        workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
+        input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
+        scatter_output, workspace.token_map, workspace.token_weights,
+        mac, stream,
+    )
+
+
 def b12x_moe_fp4(
     a: torch.Tensor,           # [m, k] bf16 activations
     a1_gscale: torch.Tensor,   # [E] or scalar — input quant scale
@@ -1237,8 +1274,6 @@ def b12x_moe_fp4(
             k,
         )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
-        w1_alpha = wv.w1_alpha
-        w2_alpha = wv.w2_alpha
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
     else:
         assert isinstance(s, TPDynamicWorkspace)
@@ -1253,8 +1288,6 @@ def b12x_moe_fp4(
             k,
         )
         input_gs = s.input_gs
-        w1_alpha = wv.w1_alpha
-        w2_alpha = wv.w2_alpha
         down_input_scale = s.down_input_scale
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
@@ -1275,60 +1308,44 @@ def b12x_moe_fp4(
         raise ValueError("output must be contiguous")
 
     if impl == "dynamic":
-        effective_mac = _get_impl_mac("dynamic")
-        if not _dynamic_multicta_enabled():
-            effective_mac = 1
-        compiled, mac = _get_dynamic_kernel(
-            E, m, k, n, num_topk, max_rows,
+        _launch_dynamic(
+            workspace=s,
+            weights=wv,
+            a=a,
+            flat_ids=flat_ids,
+            flat_weights=flat_weights,
+            scatter_output=scatter_output,
+            E=E,
+            m=m,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            max_rows=max_rows,
             topk_ids_dtype=flat_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
-            mac_override=effective_mac,
-        )
-        compiled(
-            a, flat_ids, flat_weights,
-            s.packed_a_view, s.sfa_ptr, s.packed_a_flat, s.scale_flat,
-            s.barrier_count, s.barrier_epoch,
-            s.pair_head, s.producers_done_count, s.all_work_published,
-            s.task_head, s.task_tail, s.task_ready,
-            s.task_expert, s.task_m_tile,
-            s.task_slice_begin, s.task_slice_count, s.task_valid_rows,
-            s.tile_write_count,
-            wv.w13_fp4, wv.sfb_w13_ptr,
-            wv.down_fp4, wv.sfb_down_ptr,
-            s.expert_counts, s.expert_write_rows, s.expert_tile_base,
-            s.input_gs, wv.w1_alpha, wv.w2_alpha, s.down_input_scale,
-            scatter_output, s.token_map, s.token_weights_map,
-            mac, stream,
+            stream=stream,
         )
     else:
-        static_mac = None
-        if routed_rows < 40:
-            # Tiny compact launches have very little FC2 tile work, so capping
-            # resident clusters avoids idle CTA participation in the barrier phases.
-            static_mac = min(_get_impl_mac("static"), 64)
-        compiled, mac = _get_static_kernel(
-            state_E, weight_E, m, k, n, num_topk, state_max_rows,
+        _launch_compact_static(
+            workspace=s,
+            weights=wv,
+            a=a,
+            flat_ids=flat_ids,
+            flat_weights=flat_weights,
+            input_gs=input_gs,
+            down_input_scale=down_input_scale,
+            scatter_output=scatter_output,
+            weight_E=weight_E,
+            m=m,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            state_max_rows=state_max_rows,
+            routed_rows=routed_rows,
             topk_ids_dtype=flat_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
-            mac_override=static_mac,
+            stream=stream,
         )
-        exe_args, adapted_args = _get_cached_static_execution_args(
-            compiled,
-            a,
-            flat_ids,
-            flat_weights,
-            s,
-            wv,
-            input_gs,
-            w1_alpha,
-            w2_alpha,
-            down_input_scale,
-            scatter_output,
-            mac,
-            stream,
-        )
-        _ = adapted_args
-        compiled.run_compiled_program(exe_args)
     return scatter_output

@@ -7,7 +7,7 @@ The result is still a two-phase algorithm, just without a host-side handoff:
 
   Phase 0: cooperative init / clear row counts
   Phase 1: walk routed (token, topk_slot) pairs, append rows per expert,
-           write token_map + token_weights_map, and quantize each routed
+           write token_map + token_weights, and quantize each routed
            token row directly into expert-major packed A + scale storage
   Barrier: resident-grid barrier after all expert rows are finalized
   Phase 2: run the FC1 -> SiLU -> quant -> FC2 -> scatter datapath
@@ -25,7 +25,7 @@ What changes relative to the old split path:
   the compute launch used to expect the frontend to have already produced:
     - expert row counts
     - expert-major packed A
-    - token_map / token_weights_map
+    - token_map / token_weights
   static.py builds those GPU-side before entering the same grouped compute
   schedule. That is why this file owns the resident-grid barriers and the
   route/pack bookkeeping itself.
@@ -615,7 +615,7 @@ class MoEStaticKernel:
         sfb_w13_ptr: cute.Pointer,     # scale factors for concatenated w13
         b_down: cute.Tensor,           # [K, I_tp, E]
         sfb_down_ptr: cute.Pointer,
-        row_counts: cute.Tensor,       # expert_counts [E]
+        row_counts: cute.Tensor,       # [state_E] routed rows per local expert
         active_expert_count: cute.Tensor,  # [1] active expert count
         weight_expert_ids: cute.Tensor,  # [E] local expert id -> global weight expert id
         global_to_local_expert: cute.Tensor,  # [weight_E] global expert id -> local expert id
