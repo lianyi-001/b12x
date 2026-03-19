@@ -27,7 +27,6 @@ class BlockInfo:
         split_idx: Int32 = 0,
         num_splits: Int32 = 1,
     ) -> Tuple[Int32, Int32]:
-        del split_idx, num_splits
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             m_idx_max = (m_block + 1) * self.tile_m
@@ -44,6 +43,13 @@ class BlockInfo:
             n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
+        if const_expr(self.is_split_kv):
+            total_blocks = cutlass.max(n_block_max - n_block_min, 0)
+            chunk = cute.ceil_div(total_blocks, num_splits)
+            split_max = n_block_max - split_idx * chunk
+            split_min = cutlass.max(n_block_min, split_max - chunk)
+            n_block_max = cutlass.max(cutlass.min(split_max, n_block_max), n_block_min)
+            n_block_min = cutlass.max(n_block_min, split_min)
         return n_block_min, n_block_max
 
     @cute.jit

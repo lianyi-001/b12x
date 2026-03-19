@@ -188,6 +188,7 @@ def _capture_b12x_graph(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    num_splits: int,
     warmup: int,
 ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
     workspace = allocate_paged_attention_workspace(
@@ -198,6 +199,7 @@ def _capture_b12x_graph(
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
+        num_splits=num_splits,
     )
 
     def run() -> None:
@@ -323,6 +325,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
+    parser.add_argument("--num-splits", type=int, default=1)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
     parser.add_argument("--check", action="store_true")
@@ -354,6 +357,7 @@ def main() -> None:
             "kv_heads": args.kv_heads,
             "head_dim": args.head_dim,
             "dtype": str(dtype),
+            "num_splits": args.num_splits,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
         },
@@ -381,6 +385,7 @@ def main() -> None:
             page_table=page_table,
             cache_seqlens=cache_seqlens_tensor,
             cu_seqlens_q=cu_seqlens_q,
+            num_splits=args.num_splits,
             warmup=args.warmup,
         )
         b12x_times_ms = _bench_graph(b12x_graph, replays=args.replays)
@@ -427,6 +432,7 @@ def main() -> None:
             f"bs={case.batch:2d} "
             f"q={case.q_seqlen:2d} "
             f"k={case.cache_seqlen:5d} "
+            f"splits={args.num_splits:2d} "
             f"| b12x median={b12x_metrics.median_us:8.1f} us min={b12x_metrics.min_us:8.1f} us"
         )
         if flashinfer_metrics is not None:

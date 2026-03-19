@@ -112,6 +112,7 @@ class SM120ForwardKernel:
         tile_m: int = 128,
         tile_n: int = 128,
         num_stages: int = 1,
+        num_splits: int = 1,
         num_threads: int = 160,
         Q_in_regs: bool = False,
         score_mod: Optional[cutlass.Constexpr] = None,
@@ -136,6 +137,8 @@ class SM120ForwardKernel:
         self.tile_n = tile_n
         self.num_threads = num_threads
         self.num_stages = num_stages
+        self.num_splits = num_splits
+        self.is_split_kv = num_splits > 1
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
@@ -361,6 +364,7 @@ class SM120ForwardKernel:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        split_idx: Int32 = 0,
     ):
         del tma_atom_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
@@ -387,7 +391,12 @@ class SM120ForwardKernel:
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
             else:
                 offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
+                mLSE_select = (
+                    mLSE[None, head_idx, split_idx]
+                    if const_expr(self.is_split_kv)
+                    else mLSE[None, head_idx]
+                )
+                mLSE_cur = cute.domain_offset((offset,), mLSE_select)
             if const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 gLSE_expanded_layout = cute.append(
@@ -412,7 +421,12 @@ class SM120ForwardKernel:
             mO_cur = mO[None, None, head_idx, batch_idx]
         else:
             offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-            mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
+            mO_select = (
+                mO[None, None, head_idx, split_idx]
+                if const_expr(self.is_split_kv)
+                else mO[None, None, head_idx]
+            )
+            mO_cur = cute.domain_offset((offset, 0), mO_select)
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
@@ -499,6 +513,30 @@ class SM120ForwardKernel:
             LSE_layout_transpose = [2, 1, 0] if const_expr(cute.rank(mLSE) == 3) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
 
+        q_tokens_static = mQ.shape[0]
+        q_heads_unpacked = mQ.shape[2]
+        kv_heads = mK.shape[2]
+        logical_num_head = kv_heads if const_expr(self.pack_gqa) else q_heads_unpacked
+        logical_num_block = cute.ceil_div(
+            cute.size(q_tokens_static)
+            * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1),
+            self.tile_m,
+        )
+        logical_total_q = (
+            cute.size(q_tokens_static)
+            * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+            if const_expr(mCuSeqlensQ is not None)
+            else (
+                cute.size(q_tokens_static)
+                * (
+                    cute.size(mQ.shape[3])
+                    if const_expr(cute.rank(mQ) == 4)
+                    else Int32(1)
+                )
+                * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+            )
+        )
+
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -534,30 +572,25 @@ class SM120ForwardKernel:
             else SingleTileScheduler
         )
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
-            num_head=cute.size(mQ.shape[2]),
+            num_block=logical_num_block,
+            num_head=logical_num_head,
             num_batch=(
                 cute.size(mQ.shape[3])
                 if const_expr(mCuSeqlensQ is None)
-                else cute.size(mCuSeqlensQ.shape[0] - 1)
+                else mCuSeqlensQ.shape[0] - 1
             ),
-            num_splits=1,
+            num_splits=self.num_splits,
             seqlen_k=mK.shape[0] if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
-            total_q=cute.size(mQ.shape[0])
-            if const_expr(mCuSeqlensQ is not None)
-            else (
-                cute.size(mQ.shape[0]) * cute.size(mQ.shape[3])
-                if const_expr(cute.rank(mQ) == 4)
-                else cute.size(mQ.shape[0])
-            ),
+            total_q=logical_total_q,
             tile_shape_mn=(self.tile_m, self.tile_n),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             element_size=self.dtype.width // 8,
             lpt=self.is_causal or self.is_local,
+            is_split_kv=self.is_split_kv,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -706,7 +739,7 @@ class SM120ForwardKernel:
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -803,7 +836,7 @@ class SM120ForwardKernel:
                     number_of_threads=self.num_threads,
                 )
                 wait_for_q_consumed = False
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(cute.rank(mQ) == 4):
                 mQ_batch = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)
@@ -846,7 +879,9 @@ class SM120ForwardKernel:
             )
             load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
 
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, self.num_splits
+            )
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_bytes["Q"])
             load_Q(tma_bar_ptr=mbar_ptr_Q)
@@ -1004,7 +1039,7 @@ class SM120ForwardKernel:
         )
         q_consumer_phase = Int32(0)
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
             q_consumer_phase ^= 1
@@ -1043,7 +1078,9 @@ class SM120ForwardKernel:
                 mask_mod=self.mask_mod,
             )
 
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, self.num_splits
+            )
             if n_block_max > n_block_min:
                 kv_consumer_state = self.mma_one_n_block(
                     n_block_max - 1,
@@ -1153,6 +1190,7 @@ class SM120ForwardKernel:
                 m_block,
                 head_idx,
                 batch_idx,
+                split_idx,
             )
 
             if const_expr(not self.Q_in_regs):

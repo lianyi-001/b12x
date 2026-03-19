@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from b12x.attention.reference import attention_reference, paged_attention_reference
@@ -47,7 +48,9 @@ def test_contiguous_attention_replays_under_cuda_graph() -> None:
     assert _cosine_similarity(workspace.output, ref_out) >= 0.99999
 
 
-def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata() -> None:
+@torch.inference_mode()
+@pytest.mark.parametrize("num_splits", [1, 4])
+def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_splits: int) -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -65,6 +68,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata() -> Non
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
+        num_splits=num_splits,
     )
 
     b12x_paged_attention_forward(

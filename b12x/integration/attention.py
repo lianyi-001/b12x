@@ -55,6 +55,21 @@ def _paged_lse_storage_shape(q_shape: tuple[int, ...]) -> tuple[int, int]:
     return (q_heads, total_q)
 
 
+def _split_paged_output_shape(q_shape: tuple[int, ...], *, num_splits: int) -> tuple[int, ...]:
+    if num_splits == 1:
+        return q_shape
+    return (num_splits, *q_shape)
+
+
+def _split_paged_lse_storage_shape(
+    q_shape: tuple[int, ...], *, num_splits: int
+) -> tuple[int, ...]:
+    base = _paged_lse_storage_shape(q_shape)
+    if num_splits == 1:
+        return base
+    return (num_splits, *base)
+
+
 def _seq_dims(shape: tuple[int, ...]) -> tuple[tuple[int, ...], int, int, int]:
     if len(shape) == 3:
         seqlen, num_heads, head_dim = shape
@@ -287,8 +302,11 @@ class PagedAttentionWorkspace:
     causal: bool
     tile_m: int
     tile_n: int
+    num_splits: int
     output: torch.Tensor
     lse: torch.Tensor
+    split_output: torch.Tensor | None = None
+    split_lse: torch.Tensor | None = None
 
 
 class _AttentionForwardLaunch:
@@ -390,6 +408,7 @@ class _PagedAttentionForwardLaunch:
         causal: bool,
         tile_m: int,
         tile_n: int,
+        num_splits: int,
     ):
         self._q_shape = q_shape
         self._k_cache_shape = k_cache_shape
@@ -397,15 +416,16 @@ class _PagedAttentionForwardLaunch:
         self._page_table_shape = page_table_shape
         self._cache_seqlens_shape = cache_seqlens_shape
         self._cu_seqlens_q_shape = cu_seqlens_q_shape
-        self._o_shape = q_shape
-        self._lse_shape = _paged_lse_storage_shape(q_shape)
+        self._num_splits = num_splits
+        self._o_shape = _split_paged_output_shape(q_shape, num_splits=num_splits)
+        self._lse_shape = _split_paged_lse_storage_shape(q_shape, num_splits=num_splits)
         self._q_stride = _contiguous_stride(q_shape)
         self._k_cache_stride = _contiguous_stride(k_cache_shape)
         self._v_cache_stride = _contiguous_stride(v_cache_shape)
         self._page_table_stride = _contiguous_stride(page_table_shape)
         self._cache_seqlens_stride = _contiguous_stride(cache_seqlens_shape)
         self._cu_seqlens_q_stride = _contiguous_stride(cu_seqlens_q_shape)
-        self._o_stride = _contiguous_stride(q_shape)
+        self._o_stride = _contiguous_stride(self._o_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
         _, q_heads, head_dim = q_shape
@@ -443,6 +463,7 @@ class _PagedAttentionForwardLaunch:
             pack_gqa=qhead_per_kvhead != 1,
             tile_m=tile_m,
             tile_n=tile_n,
+            num_splits=num_splits,
         )
         assert head_dim == head_dim_k
 
@@ -509,6 +530,7 @@ def _get_compiled_attention(
     causal: bool,
     tile_m: int,
     tile_n: int,
+    num_splits: int,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _AttentionForwardLaunch(
@@ -519,6 +541,7 @@ def _get_compiled_attention(
         causal=causal,
         tile_m=tile_m,
         tile_n=tile_n,
+        num_splits=num_splits,
     )
     return cute.compile(
         launch,
@@ -544,6 +567,7 @@ def _get_compiled_paged_attention(
     causal: bool,
     tile_m: int,
     tile_n: int,
+    num_splits: int,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _PagedAttentionForwardLaunch(
@@ -557,6 +581,7 @@ def _get_compiled_paged_attention(
         causal=causal,
         tile_m=tile_m,
         tile_n=tile_n,
+        num_splits=num_splits,
     )
     return cute.compile(
         launch,
@@ -631,6 +656,36 @@ def _validate_paged_workspace(
             "paged workspace shape mismatch: "
             f"expected q/k_cache/v_cache/page_table/device/dtype/causal={expected}, got {actual}"
         )
+    if workspace.num_splits < 1:
+        raise ValueError(f"paged workspace num_splits must be >= 1, got {workspace.num_splits}")
+    if tuple(workspace.output.shape) != q_shape:
+        raise ValueError(
+            f"paged workspace output shape mismatch: expected {q_shape}, got {tuple(workspace.output.shape)}"
+        )
+    expected_lse_shape = _paged_lse_storage_shape(q_shape)
+    if tuple(workspace.lse.shape) != expected_lse_shape:
+        raise ValueError(
+            "paged workspace lse shape mismatch: "
+            f"expected {expected_lse_shape}, got {tuple(workspace.lse.shape)}"
+        )
+    if workspace.num_splits == 1:
+        if workspace.split_output is not None or workspace.split_lse is not None:
+            raise ValueError("paged workspace with num_splits=1 must not carry split scratch buffers")
+    else:
+        expected_split_output_shape = _split_paged_output_shape(q_shape, num_splits=workspace.num_splits)
+        expected_split_lse_shape = _split_paged_lse_storage_shape(q_shape, num_splits=workspace.num_splits)
+        if workspace.split_output is None or workspace.split_lse is None:
+            raise ValueError("paged workspace with num_splits>1 requires split scratch buffers")
+        if tuple(workspace.split_output.shape) != expected_split_output_shape:
+            raise ValueError(
+                "paged workspace split_output shape mismatch: "
+                f"expected {expected_split_output_shape}, got {tuple(workspace.split_output.shape)}"
+            )
+        if tuple(workspace.split_lse.shape) != expected_split_lse_shape:
+            raise ValueError(
+                "paged workspace split_lse shape mismatch: "
+                f"expected {expected_split_lse_shape}, got {tuple(workspace.split_lse.shape)}"
+            )
 
 
 def _allocate_workspace(
@@ -671,9 +726,23 @@ def _allocate_paged_workspace(
     causal: bool,
     tile_m: int,
     tile_n: int,
+    num_splits: int,
 ) -> PagedAttentionWorkspace:
     output = torch.empty(q_shape, dtype=dtype, device=device)
     lse = torch.empty(_paged_lse_storage_shape(q_shape), dtype=torch.float32, device=device)
+    split_output = None
+    split_lse = None
+    if num_splits > 1:
+        split_output = torch.empty(
+            _split_paged_output_shape(q_shape, num_splits=num_splits),
+            dtype=dtype,
+            device=device,
+        )
+        split_lse = torch.empty(
+            _split_paged_lse_storage_shape(q_shape, num_splits=num_splits),
+            dtype=torch.float32,
+            device=device,
+        )
     return PagedAttentionWorkspace(
         q_shape=q_shape,
         k_cache_shape=k_cache_shape,
@@ -684,8 +753,11 @@ def _allocate_paged_workspace(
         causal=causal,
         tile_m=tile_m,
         tile_n=tile_n,
+        num_splits=num_splits,
         output=output,
         lse=lse,
+        split_output=split_output,
+        split_lse=split_lse,
     )
 
 
@@ -723,8 +795,11 @@ def allocate_paged_attention_workspace(
     *,
     causal: bool = True,
     tile_shape: tuple[int, int] | None = None,
+    num_splits: int = 1,
 ) -> PagedAttentionWorkspace:
     """Allocate one exact workspace for the page-size-64 SGLang paged path."""
+    if num_splits < 1:
+        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
     (
         q_shape,
         k_cache_shape,
@@ -765,7 +840,19 @@ def allocate_paged_attention_workspace(
         causal=causal,
         tile_m=tile_m,
         tile_n=tile_n,
+        num_splits=num_splits,
     )
+
+
+def _reduce_split_partials(workspace: PagedAttentionWorkspace) -> None:
+    assert workspace.split_output is not None
+    assert workspace.split_lse is not None
+    split_lse_token_major = workspace.split_lse.permute(0, 2, 1)
+    final_lse = torch.logsumexp(split_lse_token_major, dim=0)
+    weights = torch.exp(split_lse_token_major - final_lse.unsqueeze(0)).unsqueeze(-1)
+    reduced_out = torch.sum(workspace.split_output.to(torch.float32) * weights, dim=0)
+    workspace.output.copy_(reduced_out.to(workspace.dtype))
+    workspace.lse.copy_(final_lse.transpose(0, 1))
 
 
 def b12x_attention_forward(
@@ -875,20 +962,27 @@ def b12x_paged_attention_forward(
         workspace.causal,
         workspace.tile_m,
         workspace.tile_n,
+        workspace.num_splits,
     )
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
+    kernel_output = workspace.output if workspace.num_splits == 1 else workspace.split_output
+    kernel_lse = workspace.lse if workspace.num_splits == 1 else workspace.split_lse
+    assert kernel_output is not None
+    assert kernel_lse is not None
     compiled(
         make_ptr(cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass_dtype, k_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass_dtype, v_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, workspace.output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Float32, workspace.lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass_dtype, kernel_output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float32, kernel_lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cache_seqlens.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, page_table.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         float(softmax_scale),
         current_cuda_stream(),
     )
+    if workspace.num_splits > 1:
+        _reduce_split_partials(workspace)
     return workspace.output, workspace.lse.transpose(0, 1)
 
 

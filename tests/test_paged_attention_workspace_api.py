@@ -75,7 +75,8 @@ def _make_paged_inputs(
     return q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q
 
 
-def test_paged_workspace_matches_reference_for_qwen_like_extend_shape() -> None:
+@pytest.mark.parametrize("num_splits", [1, 4])
+def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits: int) -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -93,6 +94,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape() -> None:
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
+        num_splits=num_splits,
     )
     out, lse = b12x_paged_attention_forward(
         q,
@@ -181,6 +183,30 @@ def test_single_token_single_key_paged_corner_is_rejected() -> None:
             cache_seqlens,
             cu_seqlens_q,
             causal=True,
+        )
+
+
+def test_invalid_num_splits_is_rejected() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4, 4],
+        cache_seqlens=[64, 64],
+        page_size=64,
+        seed=71,
+    )
+
+    with pytest.raises(ValueError, match="num_splits must be >= 1"):
+        allocate_paged_attention_workspace(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            causal=True,
+            num_splits=0,
         )
 
 
