@@ -181,6 +181,7 @@ class PagedKernelConfig:
 def _select_paged_kernel_config(
     head_dim: int,
     *,
+    kv_dtype: torch.dtype,
     causal: bool,
     page_size: int,
     mode: Literal["decode", "extend"],
@@ -199,6 +200,13 @@ def _select_paged_kernel_config(
         tile_m, tile_n = (128, 64)
     elif mode == "decode" and head_dim == 256 and max_pages <= 4:
         tile_m, tile_n = (16, 64)
+    elif (
+        mode == "decode"
+        and head_dim == 256
+        and kv_dtype == _FP8_KV_DTYPE
+        and max_pages >= 128
+    ):
+        tile_m, tile_n = (16, 64)
     elif head_dim == 256:
         tile_m, tile_n = (64, 64)
     else:
@@ -212,6 +220,20 @@ def _select_paged_kernel_config(
             tile_m=tile_m,
             tile_n=tile_n,
             num_compute_warps=1,
+            num_stages=1,
+            q_in_regs=True,
+        )
+    if (
+        mode == "decode"
+        and head_dim == 256
+        and kv_dtype == _FP8_KV_DTYPE
+        and max_pages >= 128
+    ):
+        return PagedKernelConfig(
+            kernel_family="main",
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_compute_warps=2,
             num_stages=1,
             q_in_regs=True,
         )
@@ -1689,6 +1711,7 @@ def create_paged_attention_plan(
     _, _, head_dim = q_shape
     kernel_config = _select_paged_kernel_config(
         head_dim,
+        kv_dtype=kv_dtype,
         causal=causal,
         page_size=page_size,
         mode=mode,
