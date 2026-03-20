@@ -260,8 +260,28 @@ def warp_mma_gemm_rs_mxfp8(
         num_n_tiles = num_b_words  # 1 u32 per n_tile per k-step
 
         for m in cutlass.range_constexpr(num_m_tiles):
-            # Quantize this m-tile's A registers for k=32
+            # Quantize this m-tile's A registers for k=32.
+            #
+            # BF16 m16n8k16 A-fragment layout per m-tile (4 u32):
+            #   reg0: rows 0-1, k[0:4] as bf16x2
+            #   reg1: rows 0-1, k[4:8] as bf16x2
+            #   reg2: rows 2-3, k[0:4] as bf16x2
+            #   reg3: rows 2-3, k[4:8] as bf16x2
+            #
+            # MXFP8 m16n8k32 A-fragment layout per m-tile (4 u32):
+            #   reg0: rows 0-1, k[0:4] as e4m3x4   (first k-half, rows 0-1)
+            #   reg1: rows 2-3, k[0:4] as e4m3x4   (first k-half, rows 2-3)
+            #   reg2: rows 0-1, k[16:20] as e4m3x4 (second k-half, rows 0-1)
+            #   reg3: rows 2-3, k[16:20] as e4m3x4 (second k-half, rows 2-3)
+            #
+            # Each cvt_bf16x2_to_e4m3x2 converts 2 bf16 → 2 e4m3 (in low 16 bits).
+            # We pack two cvt results into one u32 (4 e4m3 bytes).
             a_base = m * 4
+            # Pack two k=16 BF16 A-fragments into one k=32 MXFP8 A-fragment.
+            # Each BF16 reg has 2 bf16 values; cvt produces 2 e4m3 in low 16 bits.
+            # Pack two cvt results (4 e4m3 bytes) into one u32.
+            # The k0/k1 interleaving within each register matches the MXFP8 layout:
+            # each A register holds bytes from both k-halves for its owned rows.
             qa0 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 0]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 0]) & mask16) << shift16)
             qa1 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 1]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 1]) & mask16) << shift16)
             qa2 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 2]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 2]) & mask16) << shift16)
