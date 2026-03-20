@@ -1030,28 +1030,27 @@ class SM120ForwardKernel:
     @cute.jit
     def load_paged_kv_stage_raw(
         self,
-        mX: cute.Tensor,
+        mX_page: cute.Tensor,
         sX: cute.Tensor,
-        batch_idx: Int32,
-        head_idx_kv: Int32,
-        src_idx: Int32,
         stage_idx: Int32,
         tile_hdim_x: cutlass.Constexpr,
     ):
         lane = cute.arch.lane_idx()
-        mXu8 = cute.recast_tensor(mX, cutlass.Uint8)
+        mX_page_u32 = cute.recast_tensor(mX_page, cutlass.Uint32)
         sXu8 = cute.recast_tensor(sX, cutlass.Uint8)
-        total_vec4 = (self.tile_n * tile_hdim_x) // 4
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec4, cute.arch.WARP_SIZE)):
-            vec_idx = lane + idx_iter * cute.arch.WARP_SIZE
-            if vec_idx < total_vec4:
-                linear_idx = vec_idx * 4
-                row = linear_idx // tile_hdim_x
-                col = linear_idx - row * tile_hdim_x
-                sXu8[row, col + 0, stage_idx] = mXu8[row, col + 0, head_idx_kv, src_idx]
-                sXu8[row, col + 1, stage_idx] = mXu8[row, col + 1, head_idx_kv, src_idx]
-                sXu8[row, col + 2, stage_idx] = mXu8[row, col + 2, head_idx_kv, src_idx]
-                sXu8[row, col + 3, stage_idx] = mXu8[row, col + 3, head_idx_kv, src_idx]
+        packed_hdim = tile_hdim_x // 4
+        total_packed = self.tile_n * packed_hdim
+        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_packed, cute.arch.WARP_SIZE)):
+            packed_idx = lane + idx_iter * cute.arch.WARP_SIZE
+            if packed_idx < total_packed:
+                row = packed_idx // packed_hdim
+                col_packed = packed_idx - row * packed_hdim
+                packed = mX_page_u32[row, col_packed]
+                col = col_packed * 4
+                sXu8[row, col + 0, stage_idx] = cutlass.Uint8(packed)
+                sXu8[row, col + 1, stage_idx] = cutlass.Uint8(packed >> cutlass.Uint32(8))
+                sXu8[row, col + 2, stage_idx] = cutlass.Uint8(packed >> cutlass.Uint32(16))
+                sXu8[row, col + 3, stage_idx] = cutlass.Uint8(packed >> cutlass.Uint32(24))
 
     @cute.jit
     def dequant_fp8_stage_shared(
@@ -1200,11 +1199,8 @@ class SM120ForwardKernel:
                     load_K(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
-                        mK,
+                        mK[None, None, head_idx_kv, src_idx],
                         sKRaw,
-                        batch_idx,
-                        head_idx_kv,
-                        src_idx,
                         kv_producer_state.index,
                         self.tile_hdim,
                     )
@@ -1214,11 +1210,8 @@ class SM120ForwardKernel:
                     load_V(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
-                        mV,
+                        mV[None, None, head_idx_kv, src_idx],
                         sVRaw,
-                        batch_idx,
-                        head_idx_kv,
-                        src_idx,
                         kv_producer_state.index,
                         self.tile_hdimv,
                     )
