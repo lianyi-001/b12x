@@ -99,6 +99,35 @@ class SeqlenInfoQK:
             has_seqused_k=mSeqUsedK is not None,
         )
 
+    @staticmethod
+    def create_uniform_q(
+        batch_idx: Int32,
+        seqlen_q_static: Int32,
+        seqlen_k_static: Int32,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        tile_m: cutlass.Constexpr[Int32] = 128,
+        tile_n: cutlass.Constexpr[Int32] = 128,
+    ):
+        del tile_n
+        offset_q = batch_idx * seqlen_q_static
+        padded_offset_q = cute.assume(
+            batch_idx * cute.ceil_div(seqlen_q_static, tile_m) * tile_m,
+            divby=tile_m,
+        )
+        seqlen_k = seqlen_k_static if const_expr(mSeqUsedK is None) else mSeqUsedK[batch_idx]
+        return SeqlenInfoQK(
+            offset_q=offset_q,
+            offset_k=Int32(0),
+            padded_offset_q=padded_offset_q,
+            padded_offset_k=Int32(0),
+            seqlen_q=seqlen_q_static,
+            seqlen_k=seqlen_k,
+            has_cu_seqlens_q=True,
+            has_cu_seqlens_k=False,
+            has_seqused_q=False,
+            has_seqused_k=mSeqUsedK is not None,
+        )
+
     def offset_batch_Q(
         self,
         mQ: cute.Tensor,
