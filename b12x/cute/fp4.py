@@ -20,7 +20,6 @@ utilities used by the fused frontend kernels.
 """
 
 import functools
-import os
 import math
 import operator
 from typing import Callable, Tuple
@@ -43,11 +42,6 @@ FLOAT8_E4M3_MAX = 448.0  # Maximum value representable in FP8 E4M3
 SF_VEC_SIZE = 16  # Elements per scale factor block
 COPY_BITS = 128  # 128-bit vectorized loads
 _FP4_MAG_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_FP8X4_E4M3_PRMT_SELECTOR = 0x1302
-_FP8X4_E4M3_TRANSPOSE_PRMT_SELECTOR = int(
-    os.environ.get("B12X_FP8_TRANSPOSE_PRMT_SELECTOR", "0x1302"),
-    0,
-)
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -767,43 +761,14 @@ def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 @dsl_user_op
 def fp8x4_e4m3_to_bfloat2x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
     """Widen 4 packed E4M3 bytes into 2 packed bf16x2 registers exactly."""
-    return fp8x4_e4m3_to_bfloat2x2_selector(
-        packed,
-        Int32(_FP8X4_E4M3_PRMT_SELECTOR),
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def fp8x4_e4m3_to_bfloat2x2_transposed(
-    packed: Uint32, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
-    """Widen 4 packed E4M3 bytes from the transposed PV word layout."""
-    return fp8x4_e4m3_to_bfloat2x2_selector(
-        packed,
-        Int32(_FP8X4_E4M3_TRANSPOSE_PRMT_SELECTOR),
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def fp8x4_e4m3_to_bfloat2x2_selector(
-    packed: Uint32, selector: Int32, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
-    """Widen 4 packed E4M3 bytes into 2 packed bf16x2 registers exactly."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [
-            Uint32(packed).ir_value(loc=loc, ip=ip),
-            Int32(selector).ir_value(loc=loc, ip=ip),
-        ],
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
         """
         {
             .reg .b16 low;
             .reg .b32 q, out0, out1, sign0, sign1, mant0, mant1, tmp, bias, bias_f32;
-            prmt.b32 q, $2, 0, $3;
+            prmt.b32 q, $2, 0, 0x1302;
 
             and.b32 sign0, q, 0x80008000;
             shr.u32 tmp, q, 4;
@@ -824,7 +789,7 @@ def fp8x4_e4m3_to_bfloat2x2_selector(
             mul.bf16x2 $1, out1, bias;
         }
         """,
-        "=r,=r,r,r",
+        "=r,=r,r",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

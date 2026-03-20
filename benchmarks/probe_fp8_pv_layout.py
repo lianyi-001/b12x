@@ -78,17 +78,14 @@ class Fp8PvLayoutProbeKernel:
         mSelector: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        self.kernel_spec.num_threads = (self.kernel_spec.num_compute_warps + 1) * 32
-        self.kernel_spec.num_mma_threads = self.kernel_spec.num_compute_warps * 32
-        self.kernel_spec.num_producer_threads = 32
-        self.kernel_spec.num_Q_load_threads = self.kernel_spec.num_mma_threads
-        self.kernel_spec.num_epilogue_threads = self.kernel_spec.num_mma_threads
         self.kernel_spec._setup_attributes()
+        shared_storage = self.kernel_spec._get_shared_storage_cls()
         _, tiled_mma_pv = self.kernel_spec._get_tiled_mma()
         self.kernel(
             mVRaw,
             mMismatch,
             mSelector,
+            shared_storage,
             self.kernel_spec.sV_layout,
             self.kernel_spec.sV_raw_layout,
             tiled_mma_pv,
@@ -104,21 +101,20 @@ class Fp8PvLayoutProbeKernel:
         mVRaw: cute.Tensor,
         mMismatch: cute.Tensor,
         mSelector: cute.Tensor,
+        SharedStorage: cutlass.Constexpr,
         sV_layout: cutlass.Constexpr,
         sV_raw_layout: cutlass.Constexpr,
         tiled_mma_pv: cutlass.Constexpr,
     ):
         tidx = cute.arch.thread_idx()[0]
         smem = cutlass.utils.SmemAllocator()
-        sV = smem.allocate_tensor(
-            element_type=cutlass.BFloat16,
-            layout=sV_layout,
-            byte_alignment=1024,
-        )
-        sVRaw = smem.allocate_tensor(
-            element_type=cutlass.Float8E4M3FN,
-            layout=sV_raw_layout,
-            byte_alignment=1024,
+        storage = smem.allocate(SharedStorage)
+        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        sVRaw = storage.sV_raw.get_tensor(
+            cute.make_layout(
+                (self.tile_n, self.head_dim, 1),
+                stride=(self.head_dim, 1, self.tile_n * self.head_dim),
+            )
         )
         total_elems = self.tile_n * self.head_dim
         for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_elems, self.num_threads)):
@@ -141,7 +137,7 @@ class Fp8PvLayoutProbeKernel:
         tRefRaw = cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint8), cutlass.Uint8)
         tRefCopyView = ref_copy.retile(tRefRaw)
         tRefSrc = ref_copy.partition_S(sVtRawU8)
-        copy_flattened(tRefSrc, tRefCopyView)
+        copy_flattened(tRefSrc[None, None, 0], tRefCopyView[None, None, 0])
 
         # Candidate word path to be fixed with per-word prmt.
         sVRawU32 = cute.recast_tensor(sVRaw, cutlass.Uint32)
@@ -157,7 +153,7 @@ class Fp8PvLayoutProbeKernel:
         tCandRaw = cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint32), cutlass.Uint32)
         tCandCopyView = cand_copy.retile(tCandRaw)
         tCandSrc = cand_copy.partition_S(sCand)
-        copy_flattened(tCandSrc, tCandCopyView)
+        copy_flattened(tCandSrc[None, None, 0], tCandCopyView[None, None, 0])
 
         selector = Int32(mSelector[0])
         cand_words = cute.flatten(tCandRaw)
