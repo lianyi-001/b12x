@@ -1782,7 +1782,7 @@ def create_paged_attention_plan(
             num_stages=1,
             q_in_regs=False,
         )
-        if auto_num_splits and max_pages >= 128 and 24 in buckets:
+        if auto_num_splits and max_pages >= 512 and 24 in buckets:
             num_splits = 24
         elif auto_num_splits and 16 in buckets:
             num_splits = 16
