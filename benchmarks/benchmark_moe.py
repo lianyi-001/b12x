@@ -327,6 +327,28 @@ def load_expert_weight_stack(
     ]
 
 
+def load_gate_weight(
+    model_path: pathlib.Path,
+    spec: ModelSpec,
+    *,
+    layer_idx: int = 0,
+) -> torch.Tensor:
+    """Load the replicated sparse-gate projection for a Qwen-style MoE block."""
+    cfg = json.loads((model_path / "config.json").read_text())["text_config"]
+    assert cfg["num_experts"] == spec.num_experts
+    assert cfg["hidden_size"] == spec.hidden_size
+
+    gate_weight = IndexedSafetensorLoader(model_path).get_tensor(
+        f"model.language_model.layers.{layer_idx}.mlp.gate.weight"
+    )
+    expected_shape = (spec.num_experts, spec.hidden_size)
+    if tuple(gate_weight.shape) != expected_shape:
+        raise ValueError(
+            f"expected gate.weight shape {expected_shape}, got {tuple(gate_weight.shape)}"
+        )
+    return gate_weight.to(device=torch.device("cuda")).contiguous()
+
+
 def make_input_activations(
     spec: ModelSpec,
     m: int,

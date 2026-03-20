@@ -9,6 +9,7 @@ from typing import Dict, Tuple
 import cutlass
 import cutlass.cute as cute
 import torch
+import torch.nn.functional as F
 
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
@@ -91,6 +92,29 @@ class TPMoEWorkspacePool:
 
     def clear(self) -> None:
         self.workspaces.clear()
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XFP4ExpertWeights:
+    """Packaged FP4 expert tensors for routed-expert MoE entrypoints."""
+
+    a1_gscale: torch.Tensor
+    w1_fp4: torch.Tensor
+    w1_blockscale: torch.Tensor
+    w1_alphas: torch.Tensor
+    a2_gscale: torch.Tensor
+    w2_fp4: torch.Tensor
+    w2_blockscale: torch.Tensor
+    w2_alphas: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XTopKRouting:
+    """Top-k routing selection for sparse-block MoE wrappers."""
+
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor | None = None
 
 
 @dataclass
@@ -1531,3 +1555,207 @@ def b12x_moe_fp4(
             stream=stream,
         )
     return scatter_output
+
+
+def _validate_sparse_routing(hidden_states: torch.Tensor, routing: B12XTopKRouting) -> None:
+    if routing.topk_ids.ndim != 2:
+        raise ValueError(
+            f"expected topk_ids with rank 2, got shape {tuple(routing.topk_ids.shape)}"
+        )
+    if routing.topk_weights.ndim != 2:
+        raise ValueError(
+            "expected topk_weights with rank 2, got shape "
+            f"{tuple(routing.topk_weights.shape)}"
+        )
+    if routing.topk_ids.shape != routing.topk_weights.shape:
+        raise ValueError(
+            "topk_ids and topk_weights must have the same shape, got "
+            f"{tuple(routing.topk_ids.shape)} and {tuple(routing.topk_weights.shape)}"
+        )
+    if routing.topk_ids.shape[0] != hidden_states.shape[0]:
+        raise ValueError(
+            "routing batch mismatch: expected "
+            f"{hidden_states.shape[0]}, got {routing.topk_ids.shape[0]}"
+        )
+    if routing.router_logits is not None and routing.router_logits.shape[0] != hidden_states.shape[0]:
+        raise ValueError(
+            "router_logits batch mismatch: expected "
+            f"{hidden_states.shape[0]}, got {routing.router_logits.shape[0]}"
+        )
+
+
+def _select_experts_reference(
+    hidden_states: torch.Tensor,
+    *,
+    top_k: int,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize: bool = True,
+) -> B12XTopKRouting:
+    """Reference routing selection for sparse-block MoE wrappers.
+
+    Keep this path simple and obviously correct. Optimized routing should live
+    in a separate public fast path rather than accreting special cases here.
+    """
+
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            "expected hidden_states with rank 2, got shape "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    if router_logits is not None and gate_weight is not None:
+        raise ValueError("pass either router_logits or gate_weight, not both")
+    if router_logits is None and gate_weight is None:
+        raise ValueError("expected router_logits or gate_weight")
+
+    if router_logits is None:
+        assert gate_weight is not None
+        if gate_weight.ndim != 2:
+            raise ValueError(
+                f"expected gate_weight with rank 2, got shape {tuple(gate_weight.shape)}"
+            )
+        if gate_weight.shape[1] != hidden_states.shape[1]:
+            raise ValueError(
+                "gate_weight hidden-size mismatch: expected "
+                f"{hidden_states.shape[1]}, got {gate_weight.shape[1]}"
+            )
+        if gate_bias is not None:
+            if gate_bias.ndim != 1:
+                raise ValueError(
+                    f"expected gate_bias with rank 1, got shape {tuple(gate_bias.shape)}"
+                )
+            if gate_bias.shape[0] != gate_weight.shape[0]:
+                raise ValueError(
+                    "gate_bias expert mismatch: expected "
+                    f"{gate_weight.shape[0]}, got {gate_bias.shape[0]}"
+                )
+        router_logits = F.linear(hidden_states, gate_weight, gate_bias)
+    else:
+        if router_logits.ndim != 2:
+            raise ValueError(
+                "expected router_logits with rank 2, got shape "
+                f"{tuple(router_logits.shape)}"
+            )
+        if router_logits.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                "router_logits batch mismatch: expected "
+                f"{hidden_states.shape[0]}, got {router_logits.shape[0]}"
+            )
+
+    num_experts = router_logits.shape[1]
+    if top_k > num_experts:
+        raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts}")
+
+    topk_logits, topk_ids = torch.topk(router_logits, k=top_k, dim=-1)
+    if renormalize:
+        topk_weights = torch.softmax(topk_logits.to(torch.float32), dim=-1)
+    else:
+        topk_weights = topk_logits.to(torch.float32)
+    return B12XTopKRouting(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
+    )
+
+
+def b12x_route_experts_fast(
+    hidden_states: torch.Tensor,
+    *,
+    top_k: int,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize: bool = True,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool | None = None,
+) -> B12XTopKRouting:
+    """Public sparse-routing entrypoint for higher-level integrations.
+
+    This is the optimization seam for future fast routing work. The current
+    implementation intentionally falls back to the simple reference selection
+    path while preserving the interface we want sglang and future fused routing
+    kernels to target.
+    """
+
+    del workspace
+    return _select_experts_reference(
+        hidden_states,
+        top_k=top_k,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        router_logits=router_logits,
+        renormalize=renormalize,
+    )
+
+
+def b12x_sparse_moe_fp4(
+    hidden_states: torch.Tensor,
+    *,
+    experts: B12XFP4ExpertWeights,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    routing: B12XTopKRouting | None = None,
+    top_k: int | None = None,
+    gate_weight: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    renormalize_topk: bool = True,
+    routed_scaling_factor: float = 1.0,
+    output: torch.Tensor | None = None,
+    return_routing: bool = False,
+    input_scales_are_reciprocal: bool = False,
+    input_scales_static: bool = False,
+    fast_math: bool | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
+    """Sparse-block FP4 MoE wrapper above the routed-expert TP primitive.
+
+    This additive entrypoint preserves `b12x_moe_fp4(...)` as the stable
+    low-level contract while giving higher-level integrations a single call that
+    can own `gate -> topk -> routed experts` at the sparse MoE block seam.
+    """
+
+    if routing is not None:
+        if top_k is not None or gate_weight is not None or gate_bias is not None or router_logits is not None:
+            raise ValueError(
+                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+            )
+        selected = routing
+    else:
+        if top_k is None:
+            raise ValueError("top_k is required when routing is not provided")
+        selected = b12x_route_experts_fast(
+            hidden_states,
+            top_k=top_k,
+            gate_weight=gate_weight,
+            gate_bias=gate_bias,
+            router_logits=router_logits,
+            renormalize=renormalize_topk,
+            workspace=workspace,
+        )
+
+    _validate_sparse_routing(hidden_states, selected)
+
+    routed_output = b12x_moe_fp4(
+        hidden_states,
+        experts.a1_gscale,
+        experts.w1_fp4,
+        experts.w1_blockscale,
+        experts.w1_alphas,
+        experts.a2_gscale,
+        experts.w2_fp4,
+        experts.w2_blockscale,
+        experts.w2_alphas,
+        selected.topk_weights,
+        selected.topk_ids,
+        workspace=workspace,
+        output=output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=input_scales_static,
+        fast_math=fast_math,
+    )
+    if routed_scaling_factor != 1.0:
+        routed_output.mul_(routed_scaling_factor)
+    if return_routing:
+        return routed_output, selected
+    return routed_output
