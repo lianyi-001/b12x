@@ -1062,13 +1062,17 @@ class SM120ForwardKernel:
     @cute.jit
     def load_paged_kv_stage_raw(
         self,
-        mX_page: cute.Tensor,
+        mX: cute.Tensor,
         sX: cute.Tensor,
+        batch_idx: Int32,
+        head_idx_kv: Int32,
+        src_idx: Int32,
         stage_idx: Int32,
         tile_hdim_x: cutlass.Constexpr,
     ):
         lane = cute.arch.lane_idx()
-        mX_page_u32 = cute.recast_tensor(mX_page, cutlass.Uint32)
+        del batch_idx
+        mXu32 = cute.recast_tensor(mX, cutlass.Uint32)
         sXu32 = cute.recast_tensor(sX, cutlass.Uint32)
         words_per_row = tile_hdim_x // 4
         total_packed = self.tile_n * words_per_row
@@ -1077,7 +1081,7 @@ class SM120ForwardKernel:
             if packed_idx < total_packed:
                 row = packed_idx // words_per_row
                 col_word = packed_idx - row * words_per_row
-                sXu32[row, col_word, stage_idx] = mX_page_u32[row, col_word]
+                sXu32[row, col_word, stage_idx] = mXu32[row, col_word, head_idx_kv, src_idx]
 
     @cute.jit
     def dequant_fp8_stage_shared(
@@ -1226,8 +1230,11 @@ class SM120ForwardKernel:
                     load_K(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
-                        mK[None, None, head_idx_kv, src_idx],
+                        mK,
                         sKRaw,
+                        batch_idx,
+                        head_idx_kv,
+                        src_idx,
                         kv_producer_state.index,
                         self.tile_hdim,
                     )
@@ -1237,8 +1244,11 @@ class SM120ForwardKernel:
                     load_V(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
-                        mV[None, None, head_idx_kv, src_idx],
+                        mV,
                         sVRaw,
+                        batch_idx,
+                        head_idx_kv,
+                        src_idx,
                         kv_producer_state.index,
                         self.tile_hdimv,
                     )

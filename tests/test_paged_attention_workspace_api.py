@@ -341,6 +341,42 @@ def test_long_decode_plan_falls_back_to_main_kernel_family() -> None:
     assert plan.q_in_regs is False
 
 
+def test_long_fp8_decode_plan_selects_decode_micro_kernel_family() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * 8,
+        cache_seqlens=[8192] * 8,
+        page_size=64,
+        seed=47,
+        num_pages=1024,
+    )
+    k_quant, v_quant, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_quant,
+        v_quant,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+
+    assert plan.mode == "decode"
+    assert plan.kv_dtype == torch.float8_e4m3fn
+    assert plan.kernel_family == "decode_micro"
+    assert plan.tile_m == 16
+    assert plan.tile_n == 64
+    assert plan.num_compute_warps == 1
+    assert plan.q_in_regs is True
+
+
 def test_paged_workspace_pool_reuses_plan_exact_shape() -> None:
     require_sm120()
     clear_attention_caches()
@@ -623,27 +659,36 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
     short_decode = torch.tensor([64] * 8, dtype=torch.int32, device="cuda")
     mid_decode = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
     long_decode = torch.tensor([2048] * 8, dtype=torch.int32, device="cuda")
-    ultra_long_decode = torch.tensor([32768] * 2, dtype=torch.int32, device="cuda")
     short_extend = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
     mid_extend = torch.tensor([256] * 8, dtype=torch.int32, device="cuda")
     long_extend = torch.tensor([2048] * 8, dtype=torch.int32, device="cuda")
+    very_long_extend = torch.tensor([16384] * 2, dtype=torch.int32, device="cuda")
     ultra_long_extend = torch.tensor([32768] * 2, dtype=torch.int32, device="cuda")
 
     assert choose_paged_attention_num_splits(short_decode, page_size=64, mode="decode") == 1
     assert choose_paged_attention_num_splits(mid_decode, page_size=64, mode="decode") == 2
     assert choose_paged_attention_num_splits(long_decode, page_size=64, mode="decode") == 8
-    assert (
-        choose_paged_attention_num_splits(
-            ultra_long_decode,
-            page_size=64,
-            mode="decode",
-            kv_dtype=torch.float8_e4m3fn,
-        )
-        == 24
-    )
     assert choose_paged_attention_num_splits(short_extend, page_size=64, mode="extend") == 1
     assert choose_paged_attention_num_splits(mid_extend, page_size=64, mode="extend") == 4
     assert choose_paged_attention_num_splits(long_extend, page_size=64, mode="extend") == 8
+    assert (
+        choose_paged_attention_num_splits(
+            long_extend,
+            page_size=64,
+            mode="extend",
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        == 8
+    )
+    assert (
+        choose_paged_attention_num_splits(
+            very_long_extend,
+            page_size=64,
+            mode="extend",
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        == 16
+    )
     assert (
         choose_paged_attention_num_splits(
             ultra_long_extend,
@@ -653,6 +698,101 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
         )
         == 24
     )
+    assert (
+        choose_paged_attention_num_splits(
+            very_long_extend,
+            page_size=64,
+            mode="extend",
+            kv_dtype=torch.bfloat16,
+        )
+        == 8
+    )
+
+
+def test_longest_decode_split_bucket_is_kv_dtype_aware() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * 8,
+        cache_seqlens=[32768] * 8,
+        page_size=64,
+        seed=97,
+    )
+    k_fp8, v_fp8, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+
+    assert choose_paged_attention_num_splits(cache_seqlens, page_size=64, mode="decode") == 32
+    assert (
+        choose_paged_attention_num_splits(
+            cache_seqlens,
+            page_size=64,
+            mode="decode",
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        == 8
+    )
+
+    bf16_plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        num_splits=0,
+    )
+    fp8_plan = create_paged_attention_plan(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        num_splits=0,
+    )
+
+    assert bf16_plan.num_splits == 32
+    assert fp8_plan.num_splits == 24
+
+
+def test_fp8_extend_plan_keeps_mid_context_split_count() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6, 6],
+        cache_seqlens=[2048, 2048],
+        page_size=64,
+        seed=97,
+    )
+    k_quant, v_quant, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+
+    plan = create_paged_attention_plan(
+        q,
+        k_quant,
+        v_quant,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        num_splits=0,
+    )
+
+    assert plan.mode == "extend"
+    assert plan.kv_dtype == torch.float8_e4m3fn
+    assert plan.num_splits == 8
 
 
 def test_page_size_other_than_64_is_rejected() -> None:

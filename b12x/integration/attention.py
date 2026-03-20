@@ -15,7 +15,7 @@ from b12x.attention.combine import PagedAttentionCombineKernel
 from b12x.attention.forward import SM120ForwardKernel
 from b12x.cute.utils import current_cuda_stream, make_ptr
 
-_DEFAULT_PAGED_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 24)
+_DEFAULT_PAGED_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 24, 32)
 _DEFAULT_MIN_PAGES_PER_SPLIT = 8
 _FP8_KV_DTYPE = torch.float8_e4m3fn
 
@@ -181,6 +181,7 @@ class PagedKernelConfig:
 def _select_paged_kernel_config(
     head_dim: int,
     *,
+    kv_dtype: torch.dtype,
     causal: bool,
     page_size: int,
     mode: Literal["decode", "extend"],
@@ -197,7 +198,9 @@ def _select_paged_kernel_config(
         tile_m, tile_n = tile_shape
     elif head_dim <= 128:
         tile_m, tile_n = (128, 64)
-    elif mode == "decode" and head_dim == 256 and max_pages <= 4:
+    elif mode == "decode" and head_dim == 256 and (
+        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
+    ):
         tile_m, tile_n = (16, 64)
     elif head_dim == 256:
         tile_m, tile_n = (64, 64)
@@ -206,7 +209,9 @@ def _select_paged_kernel_config(
             f"unsupported head_dim={head_dim} for the current b12x paged attention path"
         )
 
-    if mode == "decode" and head_dim == 256 and max_pages <= 4:
+    if mode == "decode" and head_dim == 256 and (
+        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
+    ):
         return PagedKernelConfig(
             kernel_family="decode_micro",
             tile_m=tile_m,
@@ -275,6 +280,51 @@ def _normalize_split_buckets(split_buckets: tuple[int, ...]) -> tuple[int, ...]:
     if any(bucket < 1 for bucket in normalized):
         raise ValueError(f"split_buckets must be positive, got {normalized}")
     return normalized
+
+
+def _estimate_varlen_scheduler_blocks(
+    *,
+    logical_total_q_rows: int,
+    num_batch: int,
+    tile_m: int,
+    cluster_shape_m: int = 1,
+) -> int:
+    total_blocks_max = (
+        logical_total_q_rows + num_batch * (cluster_shape_m * tile_m - 1)
+    ) // tile_m
+    return total_blocks_max // cluster_shape_m * cluster_shape_m
+
+
+def _promote_fp8_paged_splits_for_occupancy(
+    *,
+    initial_splits: int,
+    split_buckets: tuple[int, ...],
+    q_shape: tuple[int, ...],
+    k_cache_shape: tuple[int, ...],
+    page_table_shape: tuple[int, ...],
+    max_pages: int,
+    tile_m: int,
+    device: torch.device,
+) -> int:
+    total_q, q_heads, _ = q_shape
+    _, _, kv_heads, _ = k_cache_shape
+    num_batch, _ = page_table_shape
+    logical_total_q_rows = total_q * (q_heads // kv_heads)
+    logical_num_head = kv_heads if q_heads != kv_heads else q_heads
+    total_blocks_max = _estimate_varlen_scheduler_blocks(
+        logical_total_q_rows=logical_total_q_rows,
+        num_batch=num_batch,
+        tile_m=tile_m,
+    )
+    target_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+    chosen = initial_splits
+    for bucket in split_buckets:
+        if bucket < initial_splits or bucket > max_pages:
+            continue
+        chosen = bucket
+        if total_blocks_max * logical_num_head * bucket >= target_ctas:
+            break
+    return chosen
 
 
 def _validate_forward_inputs(
@@ -477,21 +527,29 @@ def choose_paged_attention_num_splits(
             return 2 if 2 in buckets else 4
         if max_pages <= 4:
             return 4 if 4 in buckets else buckets[-1]
-        if max_pages <= 32:
-            return 8 if 8 in buckets else buckets[-1]
-        if kv_dtype == _FP8_KV_DTYPE and max_pages >= 512 and 24 in buckets:
-            return 24
-        return 16 if 16 in buckets else buckets[-1]
+        if max_pages >= 256:
+            if kv_dtype == _FP8_KV_DTYPE:
+                return 8 if 8 in buckets else buckets[-1]
+            for preferred in (32, 24):
+                if preferred in buckets:
+                    return preferred
+            return buckets[-1]
+        if max_pages >= 128:
+            if kv_dtype == _FP8_KV_DTYPE:
+                return 8 if 8 in buckets else buckets[-1]
+            return 16 if 16 in buckets else buckets[-1]
+        return 8 if 8 in buckets else buckets[-1]
     if mode == "extend":
         if max_pages <= 2:
             return 1
         if max_pages <= 4:
             return 4 if 4 in buckets else buckets[-1]
-        if kv_dtype == _FP8_KV_DTYPE and max_pages >= 512 and 24 in buckets:
-            return 24
-        if max_pages <= 128:
-            return 8 if 8 in buckets else buckets[-1]
-        return 16 if 16 in buckets else buckets[-1]
+        if kv_dtype == _FP8_KV_DTYPE:
+            if max_pages >= 512 and 24 in buckets:
+                return 24
+            if max_pages >= 256 and 16 in buckets:
+                return 16
+        return 8 if 8 in buckets else buckets[-1]
     chosen = 1
     for bucket in buckets[1:]:
         if max_pages >= bucket * min_pages_per_split:
@@ -1667,7 +1725,8 @@ def create_paged_attention_plan(
         mode = inferred_mode
     elif mode != inferred_mode:
         raise ValueError(f"paged attention mode mismatch: requested {mode}, inferred {inferred_mode}")
-    if num_splits in (None, 0):
+    auto_num_splits = num_splits in (None, 0)
+    if auto_num_splits:
         num_splits = choose_paged_attention_num_splits(
             cache_seqlens,
             page_size=page_size,
@@ -1679,23 +1738,27 @@ def create_paged_attention_plan(
     elif num_splits not in buckets:
         raise ValueError(f"num_splits must be one of {buckets}, got {num_splits}")
     max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
-    if (
-        kv_dtype == _FP8_KV_DTYPE
-        and mode == "decode"
-        and max_pages >= 32
-        and num_splits < 16
-        and 16 in buckets
-    ):
-        num_splits = 16
     _, _, head_dim = q_shape
     kernel_config = _select_paged_kernel_config(
         head_dim,
+        kv_dtype=kv_dtype,
         causal=causal,
         page_size=page_size,
         mode=mode,
         max_pages=max_pages,
         tile_shape=tile_shape,
     )
+    if auto_num_splits and kv_dtype == _FP8_KV_DTYPE and mode == "decode" and num_splits > 1:
+        num_splits = _promote_fp8_paged_splits_for_occupancy(
+            initial_splits=num_splits,
+            split_buckets=buckets,
+            q_shape=q_shape,
+            k_cache_shape=k_cache_shape,
+            page_table_shape=page_table_shape,
+            max_pages=max_pages,
+            tile_m=kernel_config.tile_m,
+            device=device,
+        )
     return _get_paged_attention_plan(
         q_shape,
         k_cache_shape,
