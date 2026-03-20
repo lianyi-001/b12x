@@ -318,6 +318,7 @@ class SM120ForwardKernel:
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         paged_direct_q_seqlen: int = 0,
+        mxfp8_pv: Optional[bool] = None,
     ):
         self.dtype = dtype
         self.kv_dtype = dtype if kv_dtype is None else kv_dtype
@@ -356,11 +357,22 @@ class SM120ForwardKernel:
             "SM120 paged KV cp.async path does not support irregular head dim"
         )
         self.kv_is_fp8 = self.kv_dtype == cutlass.Float8E4M3FN
-        # Use MXFP8 block-scaled MMA for the PV accumulation when KV cache is FP8.
-        # This quantizes P (BF16 softmax output) to E4M3 and uses the SM120 MXFP8
-        # m16n8k32 MMA which gives 2x K-throughput vs the BF16 m16n8k16 dequant path.
-        # Requires tile_n divisible by 32 (k=32 MMA processes pairs of k=16 steps).
-        self.use_mxfp8_pv = self.kv_is_fp8 and (tile_n % 32 == 0)
+        # MXFP8 block-scaled MMA for PV accumulation ("turbo" mode).
+        # Quantizes P (BF16 softmax) to E4M3 and uses SM120's native MXFP8
+        # m16n8k32 MMA for 2x K-throughput. Slight accuracy trade-off
+        # (cos ~0.9978 vs ~0.9999 for the BF16 dequant path).
+        # Requires tile_n divisible by 32.
+        #   mxfp8_pv=None  -> auto-enable when FP8 KV and tile_n % 32 == 0
+        #   mxfp8_pv=True  -> force enable (asserts requirements)
+        #   mxfp8_pv=False -> force disable (use BF16 dequant path)
+        if mxfp8_pv is None:
+            self.use_mxfp8_pv = self.kv_is_fp8 and (tile_n % 32 == 0)
+        elif mxfp8_pv:
+            assert self.kv_is_fp8, "mxfp8_pv requires FP8 KV cache"
+            assert tile_n % 32 == 0, "mxfp8_pv requires tile_n divisible by 32"
+            self.use_mxfp8_pv = True
+        else:
+            self.use_mxfp8_pv = False
         self.paged_direct_q_seqlen = paged_direct_q_seqlen
 
     def _check_type(
