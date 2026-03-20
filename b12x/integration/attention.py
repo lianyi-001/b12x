@@ -665,6 +665,7 @@ class PagedAttentionPlanKey:
     num_compute_warps: int
     num_stages: int
     q_in_regs: bool
+    paged_direct_q_seqlen: int
     num_batch: int
     num_q_heads: int
     num_kv_heads: int
@@ -896,6 +897,7 @@ class _PagedAttentionForwardLaunch:
         num_compute_warps: int,
         num_stages: int,
         q_in_regs: bool,
+        paged_direct_q_seqlen: int,
     ):
         self._q_shape = q_shape
         self._k_cache_shape = k_cache_shape
@@ -919,6 +921,7 @@ class _PagedAttentionForwardLaunch:
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
         self._q_in_regs = q_in_regs or (self._kv_dtype == cutlass.Float8E4M3FN)
+        self._paged_direct_q_seqlen = paged_direct_q_seqlen
         (
             self._num_batch,
             q_heads,
@@ -972,7 +975,7 @@ class _PagedAttentionForwardLaunch:
             num_splits=num_splits,
             num_compute_warps=num_compute_warps,
             Q_in_regs=self._q_in_regs,
-            decode_direct_scheduler=mode == "decode",
+            paged_direct_q_seqlen=paged_direct_q_seqlen,
         )
         assert head_dim == head_dim_k
 
@@ -1180,6 +1183,7 @@ def _compile_paged_attention(
     num_compute_warps: int,
     num_stages: int,
     q_in_regs: bool,
+    paged_direct_q_seqlen: int,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     cutlass_kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
@@ -1201,6 +1205,7 @@ def _compile_paged_attention(
         num_compute_warps=num_compute_warps,
         num_stages=num_stages,
         q_in_regs=q_in_regs,
+        paged_direct_q_seqlen=paged_direct_q_seqlen,
     )
     return cute.compile(
         launch,
@@ -1321,6 +1326,7 @@ def _get_paged_attention_plan(
     num_compute_warps: int,
     num_stages: int,
     q_in_regs: bool,
+    paged_direct_q_seqlen: int,
 ) -> PagedAttentionPlan:
     (
         num_batch,
@@ -1352,6 +1358,7 @@ def _get_paged_attention_plan(
             num_compute_warps=num_compute_warps,
             num_stages=num_stages,
             q_in_regs=q_in_regs,
+            paged_direct_q_seqlen=paged_direct_q_seqlen,
             num_batch=num_batch,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -1379,6 +1386,7 @@ def _get_paged_attention_plan(
             num_compute_warps,
             num_stages,
             q_in_regs,
+            paged_direct_q_seqlen,
         ),
         compiled_combine=(
             _compile_paged_attention_combine(
@@ -1739,6 +1747,13 @@ def create_paged_attention_plan(
         raise ValueError(f"num_splits must be one of {buckets}, got {num_splits}")
     max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
     _, _, head_dim = q_shape
+    q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
+    uniform_q_seqlen = (
+        q_lengths[0]
+        if q_lengths and all(q_len == q_lengths[0] for q_len in q_lengths)
+        else 0
+    )
+    paged_direct_q_seqlen = uniform_q_seqlen if 0 < uniform_q_seqlen <= 8 else 0
     kernel_config = _select_paged_kernel_config(
         head_dim,
         kv_dtype=kv_dtype,
@@ -1778,6 +1793,7 @@ def create_paged_attention_plan(
         kernel_config.num_compute_warps,
         kernel_config.num_stages,
         kernel_config.q_in_regs,
+        paged_direct_q_seqlen,
     )
 
 

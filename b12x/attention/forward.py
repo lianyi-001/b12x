@@ -208,7 +208,7 @@ class SM120ForwardKernel:
         has_aux_tensors: bool = False,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
-        decode_direct_scheduler: bool = False,
+        paged_direct_q_seqlen: int = 0,
     ):
         self.dtype = dtype
         self.kv_dtype = dtype if kv_dtype is None else kv_dtype
@@ -247,7 +247,7 @@ class SM120ForwardKernel:
             "SM120 paged KV cp.async path does not support irregular head dim"
         )
         self.kv_is_fp8 = self.kv_dtype == cutlass.Float8E4M3FN
-        self.decode_direct_scheduler = decode_direct_scheduler
+        self.paged_direct_q_seqlen = paged_direct_q_seqlen
 
     def _check_type(
         self,
@@ -753,7 +753,7 @@ class SM120ForwardKernel:
         )
         TileScheduler = (
             SingleTileDecodeScheduler
-            if const_expr(self.decode_direct_scheduler)
+            if const_expr(mPageTable is not None and self.paged_direct_q_seqlen > 0)
             else (
                 SingleTileVarlenScheduler
                 if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
@@ -775,6 +775,10 @@ class SM120ForwardKernel:
             total_q=logical_total_q,
             tile_shape_mn=(self.tile_m, self.tile_n),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            direct_q_rows_per_batch=(
+                self.paged_direct_q_seqlen
+                * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+            ),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             element_size=self.dtype.width // 8,
@@ -1002,15 +1006,24 @@ class SM120ForwardKernel:
                 seqlen_k_static=logical_seqlen_k_static,
                 mSeqUsedK=mSeqUsedK,
             )
-            if const_expr(self.decode_direct_scheduler)
-            else partial(
-                SeqlenInfoQK.create,
-                seqlen_q_static=logical_seqlen_q_static,
-                seqlen_k_static=logical_seqlen_k_static,
-                mCuSeqlensQ=mCuSeqlensQ,
-                mCuSeqlensK=mCuSeqlensK,
-                mSeqUsedQ=mSeqUsedQ,
-                mSeqUsedK=mSeqUsedK,
+            if const_expr(mPageTable is not None and self.paged_direct_q_seqlen == 1)
+            else (
+                partial(
+                    SeqlenInfoQK.create_uniform_q,
+                    seqlen_q_static=self.paged_direct_q_seqlen,
+                    seqlen_k_static=logical_seqlen_k_static,
+                    mSeqUsedK=mSeqUsedK,
+                )
+                if const_expr(mPageTable is not None and self.paged_direct_q_seqlen > 1)
+                else partial(
+                    SeqlenInfoQK.create,
+                    seqlen_q_static=logical_seqlen_q_static,
+                    seqlen_k_static=logical_seqlen_k_static,
+                    mCuSeqlensQ=mCuSeqlensQ,
+                    mCuSeqlensK=mCuSeqlensK,
+                    mSeqUsedQ=mSeqUsedQ,
+                    mSeqUsedK=mSeqUsedK,
+                )
             )
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
@@ -1507,7 +1520,7 @@ class SM120ForwardKernel:
         base_softmax_scale_log2 = softmax_scale_log2
         softmax_num_rows = (
             cutlass.min(acc_O.shape[0][0] * acc_O.shape[1], self.qhead_per_kvhead)
-            if const_expr(self.decode_direct_scheduler and self.pack_gqa)
+            if const_expr(self.paged_direct_q_seqlen == 1 and self.pack_gqa)
             else acc_O.shape[0][0] * acc_O.shape[1]
         )
         softmax = Softmax.create(

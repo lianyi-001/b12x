@@ -204,6 +204,7 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.num_compute_warps == 2
     assert plan.num_stages == 1
     assert plan.q_in_regs is False
+    assert plan.paged_direct_q_seqlen == 0
     assert plan.kv_dtype == torch.bfloat16
 
 
@@ -312,6 +313,44 @@ def test_decode_plan_selects_decode_micro_kernel_family() -> None:
     assert plan.tile_n == 64
     assert plan.num_compute_warps == 1
     assert plan.q_in_regs is True
+    assert plan.paged_direct_q_seqlen == 1
+
+
+def test_uniform_extend_plan_uses_paged_direct_scheduler() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[8192] * 8,
+        page_size=64,
+        seed=49,
+        num_pages=1024,
+    )
+    k_quant, v_quant, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_quant,
+        v_quant,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+
+    assert plan.mode == "extend"
+    assert plan.kv_dtype == torch.float8_e4m3fn
+    assert plan.kernel_family == "main"
+    assert plan.tile_m == 32
+    assert plan.tile_n == 64
+    assert plan.num_compute_warps == 2
+    assert plan.q_in_regs is False
+    assert plan.paged_direct_q_seqlen == 6
 
 
 def test_long_decode_plan_falls_back_to_main_kernel_family() -> None:
