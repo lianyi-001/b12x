@@ -679,7 +679,7 @@ class SM120ForwardKernel:
         self.num_producer_regs = 80
         self.use_tma_Q = True
         self.use_tma_KV = mK.element_type in [cutlass.Float16, cutlass.BFloat16] or (
-            self.kv_is_fp8 and const_expr(mPageTable is not None) and mPageTable.shape[1] > 2
+            self.kv_is_fp8 and const_expr(mPageTable is not None) and mPageTable.shape[1] > 0
         )
         self.use_tma_O = False
         if const_expr(not self.use_tma_KV and self.dtype != cutlass.BFloat16):
