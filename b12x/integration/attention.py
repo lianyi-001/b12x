@@ -199,7 +199,7 @@ def _select_paged_kernel_config(
     elif head_dim <= 128:
         tile_m, tile_n = (128, 64)
     elif mode == "decode" and head_dim == 256 and (
-        max_pages <= 4 or kv_dtype == _FP8_KV_DTYPE
+        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
     ):
         tile_m, tile_n = (16, 64)
     elif head_dim == 256:
@@ -210,7 +210,7 @@ def _select_paged_kernel_config(
         )
 
     if mode == "decode" and head_dim == 256 and (
-        max_pages <= 4 or kv_dtype == _FP8_KV_DTYPE
+        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
     ):
         return PagedKernelConfig(
             kernel_family="decode_micro",
@@ -545,9 +545,9 @@ def choose_paged_attention_num_splits(
         if max_pages <= 4:
             return 4 if 4 in buckets else buckets[-1]
         if kv_dtype == _FP8_KV_DTYPE:
-            if max_pages >= 128 and 24 in buckets:
+            if max_pages >= 512 and 24 in buckets:
                 return 24
-            if max_pages >= 64 and 16 in buckets:
+            if max_pages >= 256 and 16 in buckets:
                 return 16
         return 8 if 8 in buckets else buckets[-1]
     chosen = 1
