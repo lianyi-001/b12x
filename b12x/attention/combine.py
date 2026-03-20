@@ -48,12 +48,14 @@ class PagedAttentionCombineKernel:
         self.shared_storage = self._get_shared_storage_cls()
 
     def _get_shared_storage_cls(self):
+        scratch_struct = cute.struct.Align[
+            cute.struct.MemRange[Float32, self.num_splits + 1],
+            16,
+        ]
+
         @cute.struct
         class SharedStorage:
-            scratch: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.num_splits + 1],
-                16,
-            ]
+            scratch: scratch_struct
 
         return SharedStorage
 
