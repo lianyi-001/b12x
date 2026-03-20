@@ -931,7 +931,7 @@ class SM120ForwardKernel:
                 producer_group=pipeline_k_producer_group,
                 consumer_group=pipeline_k_consumer_group,
                 tx_count=self.tma_copy_bytes["K"],
-                defer_sync=True,
+                defer_sync=not self.kv_is_fp8,
             )
         else:
             # PipelineAsync barriers are not warp-gated. Use actual thread counts or
