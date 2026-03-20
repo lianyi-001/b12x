@@ -1,0 +1,1286 @@
+{
+  "a_layout": {
+    "A_reg0_byte0": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg0_byte1": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg0_byte2": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg0_byte3": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg1_byte0": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg1_byte1": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg1_byte2": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg1_byte3": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg2_byte0": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg2_byte1": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg2_byte2": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg2_byte3": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 1,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg3_byte0": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg3_byte1": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg3_byte2": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "A_reg3_byte3": {
+      "nonzero_count": 64,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 2,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 3,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    }
+  },
+  "b_layout": {
+    "B_reg0_byte0": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg0_byte1": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg0_byte2": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg0_byte3": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg1_byte0": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg1_byte1": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg1_byte2": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    },
+    "B_reg1_byte3": {
+      "nonzero_count": 128,
+      "positions": [
+        {
+          "thread": 0,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 0,
+          "d_idx": 3,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 0,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 1,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 2,
+          "value": 4.0
+        },
+        {
+          "thread": 1,
+          "d_idx": 3,
+          "value": 4.0
+        }
+      ]
+    }
+  },
+  "thread0_d_with_unique_a": [
+    208.0,
+    208.0,
+    336.0,
+    336.0
+  ],
+  "all_threads_d_with_unique_a": {
+    "0": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "1": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "2": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "3": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "4": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "5": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "6": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "7": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "8": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "9": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "10": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "11": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "12": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "13": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "14": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "15": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "16": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "17": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "18": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "19": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "20": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "21": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "22": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "23": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "24": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "25": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "26": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "27": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "28": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "29": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "30": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ],
+    "31": [
+      208.0,
+      208.0,
+      336.0,
+      336.0
+    ]
+  }
+}
