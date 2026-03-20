@@ -1207,7 +1207,7 @@ class SM120ForwardKernel:
                     0,
                     cute.make_layout(1),
                     gK,
-                    sKRaw if const_expr(self.kv_is_fp8) else sK,
+                    cute.recast_tensor(sKRaw, cutlass.Uint8) if const_expr(self.kv_is_fp8) else sK,
                 )
                 load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
             if const_expr(self.use_tma_V):
