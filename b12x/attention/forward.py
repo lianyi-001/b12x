@@ -378,6 +378,14 @@ class SM120ForwardKernel:
             self.use_mxfp8_pv = True
         else:
             self.use_mxfp8_pv = False
+        # MXFP8 QK: quantize Q (BF16→E4M3) and use K (raw FP8) with m16n8k32.
+        # Requires Q_in_regs=True, FP8 KV, and head_dim divisible by 32.
+        self.use_mxfp8_qk = (
+            self.kv_is_fp8
+            and Q_in_regs
+            and head_dim % 32 == 0
+            and self.use_mxfp8_pv  # only when PV turbo is also on
+        )
         self.paged_direct_q_seqlen = paged_direct_q_seqlen
 
     def _check_type(
@@ -1312,7 +1320,17 @@ class SM120ForwardKernel:
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
-        if const_expr(self.kv_is_fp8):
+        if const_expr(self.use_mxfp8_qk):
+            warp_mma_gemm_rs_mxfp8(
+                acc_S,
+                tSrQ,
+                tSrKRaw,
+                tSsKRaw[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_KRaw,
+            )
+        elif const_expr(self.kv_is_fp8):
             warp_mma_gemm_fp8(
                 thr_mma_qk,
                 acc_S,
