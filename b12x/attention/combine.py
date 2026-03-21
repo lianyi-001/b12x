@@ -158,11 +158,19 @@ class PagedAttentionCombineKernel:
         if warp_idx == 0 and lane == 0:
             mLSE[head_idx, row_idx] = final_lse
 
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(self.head_dim, self.num_threads)):
+        num_elems_per_thread = cute.ceil_div(self.head_dim, self.num_threads)
+        accums = cute.make_rmem_tensor(
+            cute.make_layout((num_elems_per_thread,), stride=(1,)),
+            Float32,
+        )
+        accums.fill(0.0)
+        for split_idx in cutlass.range_constexpr(self.num_splits):
+            weight = cute.arch.shuffle_sync(split_weight, Int32(split_idx))
+            for idx_iter in cutlass.range_constexpr(num_elems_per_thread):
+                k_idx = tidx + idx_iter * self.num_threads
+                if k_idx < self.head_dim:
+                    accums[idx_iter] += weight * mO_partial[split_idx, row_idx, head_idx, k_idx].to(Float32)
+        for idx_iter in cutlass.range_constexpr(num_elems_per_thread):
             k_idx = tidx + idx_iter * self.num_threads
             if k_idx < self.head_dim:
-                accum = Float32.zero
-                for split_idx in cutlass.range_constexpr(self.num_splits):
-                    weight = cute.arch.shuffle_sync(split_weight, Int32(split_idx))
-                    accum += weight * mO_partial[split_idx, row_idx, head_idx, k_idx].to(Float32)
-                mO[row_idx, head_idx, k_idx] = accum.to(self.dtype)
+                mO[row_idx, head_idx, k_idx] = accums[idx_iter].to(self.dtype)
