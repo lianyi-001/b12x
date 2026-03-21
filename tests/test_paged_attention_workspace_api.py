@@ -344,9 +344,9 @@ def test_uniform_extend_plan_uses_paged_direct_scheduler() -> None:
     assert plan.kernel_family == "main"
     assert plan.tile_m == 48
     assert plan.tile_n == 64
-    assert plan.num_splits == 16
+    assert plan.num_splits == 24
     assert plan.num_compute_warps == 3
-    assert plan.q_in_regs is False
+    assert plan.q_in_regs is True
     assert plan.paged_direct_q_seqlen == 6
 
 
@@ -710,7 +710,7 @@ def test_auto_split_bucket_selection_is_deterministic() -> None:
     )
 
     assert plan0.num_splits == 1
-    assert plan1.num_splits == 8
+    assert plan1.num_splits == 16
 
 
 def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
@@ -853,7 +853,7 @@ def test_fp8_extend_plan_keeps_mid_context_split_count() -> None:
 
     assert plan.mode == "extend"
     assert plan.kv_dtype == torch.float8_e4m3fn
-    assert plan.num_splits == 8
+    assert plan.num_splits == 32
 
 
 def test_page_size_other_than_64_is_rejected() -> None:
