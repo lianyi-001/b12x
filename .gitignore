@@ -16,3 +16,4 @@ uv.lock
 *.o
 run_*.log
 results*.tsv
+experiments/
