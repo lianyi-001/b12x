@@ -830,6 +830,7 @@ def _get_static_kernel(
             _LAST_KERNEL = (cache_key, cached)
             return cached
 
+
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
@@ -1072,6 +1073,113 @@ def _get_micro_kernel(
     return result
 
 
+class _DynamicMoELaunch:
+    """Thin wrapper that makes num_tokens and max_rows runtime Int32."""
+
+    def __init__(self, kernel, k, num_topk):
+        self._kernel = kernel
+        self._k = k
+        self._half_k = k // 2
+        self._num_topk = num_topk
+        self._cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+
+    @cute.jit
+    def __call__(
+        self,
+        a_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
+        topk_weights_ptr: cute.Pointer,
+        packed_a_ptr: cute.Pointer,
+        sfa_ptr: cute.Pointer,
+        packed_a_storage_ptr: cute.Pointer,
+        scale_storage_ptr: cute.Pointer,
+        barrier_count: cute.Tensor,
+        barrier_epoch: cute.Tensor,
+        pair_head: cute.Tensor,
+        producers_done_count: cute.Tensor,
+        all_work_published: cute.Tensor,
+        task_head: cute.Tensor,
+        task_tail: cute.Tensor,
+        task_ready_ptr: cute.Pointer,
+        task_expert_ptr: cute.Pointer,
+        task_m_tile_ptr: cute.Pointer,
+        task_slice_begin_ptr: cute.Pointer,
+        task_slice_count_ptr: cute.Pointer,
+        task_valid_rows_ptr: cute.Pointer,
+        tile_write_count_ptr: cute.Pointer,
+        b_w13: cute.Tensor,
+        sfb_w13_ptr: cute.Pointer,
+        b_down: cute.Tensor,
+        sfb_down_ptr: cute.Pointer,
+        row_counts: cute.Tensor,
+        expert_write_rows: cute.Tensor,
+        expert_tile_base: cute.Tensor,
+        input_global_scale: cute.Tensor,
+        alpha: cute.Tensor,
+        down_alpha: cute.Tensor,
+        global_scale: cute.Tensor,
+        scatter_ptr: cute.Pointer,
+        token_map_ptr: cute.Pointer,
+        token_weights_ptr: cute.Pointer,
+        num_tokens: cutlass.Int32,
+        max_rows: cutlass.Int32,
+        rows_padded: cutlass.Int32,
+        max_tasks: cutlass.Int32,
+        max_phys_tiles: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        a_input = cute.make_tensor(a_ptr, layout=cute.make_layout(
+            (num_tokens, self._k), stride=(self._k, 1)))
+        topk_ids = cute.make_tensor(topk_ids_ptr, layout=cute.make_layout(
+            (num_tokens * self._num_topk,), stride=(1,)))
+        topk_weights_t = cute.make_tensor(topk_weights_ptr, layout=cute.make_layout(
+            (num_tokens * self._num_topk,), stride=(1,)))
+        scatter_output = cute.make_tensor(scatter_ptr, layout=cute.make_layout(
+            (num_tokens, self._k), stride=(self._k, 1)))
+        packed_a = cute.make_tensor(packed_a_ptr, layout=cute.make_layout(
+            (rows_padded, self._k, 1), stride=(self._k, 1, rows_padded * self._k)))
+        packed_a_storage = cute.make_tensor(packed_a_storage_ptr, layout=cute.make_layout(
+            (rows_padded * self._half_k,), stride=(1,)))
+        scale_storage = cute.make_tensor(scale_storage_ptr, layout=cute.make_layout(
+            (rows_padded * self._cols_pad_k,), stride=(1,)))
+        token_map = cute.make_tensor(token_map_ptr, layout=cute.make_layout(
+            (rows_padded,), stride=(1,)))
+        token_weights_t = cute.make_tensor(token_weights_ptr, layout=cute.make_layout(
+            (rows_padded,), stride=(1,)))
+        task_ready = cute.make_tensor(task_ready_ptr, layout=cute.make_layout(
+            (max_tasks,), stride=(1,)))
+        task_expert = cute.make_tensor(task_expert_ptr, layout=cute.make_layout(
+            (max_tasks,), stride=(1,)))
+        task_m_tile = cute.make_tensor(task_m_tile_ptr, layout=cute.make_layout(
+            (max_tasks,), stride=(1,)))
+        task_slice_begin = cute.make_tensor(task_slice_begin_ptr, layout=cute.make_layout(
+            (max_tasks,), stride=(1,)))
+        task_slice_count = cute.make_tensor(task_slice_count_ptr, layout=cute.make_layout(
+            (max_tasks,), stride=(1,)))
+        task_valid_rows = cute.make_tensor(task_valid_rows_ptr, layout=cute.make_layout(
+            (max_tasks,), stride=(1,)))
+        tile_write_count = cute.make_tensor(tile_write_count_ptr, layout=cute.make_layout(
+            (max_phys_tiles,), stride=(1,)))
+        self._kernel(
+            a_input, topk_ids, topk_weights_t,
+            packed_a, sfa_ptr, packed_a_storage, scale_storage,
+            barrier_count, barrier_epoch,
+            pair_head, producers_done_count, all_work_published,
+            task_head, task_tail, task_ready,
+            task_expert, task_m_tile,
+            task_slice_begin, task_slice_count, task_valid_rows,
+            tile_write_count,
+            b_w13, sfb_w13_ptr,
+            b_down, sfb_down_ptr,
+            row_counts, expert_write_rows, expert_tile_base,
+            input_global_scale, alpha, down_alpha, global_scale,
+            scatter_output, token_map, token_weights_t,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
+
+
 def _get_dynamic_kernel(
     E: int,
     m: int,
@@ -1087,12 +1195,10 @@ def _get_dynamic_kernel(
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
-    max_phys_tiles, _, max_tasks = _dynamic_task_geometry(E, n, max_rows)
-    rows_padded = max_phys_tiles * _LEVEL_TILE_M
 
     global _LAST_KERNEL
     cache_key = (
-        "dynamic", E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
+        "dynamic", E, k, n, num_topk, mac, topk_ids_dtype,
         input_scales_are_reciprocal, fast_math,
     )
     last_kkey, last_kval = _LAST_KERNEL
@@ -1119,31 +1225,21 @@ def _get_dynamic_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
+    launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
-    rows_pad_k = rows_padded
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
-
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
-    )
     topk_ids_cutlass_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
-        topk_ids_cutlass_dtype, (m * num_topk,), assumed_align=topk_ids_align,
-    )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (m * num_topk,), assumed_align=4,
-    )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype, (rows_padded, k, 1), stride_order=(1, 0, 2), assumed_align=16,
-    )
+
+    # a_input, topk_ids, topk_weights, scatter_output are pointers — shapes
+    # are constructed at runtime from num_tokens Int32.
+    a_input_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    topk_ids_fake = make_ptr(topk_ids_cutlass_dtype, topk_ids_align, cute.AddressSpace.gmem, assumed_align=topk_ids_align)
+    topk_weights_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+
+    packed_a_fake = make_ptr(ab_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (rows_padded * (k // 2),), assumed_align=16,
-    )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (rows_pad_k * cols_pad_k,), assumed_align=16,
-    )
+    packed_a_storage_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    scale_storage_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
@@ -1165,27 +1261,15 @@ def _get_dynamic_kernel(
     task_tail_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
-    task_ready_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_tasks,), assumed_align=4,
-    )
-    task_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_tasks,), assumed_align=4,
-    )
-    task_m_tile_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_tasks,), assumed_align=4,
-    )
-    task_slice_begin_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_tasks,), assumed_align=4,
-    )
-    task_slice_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_tasks,), assumed_align=4,
-    )
-    task_valid_rows_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_tasks,), assumed_align=4,
-    )
-    tile_write_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (max_phys_tiles,), assumed_align=4,
-    )
+    tasks_ph = 1
+    tiles_ph = 1
+    task_ready_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    task_expert_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    task_m_tile_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    task_slice_begin_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    task_slice_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    task_valid_rows_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    tile_write_count_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype, (2 * n, k, E), stride_order=(1, 0, 2), assumed_align=16,
     )
@@ -1215,17 +1299,11 @@ def _get_dynamic_kernel(
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (E,), assumed_align=16,
     )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
-    )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (rows_padded,), assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (rows_padded,), assumed_align=16,
-    )
+    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    token_weights_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     compiled = cute.compile(
-        kernel,
+        launch,
         a_input_fake, topk_ids_fake, topk_weights_fake,
         packed_a_fake, sfa_fake,
         packed_a_storage_fake, scale_storage_fake,
@@ -1240,7 +1318,7 @@ def _get_dynamic_kernel(
         row_counts_fake, expert_write_rows_fake, expert_tile_base_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
-        mac, current_cuda_stream(),
+        1, 1, 1, 1, 1, mac, current_cuda_stream(),
     )
 
     result = (compiled, mac)
@@ -1279,20 +1357,38 @@ def _launch_dynamic(
         fast_math=fast_math,
         mac_override=effective_mac,
     )
+    _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+    ids_cutlass_dtype = cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
+    ids_align = 4 if flat_ids.dtype == torch.int32 else 8
     compiled(
-        a, flat_ids, flat_weights,
-        workspace.packed_a_view, workspace.sfa_ptr, workspace.packed_a_flat, workspace.scale_flat,
+        _gptr(cutlass.BFloat16, a),
+        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
+        _gptr(cutlass.Float32, flat_weights, 4),
+        _gptr(cutlass.Float4E2M1FN, workspace.packed_a_view),
+        workspace.sfa_ptr,
+        _gptr(cutlass.Uint8, workspace.packed_a_flat),
+        _gptr(cutlass.Uint8, workspace.scale_flat),
         workspace.barrier_count, workspace.barrier_epoch,
         workspace.pair_head, workspace.producers_done_count, workspace.all_work_published,
-        workspace.task_head, workspace.task_tail, workspace.task_ready,
-        workspace.task_expert, workspace.task_m_tile,
-        workspace.task_slice_begin, workspace.task_slice_count, workspace.task_valid_rows,
-        workspace.tile_write_count,
+        workspace.task_head, workspace.task_tail,
+        _gptr(cutlass.Int32, workspace.task_ready, 4),
+        _gptr(cutlass.Int32, workspace.task_expert, 4),
+        _gptr(cutlass.Int32, workspace.task_m_tile, 4),
+        _gptr(cutlass.Int32, workspace.task_slice_begin, 4),
+        _gptr(cutlass.Int32, workspace.task_slice_count, 4),
+        _gptr(cutlass.Int32, workspace.task_valid_rows, 4),
+        _gptr(cutlass.Int32, workspace.tile_write_count, 4),
         weights.w13_fp4, weights.sfb_w13_ptr,
         weights.down_fp4, weights.sfb_down_ptr,
         workspace.row_counts, workspace.expert_write_rows, workspace.expert_tile_base,
         workspace.input_gs, weights.w1_alpha, weights.w2_alpha, workspace.down_input_scale,
-        scatter_output, workspace.token_map, workspace.token_weights,
+        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Int32, workspace.token_map, 4),
+        _gptr(cutlass.Float32, workspace.token_weights, 4),
+        m, max_rows,
+        _dynamic_task_geometry(E, n, max_rows)[0] * _LEVEL_TILE_M,
+        _dynamic_task_geometry(E, n, max_rows)[2],
+        _dynamic_task_geometry(E, n, max_rows)[0],
         mac, stream,
     )
 
