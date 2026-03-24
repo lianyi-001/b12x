@@ -1466,6 +1466,7 @@ def _launch_compact_static(
     )
 
 
+@torch._dynamo.disable
 def b12x_moe_fp4(
     a: torch.Tensor,           # [m, k] bf16 activations
     a1_gscale: torch.Tensor,   # [E] or scalar — input quant scale

@@ -14,7 +14,7 @@ from .forward_paged import PagedForwardKernel
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .planner import PagedPlan
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
-from .workspace import PagedWorkspace
+from .workspace import PagedAttentionWorkspace
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -89,26 +89,35 @@ def paged_attention_forward(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
     *,
-    workspace: PagedWorkspace,
-    plan: PagedPlan,
+    workspace: PagedAttentionWorkspace,
+    output: torch.Tensor,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if workspace.plan_key is not None and workspace.plan_key != plan.key:
-        raise ValueError("workspace.plan_key does not match the provided plan")
+    plan = workspace.plan
+    page_table = workspace.page_table
+    cache_seqlens = workspace.cache_seqlens
+    cu_seqlens_q = workspace.cu_seqlens_q
+    if page_table is None or cache_seqlens is None or cu_seqlens_q is None:
+        raise RuntimeError("paged workspace metadata has not been prepared")
     if plan.split_kv and (workspace.tmp_output is None or workspace.tmp_lse is None):
         raise ValueError("split-kv plan requires tmp_output and tmp_lse in the workspace")
-    if output is None:
-        output = workspace.output
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
         k_descale = k_descale[:, 0].contiguous()
     if v_descale is not None and v_descale.ndim == 2 and int(v_descale.shape[1]) == 1:
         v_descale = v_descale[:, 0].contiguous()
+    if output.ndim != 3:
+        raise ValueError(f"output must be rank-3 [total_q, heads, head_dim], got {tuple(output.shape)}")
+    if int(output.shape[0]) < int(plan.total_q):
+        raise ValueError(
+            f"output first dimension must be at least total_q={plan.total_q}, got {int(output.shape[0])}"
+        )
+    if tuple(output.shape[1:]) != (plan.num_q_heads, plan.head_dim_vo):
+        raise ValueError(
+            "output shape must match the prepared workspace contract: "
+            f"expected (*, {plan.num_q_heads}, {plan.head_dim_vo}), got {tuple(output.shape)}"
+        )
 
     if (k_cache.dtype == torch.float8_e4m3fn or v_cache.dtype == torch.float8_e4m3fn) and (
         k_descale is None or v_descale is None
@@ -150,6 +159,7 @@ def paged_attention_forward(
     kv_tile_indices_arg = _to_kernel_tensor(workspace.kv_tile_indices, cutlass.Int32, assumed_align=4)
     o_indptr_arg = _to_kernel_tensor(workspace.o_indptr, cutlass.Int32, assumed_align=4)
     kv_chunk_size_arg = _to_kernel_tensor(workspace.kv_chunk_size_ptr, cutlass.Int32, assumed_align=4)
+    block_valid_mask_arg = _to_kernel_tensor(workspace.block_valid_mask, cutlass.Int32, assumed_align=4)
     k_descale_arg = _to_kernel_tensor(k_descale, cutlass.Float32)
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
 
@@ -166,6 +176,7 @@ def paged_attention_forward(
         kv_tile_indices_arg,
         o_indptr_arg,
         kv_chunk_size_arg,
+        block_valid_mask_arg,
         forward_output_arg,
         forward_lse_arg,
         k_descale_arg,
@@ -196,7 +207,7 @@ def paged_attention_forward(
             stream=stream,
         )
 
-    return output, workspace.lse
+    return output[: plan.total_q], workspace.current_lse_view()
 
 
 def clear_paged_caches() -> None:

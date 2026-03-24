@@ -7,13 +7,8 @@ import torch
 
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
-    allocate_paged_attention_workspace_pool,
-    allocate_paged_attention_workspace_for_plan,
-    b12x_paged_decode,
-    b12x_paged_extend,
-    b12x_paged_attention_forward,
+    PagedAttentionWorkspace,
     clear_attention_caches,
-    create_paged_attention_plan,
     infer_paged_attention_mode,
 )
 
@@ -124,6 +119,23 @@ def _quantize_paged_kv_cache_e4m3(
     return k_quant.contiguous(), v_quant.contiguous(), k_descale.contiguous(), v_descale.contiguous()
 
 
+def _make_workspace(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    use_cuda_graph: bool = False,
+) -> PagedAttentionWorkspace:
+    return PagedAttentionWorkspace.for_tensors(
+        mode=infer_paged_attention_mode(cu_seqlens_q),
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        use_cuda_graph=use_cuda_graph,
+    )
+
+
 @pytest.mark.parametrize("fixed_split_size", [None, 4])
 def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(
     fixed_split_size: int | None,
@@ -137,27 +149,20 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(
         page_size=64,
         seed=23,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
-        causal=True,
         fixed_split_size=fixed_split_size,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
-    out, lse = b12x_paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
-    )
+    output = torch.empty_like(q)
+    out, lse = workspace.run(q, k_cache, v_cache, output=output)
     ref_out, ref_lse = paged_attention_reference(
         q,
         k_cache,
@@ -174,7 +179,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
-def test_paged_plan_exposes_primary_backend_metadata() -> None:
+def test_paged_workspace_exposes_primary_backend_metadata() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -184,15 +189,14 @@ def test_paged_plan_exposes_primary_backend_metadata() -> None:
         page_size=64,
         seed=29,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens_t,
-        cu_seqlens_q,
-        causal=True,
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
     )
+    workspace.prepare(page_table, cache_seqlens_t, cu_seqlens_q)
+    plan = workspace.plan
 
     assert plan.num_q_heads == 8
     assert plan.num_kv_heads == 1
@@ -223,25 +227,19 @@ def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
         page_table,
         cache_seqlens,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_fp8,
-        v_fp8,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
-    out, lse = b12x_paged_attention_forward(
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    output = torch.empty_like(q)
+    out, lse = workspace.run(
         q,
         k_fp8,
         v_fp8,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
+        output=output,
         k_descale=k_descale,
         v_descale=v_descale,
     )
@@ -258,7 +256,7 @@ def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
     )
     torch.cuda.synchronize()
 
-    assert plan.kv_dtype == torch.float8_e4m3fn
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
     assert (out - ref_out).abs().max().item() <= 0.05
     assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(out, ref_out) >= 0.9999
@@ -285,7 +283,7 @@ def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
     assert infer_paged_attention_mode(cu_seqlens_extend) == "extend"
 
 
-def test_decode_plan_uses_small_q_tile() -> None:
+def test_decode_prepare_uses_small_q_tile() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -295,221 +293,75 @@ def test_decode_plan_uses_small_q_tile() -> None:
         page_size=64,
         seed=39,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
     )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
 
-    assert plan.mode == "decode"
-    assert plan.cta_tile_q == 16
-    assert plan.kv_chunk_size == 2 * 64
+    assert workspace.plan.mode == "decode"
+    assert workspace.plan.cta_tile_q == 16
+    assert workspace.plan.kv_chunk_size == 2 * 64
 
 
-def test_uniform_extend_plan_uses_large_q_tile_and_expected_chunking() -> None:
+def test_workspace_eager_path_grows_with_larger_shape() -> None:
     require_sm120()
     clear_attention_caches()
 
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[8192] * 8,
-        page_size=64,
-        seed=49,
-        num_pages=1024,
-    )
-    k_quant, v_quant, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-    )
-    plan = create_paged_attention_plan(
-        q,
-        k_quant,
-        v_quant,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_dtype == torch.float8_e4m3fn
-    assert plan.cta_tile_q == 64
-    assert plan.kv_chunk_size == 6 * 64
-    assert plan.split_kv is True
-
-
-def test_workspace_allocation_validates_plan_capacity() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=[6, 5, 7, 4],
-        cache_seqlens=[97, 81, 113, 68],
+    small = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[64, 64, 64, 64],
         page_size=64,
         seed=41,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
-    )
-
-    with pytest.raises(ValueError, match="workspace total_q"):
-        allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0] + 1)
-    with pytest.raises(ValueError, match="workspace batch"):
-        allocate_paged_attention_workspace_for_plan(plan, batch=page_table.shape[0] + 1)
-
-
-def test_paged_workspace_pool_reuses_plan_exact_shape() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=[6, 5, 7, 4],
-        cache_seqlens=[97, 81, 113, 68],
+    large = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[2048, 2048, 4096, 4096],
         page_size=64,
         seed=43,
+        page_table_width=64,
+        num_pages=512,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
+    q_s, k_s, v_s, pt_s, cs_s, cu_s = small
+    q_l, k_l, v_l, pt_l, cs_l, cu_l = large
+    workspace = _make_workspace(
+        q=q_s,
+        k_cache=k_s,
+        v_cache=v_s,
+        cu_seqlens_q=cu_s,
     )
-    pool = allocate_paged_attention_workspace_pool()
+    workspace.prepare(pt_s, cs_s, cu_s)
+    request_items_small = int(workspace.request_indices.shape[0])
+    merge_small = int(workspace.merge_indptr.shape[0])
 
-    out0, lse0 = b12x_paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=pool,
-        plan=plan,
-    )
-    out1, lse1 = b12x_paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=pool,
-        plan=plan,
-    )
-
-    assert out0.data_ptr() == out1.data_ptr()
-    assert lse0.data_ptr() == lse1.data_ptr()
-    assert len(pool.workspaces) == 1
+    workspace.prepare(pt_l, cs_l, cu_l)
+    assert int(workspace.request_indices.shape[0]) >= request_items_small
+    assert int(workspace.merge_indptr.shape[0]) >= merge_small
 
 
-def test_paged_workspace_pool_requires_explicit_plan() -> None:
+def test_workspace_mode_validation_rejects_mismatched_prepare() -> None:
     require_sm120()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
         q_seqlens=[6, 5, 7, 4],
         cache_seqlens=[97, 81, 113, 68],
-        page_size=64,
-        seed=45,
-    )
-    pool = allocate_paged_attention_workspace_pool()
-
-    with pytest.raises(TypeError, match="explicit PagedAttentionPlan"):
-        b12x_paged_attention_forward(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            workspace=pool,
-        )
-
-
-def test_paged_decode_and_extend_surfaces_validate_mode() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    decode_inputs = _make_paged_inputs(
-        q_seqlens=[1, 1, 1, 1],
-        cache_seqlens=[64, 96, 128, 70],
         page_size=64,
         seed=47,
     )
-    extend_inputs = _make_paged_inputs(
-        q_seqlens=[6, 5, 7, 4],
-        cache_seqlens=[97, 81, 113, 68],
-        page_size=64,
-        seed=49,
+    workspace = PagedAttentionWorkspace.for_tensors(
+        mode="decode",
+        q=q[:4],
+        k_cache=k_cache,
+        v_cache=v_cache,
     )
-    q_d, k_d, v_d, pt_d, cs_d, cu_d = decode_inputs
-    q_e, k_e, v_e, pt_e, cs_e, cu_e = extend_inputs
-    decode_plan = create_paged_attention_plan(q_d, k_d, v_d, pt_d, cs_d, cu_d, causal=True)
-    extend_plan = create_paged_attention_plan(q_e, k_e, v_e, pt_e, cs_e, cu_e, causal=True)
-    decode_workspace = allocate_paged_attention_workspace_for_plan(decode_plan, total_q=q_d.shape[0])
-    extend_workspace = allocate_paged_attention_workspace_for_plan(extend_plan, total_q=q_e.shape[0])
-
-    b12x_paged_decode(
-        q_d,
-        k_d,
-        v_d,
-        pt_d,
-        cs_d,
-        cu_d,
-        workspace=decode_workspace,
-        plan=decode_plan,
-    )
-    b12x_paged_extend(
-        q_e,
-        k_e,
-        v_e,
-        pt_e,
-        cs_e,
-        cu_e,
-        workspace=extend_workspace,
-        plan=extend_plan,
-    )
-
-    with pytest.raises(ValueError, match="expected a decode plan"):
-        b12x_paged_decode(
-            q_e,
-            k_e,
-            v_e,
-            pt_e,
-            cs_e,
-            cu_e,
-            workspace=extend_workspace,
-            plan=extend_plan,
-        )
-    with pytest.raises(ValueError, match="expected an extend plan"):
-        b12x_paged_extend(
-            q_d,
-            k_d,
-            v_d,
-            pt_d,
-            cs_d,
-            cu_d,
-            workspace=decode_workspace,
-            plan=decode_plan,
-        )
+    with pytest.raises(ValueError, match="workspace mode decode does not match prepared mode extend"):
+        workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
 
 
-def test_public_fixed_split_size_pins_chunk_pages() -> None:
+def test_workspace_fixed_split_size_pins_chunk_pages() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -519,51 +371,99 @@ def test_public_fixed_split_size_pins_chunk_pages() -> None:
         page_size=64,
         seed=51,
     )
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
-        causal=True,
         fixed_split_size=8,
     )
 
-    assert plan.fixed_split_size == 8
-    assert plan.kv_chunk_size == 8 * 64
+    assert workspace.plan.fixed_split_size == 8
+    assert workspace.plan.kv_chunk_size == 8 * 64
 
 
-def test_public_surface_rejects_softmax_scale_override() -> None:
+def test_graph_workspace_reuses_stable_metadata_buffers_for_smaller_replay() -> None:
     require_sm120()
     clear_attention_caches()
 
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+    capture_inputs = _make_paged_inputs(
         q_seqlens=[6, 5, 7, 4],
-        cache_seqlens=[97, 81, 113, 68],
+        cache_seqlens=[2048, 2048, 4096, 4096],
         page_size=64,
-        seed=53,
+        seed=59,
+        page_table_width=64,
+        num_pages=512,
     )
+    replay_inputs = _make_paged_inputs(
+        q_seqlens=[4, 4, 4, 4],
+        cache_seqlens=[1024, 1536, 2048, 2048],
+        page_size=64,
+        seed=61,
+        page_table_width=64,
+        num_pages=512,
+    )
+    q0, k0, v0, pt0, cs0, cu0 = capture_inputs
+    q1, k1, v1, pt1, cs1, cu1 = replay_inputs
 
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
+    workspace = _make_workspace(
+        q=q0,
+        k_cache=k0,
+        v_cache=v0,
+        cu_seqlens_q=cu0,
+        use_cuda_graph=True,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
-    with pytest.raises(ValueError, match="softmax_scale overrides"):
-        b12x_paged_attention_forward(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            workspace=workspace,
-            plan=plan,
-            softmax_scale=0.125,
-        )
+    workspace.prepare(pt0, cs0, cu0)
+    ptrs = (
+        workspace.request_indices.data_ptr(),
+        workspace.page_table.data_ptr(),
+        workspace.cache_seqlens.data_ptr(),
+        workspace.cu_seqlens_q.data_ptr(),
+    )
+    workspace.prepare(pt1, cs1, cu1)
+
+    assert ptrs == (
+        workspace.request_indices.data_ptr(),
+        workspace.page_table.data_ptr(),
+        workspace.cache_seqlens.data_ptr(),
+        workspace.cu_seqlens_q.data_ptr(),
+    )
+    assert workspace.active_total_q == q1.shape[0]
+
+
+def test_graph_workspace_rejects_capacity_growth() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    small = _make_paged_inputs(
+        q_seqlens=[1, 1],
+        cache_seqlens=[64, 64],
+        page_size=64,
+        seed=67,
+    )
+    large = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[8192, 8192, 8192, 8192],
+        page_size=64,
+        seed=71,
+        page_table_width=128,
+        num_pages=1024,
+    )
+    q_s, k_s, v_s, pt_s, cs_s, cu_s = small
+    q_l, k_l, v_l, pt_l, cs_l, cu_l = large
+    workspace = _make_workspace(
+        q=q_s,
+        k_cache=k_s,
+        v_cache=v_s,
+        cu_seqlens_q=cu_s,
+        use_cuda_graph=True,
+    )
+    workspace.prepare(pt_s, cs_s, cu_s)
+
+    with pytest.raises(ValueError, match="graph-mode paged workspace capacity exceeded"):
+        workspace.prepare(pt_l, cs_l, cu_l)

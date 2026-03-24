@@ -4,10 +4,8 @@ import math
 
 import torch
 
-from b12x.attention.paged.api import paged_attention_forward
-from b12x.attention.paged.planner import create_paged_plan
-from b12x.attention.paged.workspace import allocate_paged_workspace_for_plan
 from b12x.attention.reference import paged_attention_reference
+from b12x.integration.attention import PagedAttentionWorkspace
 
 from .helpers import require_sm120
 from .test_attention_paged_planner import _make_inputs
@@ -20,6 +18,21 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
 
 
+def _make_workspace(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    mode: str,
+) -> PagedAttentionWorkspace:
+    return PagedAttentionWorkspace.for_tensors(
+        mode=mode,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+
+
 @torch.inference_mode()
 def test_paged_forward_matches_reference_without_split() -> None:
     require_sm120()
@@ -29,26 +42,18 @@ def test_paged_forward_matches_reference_without_split() -> None:
         dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
     )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
+    workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
         disable_split_kv=True,
     )
-    workspace = allocate_paged_workspace_for_plan(plan)
-
-    output, lse_base2 = paged_attention_forward(
+    output, lse_base2 = workspace.run(
         q,
         k_cache,
         v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
+        output=torch.empty_like(q),
     )
     torch.cuda.synchronize()
 
@@ -61,7 +66,7 @@ def test_paged_forward_matches_reference_without_split() -> None:
         cu_seqlens_q,
         causal=True,
     )
-    lse_natural = lse_base2.transpose(0, 1) * math.log(2.0)
+    lse_natural = lse_base2 * math.log(2.0)
     assert (output - ref_out).abs().max().item() <= 0.03
     assert (lse_natural - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out) >= 0.99999
@@ -82,26 +87,18 @@ def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> No
         page_table,
         cache_seqlens,
     )
-    plan = create_paged_plan(
-        q,
-        k_fp8,
-        v_fp8,
+    workspace = _make_workspace(q, k_fp8, v_fp8, mode="decode")
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
         disable_split_kv=True,
     )
-    workspace = allocate_paged_workspace_for_plan(plan)
-
-    output, lse_base2 = paged_attention_forward(
+    output, lse_base2 = workspace.run(
         q,
         k_fp8,
         v_fp8,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
+        output=torch.empty_like(q),
         k_descale=k_descale,
         v_descale=v_descale,
     )
@@ -118,7 +115,7 @@ def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> No
         v_descale=v_descale,
         causal=True,
     )
-    lse_natural = lse_base2.transpose(0, 1) * math.log(2.0)
+    lse_natural = lse_base2 * math.log(2.0)
     assert (output - ref_out).abs().max().item() <= 0.05
     assert (lse_natural - ref_lse).abs().max().item() <= 0.08
     assert _cosine_similarity(output, ref_out) >= 0.999
@@ -133,27 +130,14 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
         dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
     )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
         disable_split_kv=True,
     )
-    workspace = allocate_paged_workspace_for_plan(plan)
-
-    output, lse_base2 = paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
-    )
+    output, lse_base2 = workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
     torch.cuda.synchronize()
 
     ref_out, ref_lse = paged_attention_reference(
@@ -165,7 +149,7 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
         cu_seqlens_q,
         causal=True,
     )
-    lse_natural = lse_base2.transpose(0, 1) * math.log(2.0)
+    lse_natural = lse_base2 * math.log(2.0)
     assert (output - ref_out).abs().max().item() <= 0.03
     assert (lse_natural - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out) >= 0.99999
@@ -186,26 +170,18 @@ def test_paged_forward_matches_reference_with_split_fp8_kv() -> None:
         page_table,
         cache_seqlens,
     )
-    plan = create_paged_plan(
-        q,
-        k_fp8,
-        v_fp8,
+    workspace = _make_workspace(q, k_fp8, v_fp8, mode="extend")
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
         fixed_split_size=8,
     )
-    workspace = allocate_paged_workspace_for_plan(plan)
-
-    output, lse_base2 = paged_attention_forward(
+    output, lse_base2 = workspace.run(
         q,
         k_fp8,
         v_fp8,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
+        output=torch.empty_like(q),
         k_descale=k_descale,
         v_descale=v_descale,
     )
@@ -222,7 +198,7 @@ def test_paged_forward_matches_reference_with_split_fp8_kv() -> None:
         v_descale=v_descale,
         causal=True,
     )
-    lse_natural = lse_base2.transpose(0, 1) * math.log(2.0)
+    lse_natural = lse_base2 * math.log(2.0)
     assert (output - ref_out).abs().max().item() <= 0.05
     assert (lse_natural - ref_lse).abs().max().item() <= 0.08
     assert _cosine_similarity(output, ref_out) >= 0.999
@@ -237,27 +213,14 @@ def test_paged_forward_matches_reference_with_split_bf16_kv() -> None:
         dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
     )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
         fixed_split_size=8,
     )
-    workspace = allocate_paged_workspace_for_plan(plan)
-
-    output, lse_base2 = paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=workspace,
-        plan=plan,
-    )
+    output, lse_base2 = workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
     torch.cuda.synchronize()
 
     ref_out, ref_lse = paged_attention_reference(
@@ -269,7 +232,7 @@ def test_paged_forward_matches_reference_with_split_bf16_kv() -> None:
         cu_seqlens_q,
         causal=True,
     )
-    lse_natural = lse_base2.transpose(0, 1) * math.log(2.0)
+    lse_natural = lse_base2 * math.log(2.0)
     assert (output - ref_out).abs().max().item() <= 0.03
     assert (lse_natural - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out) >= 0.99999

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from b12x.attention.paged.planner import create_paged_plan, infer_paged_mode
-from b12x.attention.paged.workspace import allocate_paged_workspace_for_plan
+from b12x.integration.attention import PagedAttentionWorkspace
 
 
 _EXPLICIT_TOKEN_LENGTHS = [
@@ -142,9 +142,19 @@ def test_paged_workspace_shapes_follow_plan_metadata() -> None:
         cu_seqlens_q,
         fixed_split_size=16,
     )
-    workspace = allocate_paged_workspace_for_plan(plan)
+    workspace = PagedAttentionWorkspace.for_tensors(
+        mode="extend",
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        fixed_split_size=16,
+    )
 
-    assert workspace.output.shape == (7, 8, 256)
     assert workspace.lse.shape == (8, 7)
     assert workspace.kv_chunk_size_ptr.item() == 16 * 64
     assert workspace.total_num_rows_ptr.item() == 7

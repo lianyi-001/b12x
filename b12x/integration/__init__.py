@@ -1,16 +1,6 @@
 from .attention import (
-    PagedAttentionPlan,
-    PagedAttentionPlanKey,
     PagedAttentionWorkspace,
-    PagedAttentionWorkspacePool,
-    allocate_paged_attention_workspace,
-    allocate_paged_attention_workspace_pool,
-    allocate_paged_attention_workspace_for_plan,
-    b12x_paged_decode,
-    b12x_paged_attention_forward,
-    b12x_paged_extend,
     clear_attention_caches,
-    create_paged_attention_plan,
     infer_paged_attention_mode,
 )
 from .tp_moe import (
@@ -22,18 +12,8 @@ from .tp_moe import (
 )
 
 __all__ = [
-    "PagedAttentionPlan",
-    "PagedAttentionPlanKey",
     "PagedAttentionWorkspace",
-    "PagedAttentionWorkspacePool",
-    "allocate_paged_attention_workspace",
-    "allocate_paged_attention_workspace_pool",
-    "allocate_paged_attention_workspace_for_plan",
-    "b12x_paged_decode",
-    "b12x_paged_attention_forward",
-    "b12x_paged_extend",
     "clear_attention_caches",
-    "create_paged_attention_plan",
     "infer_paged_attention_mode",
     "B12XFP4ExpertWeights",
     "B12XTopKRouting",

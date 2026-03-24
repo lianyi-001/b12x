@@ -107,6 +107,23 @@ def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
     )
 
 
+@dsl_user_op
+def _exit_thread(
+    *,
+    loc=None,
+    ip=None,
+):
+    llvm.inline_asm(
+        None,
+        [],
+        "exit;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def _permuted_offset_128b(row_idx, vec_idx, stride_128b):
     return row_idx * stride_128b + (vec_idx ^ (row_idx % 8))
@@ -714,6 +731,7 @@ class PagedForwardKernel:
         mKvTileIndices: cute.Tensor,
         mOIndptr: cute.Tensor,
         mKvChunkSizePtr: cute.Tensor,
+        mBlockValidMask: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -730,8 +748,8 @@ class PagedForwardKernel:
             raise ValueError("mCacheSeqlens and mCuSeqlensQ must be rank-1")
         if const_expr(len(mRequestIndices.shape) != 1 or len(mQoTileIndices.shape) != 1 or len(mKvTileIndices.shape) != 1):
             raise ValueError("worklist tensors must be rank-1")
-        if const_expr(len(mOIndptr.shape) != 1 or len(mKvChunkSizePtr.shape) != 1):
-            raise ValueError("mOIndptr and mKvChunkSizePtr must be rank-1")
+        if const_expr(len(mOIndptr.shape) != 1 or len(mKvChunkSizePtr.shape) != 1 or len(mBlockValidMask.shape) != 1):
+            raise ValueError("mOIndptr, mKvChunkSizePtr, and mBlockValidMask must be rank-1")
         if const_expr(len(mO.shape) != 3 or len(mLSE.shape) != 2):
             raise ValueError("mO must be rank-3 and mLSE must be rank-2")
         if const_expr(mKDescale is not None and len(mKDescale.shape) not in (1, 2)):
@@ -770,12 +788,13 @@ class PagedForwardKernel:
             mKvTileIndices,
             mOIndptr,
             mKvChunkSizePtr,
+            mBlockValidMask,
             mO,
             mLSE,
             mKDescale,
             mVDescale,
         ).launch(
-            grid=(mRequestIndices.shape[0], mKCache.shape[2], 1),
+            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, self.traits.num_warps_q, self.traits.num_warps_kv],
             stream=stream,
         )
@@ -794,6 +813,7 @@ class PagedForwardKernel:
         mKvTileIndices: cute.Tensor,
         mOIndptr: cute.Tensor,
         mKvChunkSizePtr: cute.Tensor,
+        mBlockValidMask: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mKDescale: cute.Tensor | None,
@@ -801,7 +821,10 @@ class PagedForwardKernel:
     ):
         lane, warp_q_idx, warp_kv_idx = cute.arch.thread_idx()
         work_idx, kv_head_idx, _ = cute.arch.block_idx()
-
+        block_valid = mBlockValidMask[work_idx]
+        if block_valid == Int32(0):
+            _exit_thread()
+        valid_work = True
         request_idx = mRequestIndices[work_idx]
         qo_tile_idx = mQoTileIndices[work_idx]
         kv_tile_idx = mKvTileIndices[work_idx]
@@ -1462,7 +1485,7 @@ class PagedForwardKernel:
                             sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[mma_q, mma_d, reg_base + 5]
             cute.arch.sync_threads()
 
-        store_enabled = warp_kv_idx == 0
+        store_enabled = valid_work and warp_kv_idx == 0
         for mma_q in cutlass.range_constexpr(num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
                 packed_row_local = row_local_idx[mma_q, row_slot]
@@ -1581,62 +1604,64 @@ class PagedForwardKernel:
                                 )
 
         if const_expr(decode_store_v128):
-            cute.arch.sync_threads()
-            decode_chunks_per_row = self.traits.head_dim_vo // 8
-            decode_chunk_linear_idx = tidx
-            decode_total_chunks = packed_tile_rows * decode_chunks_per_row
-            while decode_chunk_linear_idx < decode_total_chunks:
-                packed_row_local = decode_chunk_linear_idx // decode_chunks_per_row
-                chunk_idx = decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
-                packed_q_idx = packed_tile_start + packed_row_local
-                token_local = packed_q_idx // group_size
-                q_group_lane = packed_q_idx - token_local * group_size
-                q_head_idx = kv_head_idx * group_size + q_group_lane
-                q_row_idx = q_start + token_local
-                u32_idx = chunk_idx * 4
-                if const_expr(self.split_kv):
+            if valid_work:
+                cute.arch.sync_threads()
+                decode_chunks_per_row = self.traits.head_dim_vo // 8
+                decode_chunk_linear_idx = tidx
+                decode_total_chunks = packed_tile_rows * decode_chunks_per_row
+                while decode_chunk_linear_idx < decode_total_chunks:
+                    packed_row_local = decode_chunk_linear_idx // decode_chunks_per_row
+                    chunk_idx = decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
+                    packed_q_idx = packed_tile_start + packed_row_local
+                    token_local = packed_q_idx // group_size
+                    q_group_lane = packed_q_idx - token_local * group_size
+                    q_head_idx = kv_head_idx * group_size + q_group_lane
+                    q_row_idx = q_start + token_local
+                    u32_idx = chunk_idx * 4
+                    if const_expr(self.split_kv):
+                        partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                        gmem_elem_offset = (
+                            ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
+                            + chunk_idx * 8
+                        )
+                    else:
+                        gmem_elem_offset = (
+                            ((q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
+                            + chunk_idx * 8
+                        )
+                    st_global_v4_u32(
+                        get_ptr_as_int64(mOFlat, gmem_elem_offset),
+                        sDecodeStageU32[0, packed_row_local, u32_idx + 0],
+                        sDecodeStageU32[0, packed_row_local, u32_idx + 1],
+                        sDecodeStageU32[0, packed_row_local, u32_idx + 2],
+                        sDecodeStageU32[0, packed_row_local, u32_idx + 3],
+                    )
+                    decode_chunk_linear_idx += self.traits.num_threads
+
+        if split_store_v128:
+            if valid_work:
+                cute.arch.sync_threads()
+                split_chunks_per_row = self.traits.head_dim_vo // 8
+                split_chunk_linear_idx = tidx
+                split_total_chunks = packed_tile_rows * split_chunks_per_row
+                while split_chunk_linear_idx < split_total_chunks:
+                    packed_row_local = split_chunk_linear_idx // split_chunks_per_row
+                    chunk_idx = split_chunk_linear_idx - packed_row_local * split_chunks_per_row
+                    packed_q_idx = packed_tile_start + packed_row_local
+                    token_local = packed_q_idx // group_size
+                    q_group_lane = packed_q_idx - token_local * group_size
+                    q_head_idx = kv_head_idx * group_size + q_group_lane
                     partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                    u32_idx = chunk_idx * 4
                     gmem_elem_offset = (
                         ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
                         + chunk_idx * 8
                     )
-                else:
-                    gmem_elem_offset = (
-                        ((q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
-                        + chunk_idx * 8
+                    st_global_v4_u32(
+                        get_ptr_as_int64(mOFlat, gmem_elem_offset),
+                        sOStageU32[packed_row_local, u32_idx + 0],
+                        sOStageU32[packed_row_local, u32_idx + 1],
+                        sOStageU32[packed_row_local, u32_idx + 2],
+                        sOStageU32[packed_row_local, u32_idx + 3],
                     )
-                st_global_v4_u32(
-                    get_ptr_as_int64(mOFlat, gmem_elem_offset),
-                    sDecodeStageU32[0, packed_row_local, u32_idx + 0],
-                    sDecodeStageU32[0, packed_row_local, u32_idx + 1],
-                    sDecodeStageU32[0, packed_row_local, u32_idx + 2],
-                    sDecodeStageU32[0, packed_row_local, u32_idx + 3],
-                )
-                decode_chunk_linear_idx += self.traits.num_threads
-
-        if split_store_v128:
-            cute.arch.sync_threads()
-            split_chunks_per_row = self.traits.head_dim_vo // 8
-            split_chunk_linear_idx = tidx
-            split_total_chunks = packed_tile_rows * split_chunks_per_row
-            while split_chunk_linear_idx < split_total_chunks:
-                packed_row_local = split_chunk_linear_idx // split_chunks_per_row
-                chunk_idx = split_chunk_linear_idx - packed_row_local * split_chunks_per_row
-                packed_q_idx = packed_tile_start + packed_row_local
-                token_local = packed_q_idx // group_size
-                q_group_lane = packed_q_idx - token_local * group_size
-                q_head_idx = kv_head_idx * group_size + q_group_lane
-                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                u32_idx = chunk_idx * 4
-                gmem_elem_offset = (
-                    ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
-                    + chunk_idx * 8
-                )
-                st_global_v4_u32(
-                    get_ptr_as_int64(mOFlat, gmem_elem_offset),
-                    sOStageU32[packed_row_local, u32_idx + 0],
-                    sOStageU32[packed_row_local, u32_idx + 1],
-                    sOStageU32[packed_row_local, u32_idx + 2],
-                    sOStageU32[packed_row_local, u32_idx + 3],
-                )
-                split_chunk_linear_idx += self.traits.num_threads
+                    split_chunk_linear_idx += self.traits.num_threads

@@ -15,10 +15,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.integration.attention import (
-    allocate_paged_attention_workspace_for_plan,
-    b12x_paged_attention_forward,
+    PagedAttentionWorkspace,
     clear_attention_caches,
-    create_paged_attention_plan,
 )
 
 
@@ -252,40 +250,34 @@ def _capture_backend_graph(
     warmup: int,
 ) -> BackendCapture:
     output = torch.empty_like(q)
-
-    plan = create_paged_attention_plan(
-        q,
-        k_cache,
-        v_cache,
+    mode = "decode" if int(q.shape[0]) == int(page_table.shape[0]) else "extend"
+    workspace = PagedAttentionWorkspace.for_tensors(
+        mode=mode,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        use_cuda_graph=True,
+    )
+    workspace.prepare(
         page_table,
         cache_seqlens,
         cu_seqlens_q,
-        causal=True,
         fixed_split_size=fixed_split_pages,
-    )
-    workspace = allocate_paged_attention_workspace_for_plan(
-        plan,
-        total_q=q.shape[0],
-        batch=page_table.shape[0],
     )
 
     def run() -> None:
-        b12x_paged_attention_forward(
+        workspace.run(
             q,
             k_cache,
             v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            workspace=workspace,
-            plan=plan,
+            output=output,
             k_descale=k_descale,
             v_descale=v_descale,
         )
 
     graph = _capture_graph(run, warmup=warmup)
-    chunk_desc = f"chunk={plan.kv_chunk_size}"
-    if plan.split_kv:
+    chunk_desc = f"chunk={workspace.plan.kv_chunk_size}"
+    if workspace.plan.split_kv:
         chunk_desc += ",split"
     else:
         chunk_desc += ",nosplit"
