@@ -12,7 +12,6 @@ import os
 import torch
 import torch.nn.functional as F
 
-
 from serve.cache.kv_cache import KVCacheManager
 from serve.cache.page_pool import PagePool
 from serve.model.attention import B12xPagedAttention
@@ -42,10 +41,8 @@ class ModelRunner:
         self.max_batch_size = max_batch_size
         self.max_total_tokens = max_total_tokens
 
-        # Inject shared workspace pools and bind per-layer cache refs.
-        from b12x.integration.attention import allocate_paged_attention_workspace_pool
+        # Inject per-layer workspaces and bind per-layer cache refs.
         from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
-        attn_workspace = allocate_paged_attention_workspace_pool()
         moe_workspace = allocate_tp_moe_workspace_pool()
 
         kv_layer_idx = 0
@@ -54,12 +51,21 @@ class ModelRunner:
 
         for i, layer in enumerate(model.layers):
             attn = getattr(layer, 'attn', None)
+            lt = layer_types[i] if layer_types else None
             if isinstance(attn, B12xPagedAttention):
-                attn.set_workspace(attn_workspace)
+                attn.set_workspace(
+                    attn.allocate_workspaces(
+                        device=self.device,
+                        kv_dtype=self.pool.k_cache[kv_layer_idx].dtype,
+                        page_size=self.pool.page_size,
+                        num_cache_pages=self.pool.num_pages,
+                        max_total_q=self.max_total_tokens,
+                        use_cuda_graph=False,
+                    )
+                )
             layer.set_moe_workspace(moe_workspace)
 
             # Bind cache refs so layers own their slice.
-            lt = layer_types[i] if layer_types else None
             if lt == "linear_attention" and ssm_pool is not None:
                 layer.bind_cache(
                     ssm_state=ssm_pool.ssm_state_for_layer(ssm_layer_idx),
