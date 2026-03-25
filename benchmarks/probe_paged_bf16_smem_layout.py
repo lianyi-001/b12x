@@ -20,6 +20,9 @@ _HEAD_DIM = 256
 _NUM_WORDS = _PAGE_SIZE * _HEAD_DIM // 2
 _DUMP_Q = 8
 _DUMP_WORD_CAPACITY = _DUMP_Q * 8 * (_HEAD_DIM // 2)
+_WORDS_PER_ROW = _HEAD_DIM // 2
+_CHUNKS_PER_ROW = _HEAD_DIM // 8
+_WORDS_PER_CHUNK = 4
 
 
 @contextlib.contextmanager
@@ -112,6 +115,26 @@ def _inverse(words: torch.Tensor) -> list[int]:
     return inverse
 
 
+def _row_chunk_sources(words: torch.Tensor, row: int) -> list[dict[str, int]]:
+    if row < 0 or row >= _PAGE_SIZE:
+        raise ValueError(f"row must be in [0, {_PAGE_SIZE - 1}]")
+    row_words = words[row * _WORDS_PER_ROW : (row + 1) * _WORDS_PER_ROW]
+    chunks: list[dict[str, int]] = []
+    for chunk_idx in range(_CHUNKS_PER_ROW):
+        chunk_words = row_words[chunk_idx * _WORDS_PER_CHUNK : (chunk_idx + 1) * _WORDS_PER_CHUNK]
+        first = int(chunk_words[0].item())
+        lo = first & 0xFFFF
+        src_linear = lo
+        chunks.append(
+            {
+                "chunk": chunk_idx,
+                "src_row": src_linear // _HEAD_DIM,
+                "src_chunk": (src_linear % _HEAD_DIM) // 8,
+            }
+        )
+    return chunks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Dump the live paged BF16 shared-word layout for the staged V tile on cp.async and TMA paths."
@@ -128,6 +151,12 @@ def main() -> None:
         default=None,
         help="optional path to write the full JSON report",
     )
+    parser.add_argument(
+        "--show-rows",
+        type=str,
+        default="0,1,2,7,8",
+        help="comma-separated staged rows to include as 16B-chunk source maps",
+    )
     args = parser.parse_args()
 
     if _DUMP_WORD_CAPACITY < _NUM_WORDS:
@@ -135,6 +164,7 @@ def main() -> None:
 
     cpasync_words = _dump_words(use_tma=False)
     tma_words = _dump_words(use_tma=True)
+    show_rows = [int(part) for part in args.show_rows.split(",") if part]
     mismatches = (cpasync_words != tma_words).nonzero(as_tuple=False).reshape(-1)
     report = {
         "num_words": _NUM_WORDS,
@@ -151,6 +181,12 @@ def main() -> None:
         "tma_first_pairs": _pairs(tma_words, args.show_words),
         "cpasync_first_inverse": _inverse(cpasync_words)[:64],
         "tma_first_inverse": _inverse(tma_words)[:64],
+        "cpasync_row_chunk_sources": {
+            str(row): _row_chunk_sources(cpasync_words, row) for row in show_rows
+        },
+        "tma_row_chunk_sources": {
+            str(row): _row_chunk_sources(tma_words, row) for row in show_rows
+        },
     }
     text = json.dumps(report, indent=2)
     print(text)

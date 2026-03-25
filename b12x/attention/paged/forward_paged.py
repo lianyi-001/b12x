@@ -79,7 +79,7 @@ def _assume_paged_kv_tma_source_aligned(t: cute.Tensor):
 
 def _make_payload_ptr(payload_u8: cute.Tensor, dtype, offset_bytes: int = 0):
     # Preserve 128-bit shared alignment when carving typed aliases out of the
-    # byte payload so donor ldmatrix views do not collapse to align<1>.
+    # byte payload.
     ptr = payload_u8.iterator if offset_bytes == 0 else payload_u8.iterator + offset_bytes
     return cute.recast_ptr(ptr.align(16), dtype=dtype)
 
@@ -876,6 +876,85 @@ def _literal_qk_mma_into_sfrag_tma_bf16_copyfrag(
 
 
 @cute.jit
+def _literal_qk_mma_into_sfrag_plane_bf16(
+    s_frag: cute.Tensor,
+    q_base_addr: Int32,
+    k_plane0_base_addr: Int32,
+    k_plane1_base_addr: Int32,
+    k_plane2_base_addr: Int32,
+    k_plane3_base_addr: Int32,
+    lane,
+    warp_q_idx,
+    warp_kv_idx,
+    row_base,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_qk,
+    upcast_stride_q,
+    upcast_stride_plane,
+):
+    for mma_d in cutlass.range_constexpr(num_mma_d_qk):
+        plane_idx = mma_d // 4
+        mma_d_local = mma_d - plane_idx * 4
+        a_regs = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
+            Uint32,
+        )
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            q_row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane % 16
+            q_col = mma_d * 2 + lane // 16
+            q_offset = _permuted_offset_128b(q_row, q_col, upcast_stride_q)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset))
+            a_regs[mma_q, 0] = a0
+            a_regs[mma_q, 1] = a1
+            a_regs[mma_q, 2] = a2
+            a_regs[mma_q, 3] = a3
+
+        if const_expr(plane_idx == 0):
+            k_plane_base_addr = k_plane0_base_addr
+        elif const_expr(plane_idx == 1):
+            k_plane_base_addr = k_plane1_base_addr
+        elif const_expr(plane_idx == 2):
+            k_plane_base_addr = k_plane2_base_addr
+        else:
+            k_plane_base_addr = k_plane3_base_addr
+
+        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+            k_row = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + 8 * (lane // 16) + lane % 8
+            k_col = mma_d_local * 2 + (lane % 16) // 8
+            k_offset = _permuted_offset_128b(k_row, k_col, upcast_stride_plane)
+            b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(k_plane_base_addr, k_offset))
+
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+                    s_frag[mma_q, mma_kv, 0],
+                    s_frag[mma_q, mma_kv, 1],
+                    s_frag[mma_q, mma_kv, 2],
+                    s_frag[mma_q, mma_kv, 3],
+                    s_frag[mma_q, mma_kv, 4],
+                    s_frag[mma_q, mma_kv, 5],
+                    s_frag[mma_q, mma_kv, 6],
+                    s_frag[mma_q, mma_kv, 7],
+                    a_regs[mma_q, 0],
+                    a_regs[mma_q, 1],
+                    a_regs[mma_q, 2],
+                    a_regs[mma_q, 3],
+                    b0,
+                    b1,
+                    b2,
+                    b3,
+                )
+                s_frag[mma_q, mma_kv, 0] = d0
+                s_frag[mma_q, mma_kv, 1] = d1
+                s_frag[mma_q, mma_kv, 2] = d2
+                s_frag[mma_q, mma_kv, 3] = d3
+                s_frag[mma_q, mma_kv, 4] = d4
+                s_frag[mma_q, mma_kv, 5] = d5
+                s_frag[mma_q, mma_kv, 6] = d6
+                s_frag[mma_q, mma_kv, 7] = d7
+
+
+@cute.jit
 def _literal_qk_mma_into_sfrag_fp8_raw(
     s_frag: cute.Tensor,
     q_base_addr: Int32,
@@ -1175,6 +1254,94 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
             v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, mma_d)
         v_offset = _advance_offset_by_row_128b(v_offset_cur, 16, upcast_stride_v) - Int32(2 * num_mma_d_vo)
     v_offset -= Int32(16 * num_mma_kv * upcast_stride_v)
+
+
+@cute.jit
+def _literal_pv_mma_into_ofrag_plane_bf16_packed(
+    o_frag: cute.Tensor,
+    p_frag: cute.Tensor,
+    v_plane0_base_addr: Int32,
+    v_plane1_base_addr: Int32,
+    v_plane2_base_addr: Int32,
+    v_plane3_base_addr: Int32,
+    lane,
+    warp_kv_idx,
+    row_base,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_vo,
+    upcast_stride_plane,
+    v_scale,
+    debug_regs: cute.Tensor | None = None,
+):
+    v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
+    for mma_kv in cutlass.range_constexpr(num_mma_kv):
+        a_regs = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
+            Uint32,
+        )
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            a_regs[mma_q, 0] = bfloat2_mul(p_frag[mma_q, mma_kv, 0], v_scale_bf2)
+            a_regs[mma_q, 1] = bfloat2_mul(p_frag[mma_q, mma_kv, 1], v_scale_bf2)
+            a_regs[mma_q, 2] = bfloat2_mul(p_frag[mma_q, mma_kv, 2], v_scale_bf2)
+            a_regs[mma_q, 3] = bfloat2_mul(p_frag[mma_q, mma_kv, 3], v_scale_bf2)
+
+        v_row = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + lane % 16
+        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+            plane_idx = mma_d // 4
+            mma_d_local = mma_d - plane_idx * 4
+            if const_expr(plane_idx == 0):
+                v_plane_base_addr = v_plane0_base_addr
+            elif const_expr(plane_idx == 1):
+                v_plane_base_addr = v_plane1_base_addr
+            elif const_expr(plane_idx == 2):
+                v_plane_base_addr = v_plane2_base_addr
+            else:
+                v_plane_base_addr = v_plane3_base_addr
+            v_col = mma_d_local * 2 + lane // 16
+            v_offset = _permuted_offset_128b(v_row, v_col, upcast_stride_plane)
+            b0, b1, b2, b3 = ldmatrix_m8n8x4_trans_b16(
+                _smem_addr_from_b128_offset(v_plane_base_addr, v_offset)
+            )
+            if const_expr(debug_regs is not None):
+                lane_words = num_mma_kv * num_mma_d_vo * 4
+                dst_words = cute.size(debug_regs.shape)
+                dst_idx = lane * lane_words + (mma_kv * num_mma_d_vo + mma_d) * 4
+                if dst_idx + 0 < dst_words:
+                    debug_regs[dst_idx + 0] = b0
+                if dst_idx + 1 < dst_words:
+                    debug_regs[dst_idx + 1] = b1
+                if dst_idx + 2 < dst_words:
+                    debug_regs[dst_idx + 2] = b2
+                if dst_idx + 3 < dst_words:
+                    debug_regs[dst_idx + 3] = b3
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+                    o_frag[mma_q, mma_d, 0],
+                    o_frag[mma_q, mma_d, 1],
+                    o_frag[mma_q, mma_d, 2],
+                    o_frag[mma_q, mma_d, 3],
+                    o_frag[mma_q, mma_d, 4],
+                    o_frag[mma_q, mma_d, 5],
+                    o_frag[mma_q, mma_d, 6],
+                    o_frag[mma_q, mma_d, 7],
+                    a_regs[mma_q, 0],
+                    a_regs[mma_q, 1],
+                    a_regs[mma_q, 2],
+                    a_regs[mma_q, 3],
+                    b0,
+                    b1,
+                    b2,
+                    b3,
+                )
+                o_frag[mma_q, mma_d, 0] = d0
+                o_frag[mma_q, mma_d, 1] = d1
+                o_frag[mma_q, mma_d, 2] = d2
+                o_frag[mma_q, mma_d, 3] = d3
+                o_frag[mma_q, mma_d, 4] = d4
+                o_frag[mma_q, mma_d, 5] = d5
+                o_frag[mma_q, mma_d, 6] = d6
+                o_frag[mma_q, mma_d, 7] = d7
 
 
 @cute.jit
@@ -1618,7 +1785,6 @@ class PagedForwardKernel:
             if traits.num_warps_kv > 1 or self.kv_is_fp8
             else (2 if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock else 1)
         )
-        # Keep the donor-derived paged-KV TMA ingress opt-in until the BF16 decode path is stable.
         base_use_paged_kv_tma = (
             enable_paged_kv_tma
             and
@@ -1636,40 +1802,25 @@ class PagedForwardKernel:
             and dtype_o == cutlass.BFloat16
             and not self.kv_is_fp8
         )
-        self.use_paged_k_tma = (
+        requested_use_paged_k_tma = (
             base_use_paged_kv_tma and os.environ.get("B12X_PAGED_KV_TMA_K", "1") == "1"
         )
-        self.use_paged_v_tma = (
+        requested_use_paged_v_tma = (
             base_use_paged_kv_tma and os.environ.get("B12X_PAGED_KV_TMA_V", "1") == "1"
         )
+        self.use_paged_kv_tma_exact_plane_bf16_layout = (
+            (requested_use_paged_k_tma or requested_use_paged_v_tma)
+            # Exact 4-plane BF16 landing is the only retained BF16 TMA path.
+            and os.environ.get("B12X_PAGED_KV_TMA_EXACT_PLANE_LAYOUT", "1") != "0"
+            and os.environ.get("B12X_PAGED_KV_TMA_DISABLE_EXACT_PLANE", "0") != "1"
+        )
+        self.use_paged_k_tma = (
+            requested_use_paged_k_tma and self.use_paged_kv_tma_exact_plane_bf16_layout
+        )
+        self.use_paged_v_tma = (
+            requested_use_paged_v_tma and self.use_paged_kv_tma_exact_plane_bf16_layout
+        )
         self.use_paged_kv_tma = self.use_paged_k_tma or self.use_paged_v_tma
-        self.use_paged_kv_tma_repack_v = (
-            self.use_paged_v_tma and os.environ.get("B12X_PAGED_KV_TMA_REPACK_V", "0") == "1"
-        )
-        self.use_paged_kv_tma_repack_v_vec128 = (
-            self.use_paged_kv_tma_repack_v
-            and os.environ.get("B12X_PAGED_KV_TMA_REPACK_V_VEC128", "0") == "1"
-        )
-        self.use_paged_kv_tma_donor_gemm = (
-            self.use_paged_kv_tma
-            and not self.use_paged_kv_tma_repack_v
-            and os.environ.get("B12X_PAGED_KV_TMA_DONOR_GEMM", "0") == "1"
-        )
-        self.use_paged_kv_tma_copyfrag_qk = (
-            self.use_paged_kv_tma
-            and not self.use_paged_kv_tma_repack_v
-            and os.environ.get("B12X_PAGED_KV_TMA_COPYFRAG_QK", "0") == "1"
-        )
-        self.use_paged_kv_tma_copyfrag_pv = (
-            self.use_paged_kv_tma
-            and not self.use_paged_kv_tma_repack_v
-            and os.environ.get("B12X_PAGED_KV_TMA_COPYFRAG_PV", "0") == "1"
-        )
-        self.use_paged_kv_tma_plain_bf16_layout = (
-            self.use_paged_kv_tma
-            and not self.kv_is_fp8
-            and os.environ.get("B12X_PAGED_KV_TMA_PLAIN_BF16_LAYOUT", "0") == "1"
-        )
         tma_debug_dump = os.environ.get("B12X_PAGED_KV_TMA_DEBUG_DUMP", "")
         paged_debug_dump = os.environ.get("B12X_PAGED_KV_DEBUG_DUMP", "")
         self.debug_dump_paged_kv_tma_k = self.use_paged_kv_tma and tma_debug_dump == "K"
@@ -1691,22 +1842,6 @@ class PagedForwardKernel:
             and dtype_o == cutlass.BFloat16
             and not self.kv_is_fp8
         )
-        self.debug_dump_paged_kv_pvregs_donor = (
-            paged_debug_dump == "PVREGS_DONOR"
-            and traits.num_warps_kv > 1
-            and traits.num_warps_q == 1
-            and dtype_q == cutlass.BFloat16
-            and dtype_o == cutlass.BFloat16
-            and not self.kv_is_fp8
-        )
-        self.debug_dump_paged_kv_vt = (
-            paged_debug_dump == "VT"
-            and traits.num_warps_kv > 1
-            and traits.num_warps_q == 1
-            and dtype_q == cutlass.BFloat16
-            and dtype_o == cutlass.BFloat16
-            and not self.kv_is_fp8
-        )
         self.debug_dump_paged_kv_svwords = (
             paged_debug_dump == "SVWORDS"
             and traits.num_warps_kv > 1
@@ -1714,6 +1849,12 @@ class PagedForwardKernel:
             and dtype_q == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
             and not self.kv_is_fp8
+        )
+        self.kv_tma_plane_head_dim = 64
+        self.kv_tma_plane_count = (
+            4
+            if self.use_paged_kv_tma_exact_plane_bf16_layout
+            else 1
         )
         self.kv_tma_copy_bytes_k = self.stage_tile_rows * traits.head_dim_qk * (dtype_kv_storage.width // 8)
         self.kv_tma_copy_bytes_v = self.stage_tile_rows * traits.head_dim_vo * (dtype_kv_storage.width // 8)
@@ -1744,12 +1885,17 @@ class PagedForwardKernel:
                     "mbar_ptr_K": mbar_struct,
                     "mbar_ptr_V": mbar_struct,
                 }
+            payload_alignment = (
+                1024
+                if self.use_paged_kv_tma_exact_plane_bf16_layout
+                else 128
+            )
             payload_struct = cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Uint8,
                     int(self.traits.shared_storage_bytes),
                 ],
-                128,
+                payload_alignment,
             ]
             SharedStorage.__annotations__["payload"] = payload_struct
         else:
@@ -1782,27 +1928,25 @@ class PagedForwardKernel:
 
         return cute.struct(SharedStorage)
 
+    def _get_paged_kv_tma_plane_layout(self):
+        return cute.make_composed_layout(
+            make_swizzle(3, 4, 3),
+            0,
+            cute.make_layout(
+                (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                stride=(self.kv_tma_plane_head_dim, 1),
+            ),
+        )
+
+    def _get_paged_kv_tma_plane_stage_layout(self):
+        return cute.tile_to_shape(
+            self._get_paged_kv_tma_plane_layout(),
+            (self.stage_tile_rows, self.kv_tma_plane_head_dim, self.num_stages),
+            (0, 1, 2),
+        )
+
     def _get_paged_kv_tma_layout(self, head_dim: int):
         if self.dtype_kv_storage.width == 16:
-            swizzle_override = os.environ.get("B12X_PAGED_KV_TMA_SWIZZLE", "")
-            if swizzle_override:
-                b_str, m_str, s_str = [part.strip() for part in swizzle_override.split(",")]
-                return cute.make_composed_layout(
-                    make_swizzle(int(b_str), int(m_str), int(s_str)),
-                    0,
-                    cute.make_layout(
-                        (self.stage_tile_rows, head_dim),
-                        stride=(head_dim, 1),
-                    ),
-                )
-            if self.use_paged_kv_tma_plain_bf16_layout or self.use_paged_kv_tma_repack_v:
-                # The plain row-major BF16 landing is the correctness oracle for
-                # the TMA decode path. REPACK_V keeps the same exact K contract
-                # and only remaps V into the faster live PV layout afterward.
-                return cute.make_layout(
-                    (self.stage_tile_rows, head_dim),
-                    stride=(head_dim, 1),
-                )
             layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils_basic.get_smem_layout_atom(
                     LayoutEnum.ROW_MAJOR,
@@ -1880,9 +2024,12 @@ class PagedForwardKernel:
                     )
 
     @cute.jit
-    def _issue_paged_kv_tma_copy(
+    def _issue_paged_kv_tma_copy_planes(
         self,
-        load_tma,
+        load_tma0,
+        load_tma1,
+        load_tma2,
+        load_tma3,
         pipeline_tma,
         producer_state,
         mPageTable: cute.Tensor,
@@ -1893,7 +2040,10 @@ class PagedForwardKernel:
         page_idx = tile_token_base // page_size
         page_id = Int32(0) if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1") else mPageTable[request_idx, page_idx]
         pipeline_tma.producer_acquire(producer_state)
-        load_tma(src_idx=page_id, producer_state=producer_state)
+        load_tma0(src_idx=page_id, producer_state=producer_state)
+        load_tma1(src_idx=page_id, producer_state=producer_state)
+        load_tma2(src_idx=page_id, producer_state=producer_state)
+        load_tma3(src_idx=page_id, producer_state=producer_state)
 
     @cute.jit
     def _async_copy_q_tile_permuted_128b(
@@ -2040,21 +2190,19 @@ class PagedForwardKernel:
             gmem_tiled_copy_kv = cpasync.CopyBulkTensorTileG2SOp()
             v_tma_source = mKCacheT if os.environ.get("B12X_PAGED_KV_TMA_USE_K_FOR_V", "0") == "1" else mVCacheT
             if const_expr(self.use_paged_k_tma):
-                k_tma_layout = self._get_paged_kv_tma_layout(self.traits.head_dim_qk)
                 tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                     gmem_tiled_copy_kv,
                     mKCacheT,
-                    k_tma_layout,
-                    (self.stage_tile_rows, self.traits.head_dim_qk),
+                    self._get_paged_kv_tma_plane_layout(),
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
                     1,
                 )
             if const_expr(self.use_paged_v_tma):
-                v_tma_layout = self._get_paged_kv_tma_layout(self.traits.head_dim_vo)
                 tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                     gmem_tiled_copy_kv,
                     v_tma_source,
-                    v_tma_layout,
-                    (self.stage_tile_rows, self.traits.head_dim_vo),
+                    self._get_paged_kv_tma_plane_layout(),
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
                     1,
                 )
 
@@ -2153,6 +2301,10 @@ class PagedForwardKernel:
         q_bytes = self.traits.q_smem_bytes
         k_bytes = self.num_stages * stage_tile_rows * self.traits.head_dim_qk * (self.dtype_kv_storage.width // 8)
         v_bytes = self.num_stages * stage_tile_rows * self.traits.head_dim_vo * (self.dtype_kv_storage.width // 8)
+        kv_plane_stage_bytes = (
+            stage_tile_rows * self.kv_tma_plane_head_dim * (self.dtype_kv_storage.width // 8)
+        )
+        kv_plane_total_bytes = self.num_stages * kv_plane_stage_bytes
         warp_linear_idx = warp_kv_idx * self.traits.num_warps_q + warp_q_idx
         tidx = lane + 32 * (warp_q_idx + self.traits.num_warps_q * warp_kv_idx)
         packed_tile_rows = packed_tile_end - packed_tile_start
@@ -2215,32 +2367,90 @@ class PagedForwardKernel:
                 q_bytes + k_bytes,
                 cute.make_layout((v_bytes,), stride=(1,)),
             )
-            if const_expr(self.use_paged_k_tma):
-                sKTmaRange = _make_payload_memrange(
-                    payload_u8,
-                    self.dtype_kv_storage,
-                    q_bytes,
-                    self.num_stages * stage_tile_rows * self.traits.head_dim_qk,
+            sKTma = None
+            sVTma = None
+            if const_expr(self.use_paged_kv_tma_exact_plane_bf16_layout):
+                sKPlane0 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + 0 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
                 )
-                sKTma = _get_memrange_tensor(
-                    sKTmaRange,
-                    self._get_paged_kv_tma_stage_layout(self.traits.head_dim_qk),
+                sKPlane1 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + 1 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
+                )
+                sKPlane2 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + 2 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
+                )
+                sKPlane3 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + 3 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
+                )
+                sVPlane0 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + k_bytes + 0 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
+                )
+                sVPlane1 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + k_bytes + 1 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
+                )
+                sVPlane2 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + k_bytes + 2 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
+                )
+                sVPlane3 = _get_memrange_tensor(
+                    _make_payload_memrange(
+                        payload_u8,
+                        self.dtype_kv_storage,
+                        q_bytes + k_bytes + 3 * kv_plane_total_bytes,
+                        self.num_stages * stage_tile_rows * self.kv_tma_plane_head_dim,
+                    ),
+                    self._get_paged_kv_tma_plane_stage_layout(),
                 )
             else:
-                sKTma = None
-            if const_expr(self.use_paged_v_tma):
-                sVTmaRange = _make_payload_memrange(
-                    payload_u8,
-                    self.dtype_kv_storage,
-                    q_bytes + k_bytes,
-                    self.num_stages * stage_tile_rows * self.traits.head_dim_vo,
-                )
-                sVTma = _get_memrange_tensor(
-                    sVTmaRange,
-                    self._get_paged_kv_tma_stage_layout(self.traits.head_dim_vo),
-                )
-            else:
-                sVTma = None
+                sKPlane0 = None
+                sKPlane1 = None
+                sKPlane2 = None
+                sKPlane3 = None
+                sVPlane0 = None
+                sVPlane1 = None
+                sVPlane2 = None
+                sVPlane3 = None
         else:
             mbar_ptr_K = None
             mbar_ptr_V = None
@@ -2267,6 +2477,14 @@ class PagedForwardKernel:
             )
             sKTma = None
             sVTma = None
+            sKPlane0 = None
+            sKPlane1 = None
+            sKPlane2 = None
+            sKPlane3 = None
+            sVPlane0 = None
+            sVPlane1 = None
+            sVPlane2 = None
+            sVPlane3 = None
         if const_expr(self.use_paged_k_tma or self.use_paged_v_tma):
             pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, self.total_warps
@@ -2331,37 +2549,93 @@ class PagedForwardKernel:
             mKCacheTHead = mKCacheT[None, None, kv_head_idx, None]
             mVCacheTHead = mVCacheT[None, None, kv_head_idx, None]
             if const_expr(self.use_paged_k_tma):
-                gKTma = cute.local_tile(
+                gKTma0 = cute.local_tile(
                     mKCacheTHead,
-                    (self.stage_tile_rows, self.traits.head_dim_qk),
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
                     (0, 0, None),
                 )
-                load_K_tma, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_K,
-                    0,
-                    cute.make_layout(1),
-                    gKTma,
-                    sKTma,
+                gKTma1 = cute.local_tile(
+                    mKCacheTHead,
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                    (0, 1, None),
                 )
-                load_K_tma = copy_utils.tma_producer_copy_fn(load_K_tma, pipeline_k)
+                gKTma2 = cute.local_tile(
+                    mKCacheTHead,
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                    (0, 2, None),
+                )
+                gKTma3 = cute.local_tile(
+                    mKCacheTHead,
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                    (0, 3, None),
+                )
+                load_K_tma0, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_K, 0, cute.make_layout(1), gKTma0, sKPlane0
+                )
+                load_K_tma1, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_K, 0, cute.make_layout(1), gKTma1, sKPlane1
+                )
+                load_K_tma2, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_K, 0, cute.make_layout(1), gKTma2, sKPlane2
+                )
+                load_K_tma3, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_K, 0, cute.make_layout(1), gKTma3, sKPlane3
+                )
+                load_K_tma0 = copy_utils.tma_producer_copy_fn(load_K_tma0, pipeline_k)
+                load_K_tma1 = copy_utils.tma_producer_copy_fn(load_K_tma1, pipeline_k)
+                load_K_tma2 = copy_utils.tma_producer_copy_fn(load_K_tma2, pipeline_k)
+                load_K_tma3 = copy_utils.tma_producer_copy_fn(load_K_tma3, pipeline_k)
+                load_K_tma = None
             else:
                 load_K_tma = None
+                load_K_tma0 = None
+                load_K_tma1 = None
+                load_K_tma2 = None
+                load_K_tma3 = None
             if const_expr(self.use_paged_v_tma):
-                gVTma = cute.local_tile(
+                gVTma0 = cute.local_tile(
                     mVCacheTHead,
-                    (self.stage_tile_rows, self.traits.head_dim_vo),
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
                     (0, 0, None),
                 )
-                load_V_tma, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_V,
-                    0,
-                    cute.make_layout(1),
-                    gVTma,
-                    sVTma,
+                gVTma1 = cute.local_tile(
+                    mVCacheTHead,
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                    (0, 1, None),
                 )
-                load_V_tma = copy_utils.tma_producer_copy_fn(load_V_tma, pipeline_v)
+                gVTma2 = cute.local_tile(
+                    mVCacheTHead,
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                    (0, 2, None),
+                )
+                gVTma3 = cute.local_tile(
+                    mVCacheTHead,
+                    (self.stage_tile_rows, self.kv_tma_plane_head_dim),
+                    (0, 3, None),
+                )
+                load_V_tma0, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V, 0, cute.make_layout(1), gVTma0, sVPlane0
+                )
+                load_V_tma1, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V, 0, cute.make_layout(1), gVTma1, sVPlane1
+                )
+                load_V_tma2, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V, 0, cute.make_layout(1), gVTma2, sVPlane2
+                )
+                load_V_tma3, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V, 0, cute.make_layout(1), gVTma3, sVPlane3
+                )
+                load_V_tma0 = copy_utils.tma_producer_copy_fn(load_V_tma0, pipeline_v)
+                load_V_tma1 = copy_utils.tma_producer_copy_fn(load_V_tma1, pipeline_v)
+                load_V_tma2 = copy_utils.tma_producer_copy_fn(load_V_tma2, pipeline_v)
+                load_V_tma3 = copy_utils.tma_producer_copy_fn(load_V_tma3, pipeline_v)
+                load_V_tma = None
             else:
                 load_V_tma = None
+                load_V_tma0 = None
+                load_V_tma1 = None
+                load_V_tma2 = None
+                load_V_tma3 = None
         sKU8 = (
             sK
             if const_expr(self.kv_is_fp8 and self.dtype_kv_storage == cutlass.Uint8)
@@ -2444,6 +2718,7 @@ class PagedForwardKernel:
         tc_upcast_stride_qk = self.traits.head_dim_qk // tc_upcast_elems_qk
         tc_upcast_elems_vo = 16 // (self.dtype_q.width // 8)
         tc_upcast_stride_vo = self.traits.head_dim_vo // tc_upcast_elems_vo
+        tc_upcast_stride_plane = self.kv_tma_plane_head_dim // tc_upcast_elems_vo
         if const_expr(self.traits.num_warps_kv > 1):
             sQBytes = cute.flatten(cute.recast_tensor(sQ, cutlass.Uint8))
             if warp_kv_idx == Int32(0):
@@ -2520,70 +2795,27 @@ class PagedForwardKernel:
             frag_s_layout,
             Float32,
         )
-        if const_expr(
-            self.use_paged_kv_tma_donor_gemm
-            or self.use_paged_kv_tma_copyfrag_qk
-            or self.use_paged_kv_tma_copyfrag_pv
-            or self.debug_dump_paged_kv_pvregs_donor
-            or self.debug_dump_paged_kv_vt
-        ):
-            tiled_mma_qk_tma = cute.make_tiled_mma(
-                warp.MmaF16BF16Op(self.dtype_q, Float32, (16, 8, 16)),
-                (1, self.traits.num_warps_kv, 1),
-                permutation_mnk=(16, self.traits.num_warps_kv * 16, 16),
-            )
-            tiled_mma_pv_tma = cute.make_tiled_mma(
-                warp.MmaF16BF16Op(self.dtype_q, Float32, (16, 8, 16)),
-                (1, self.traits.num_warps_kv, 1),
-                permutation_mnk=(16, self.traits.num_warps_kv * 16, 16),
-            )
-            thr_mma_qk_tma = tiled_mma_qk_tma.get_slice(tidx)
-            thr_mma_pv_tma = tiled_mma_pv_tma.get_slice(tidx)
-            smem_copy_atom_qk_tma = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-                self.dtype_q,
-            )
-            smem_copy_atom_pv_tma = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
-                self.dtype_q,
-            )
-            smem_thr_copy_Q_tma = attention_utils.make_tiled_copy_A(
-                smem_copy_atom_qk_tma, tiled_mma_qk_tma
-            ).get_slice(tidx)
-            smem_thr_copy_K_tma = attention_utils.make_tiled_copy_B(
-                smem_copy_atom_qk_tma, tiled_mma_qk_tma
-            ).get_slice(tidx)
-            smem_thr_copy_V_tma = attention_utils.make_tiled_copy_B(
-                smem_copy_atom_pv_tma, tiled_mma_pv_tma
-            ).get_slice(tidx)
-            tSsQ_tma = smem_thr_copy_Q_tma.partition_S(sQTile)
-            tSrQ_tma = thr_mma_qk_tma.make_fragment_A(thr_mma_qk_tma.partition_A(sQTile))
-            acc_shape_S_tma = thr_mma_qk_tma.partition_shape_C((self.traits.cta_tile_q, self.stage_tile_rows))
-            if const_expr(self.use_paged_kv_tma_donor_gemm):
-                cS_tma = cute.make_identity_tensor((self.traits.cta_tile_q, self.stage_tile_rows))
-                tScS_mn_tma = _reshape_acc_to_mn(thr_mma_qk_tma.partition_C(cS_tma))
-                t0ScS_mn_tma = _reshape_acc_to_mn(thr_mma_qk_tma.get_slice(0).partition_C(cS_tma))
-            else:
-                tScS_mn_tma = None
-                t0ScS_mn_tma = None
-        else:
-            tSsQ_tma = None
-            tSrQ_tma = None
-            acc_shape_S_tma = None
-            tiled_mma_qk_tma = None
-            tiled_mma_pv_tma = None
-            thr_mma_qk_tma = None
-            thr_mma_pv_tma = None
-            smem_thr_copy_K_tma = None
-            smem_thr_copy_V_tma = None
-            tScS_mn_tma = None
-            t0ScS_mn_tma = None
+        tSsQ_tma = None
+        tSrQ_tma = None
+        acc_shape_S_tma = None
+        tiled_mma_qk_tma = None
+        tiled_mma_pv_tma = None
+        thr_mma_qk_tma = None
+        thr_mma_pv_tma = None
+        smem_thr_copy_K_tma = None
+        smem_thr_copy_V_tma = None
+        tScS_mn_tma = None
+        t0ScS_mn_tma = None
         o_frag = cute.make_rmem_tensor(
             frag_o_layout,
             Float32,
         )
         m_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Float32)
         d_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Float32)
+        p_frag = cute.make_rmem_tensor(
+            frag_p_layout,
+            Uint32,
+        )
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
 
         for mma_q in cutlass.range_constexpr(num_mma_q):
@@ -2637,8 +2869,11 @@ class PagedForwardKernel:
                 tile_tokens = tile_limit - prefetch_base
                 if warp_linear_idx == Int32(0):
                     if const_expr(self.use_paged_k_tma):
-                        self._issue_paged_kv_tma_copy(
-                            load_K_tma,
+                        self._issue_paged_kv_tma_copy_planes(
+                            load_K_tma0,
+                            load_K_tma1,
+                            load_K_tma2,
+                            load_K_tma3,
                             pipeline_k,
                             kv_producer_state,
                             mPageTable,
@@ -2647,8 +2882,11 @@ class PagedForwardKernel:
                             page_size,
                         )
                     if const_expr(self.use_paged_v_tma):
-                        self._issue_paged_kv_tma_copy(
-                            load_V_tma,
+                        self._issue_paged_kv_tma_copy_planes(
+                            load_V_tma0,
+                            load_V_tma1,
+                            load_V_tma2,
+                            load_V_tma3,
                             pipeline_v,
                             kv_producer_state,
                             mPageTable,
@@ -2860,60 +3098,38 @@ class PagedForwardKernel:
                     k_smem_base_addr = shared_ptr_to_u32(
                         sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes)
                     )
-                    acc_S_tma = None
-                    if const_expr(self.use_paged_kv_tma_donor_gemm):
-                        sKTmaStage = sKTma[None, None, consume_stage_idx]
-                        tSrK_tma = thr_mma_qk_tma.make_fragment_B(thr_mma_qk_tma.partition_B(sKTmaStage))
-                        tSsK_tma = smem_thr_copy_K_tma.partition_S(sKTmaStage)
-                        acc_S_tma = cute.make_fragment(acc_shape_S_tma, Float32)
-                        acc_S_tma.fill(0.0)
-                        _warp_mma_gemm(
-                            tiled_mma_qk_tma,
-                            acc_S_tma,
-                            tSrQ_tma,
-                            tSrK_tma,
-                            tSsQ_tma,
-                            tSsK_tma,
-                            smem_thr_copy_Q_tma,
-                            smem_thr_copy_K_tma,
-                        )
-                        frag_S = None
-                    elif const_expr(self.use_paged_k_tma):
+                    if const_expr(self.use_paged_k_tma):
                         frag_S = cute.make_rmem_tensor(
                             frag_s_layout,
                             Float32,
                         )
                         frag_S.fill(0.0)
-                        if const_expr(self.use_paged_kv_tma_copyfrag_qk):
-                            sKTmaStage = sKTma[None, None, consume_stage_idx]
-                            tSrK_tma = thr_mma_qk_tma.make_fragment_B(thr_mma_qk_tma.partition_B(sKTmaStage))
-                            tSsK_tma = smem_thr_copy_K_tma.partition_S(sKTmaStage)
-                            _literal_qk_mma_into_sfrag_tma_bf16_copyfrag(
-                                frag_S,
-                                q_smem_base_addr,
-                                tSrK_tma,
-                                tSsK_tma,
-                                smem_thr_copy_K_tma,
-                                lane,
-                                warp_q_idx,
-                                num_mma_q,
-                                self.traits.num_mma_d_qk,
-                                tc_upcast_stride_qk,
-                            )
-                        else:
-                            _literal_qk_mma_into_sfrag_tma_bf16(
-                                frag_S,
-                                q_smem_base_addr,
-                                sKTma,
-                                lane,
-                                warp_q_idx,
-                                warp_kv_idx,
-                                literal_key_base,
-                                num_mma_q,
-                                num_mma_kv,
-                                self.traits.num_mma_d_qk,
-                                tc_upcast_stride_qk,
-                            )
+                        k_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                        _literal_qk_mma_into_sfrag_plane_bf16(
+                            frag_S,
+                            q_smem_base_addr,
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator + k_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator + k_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                            ),
+                            lane,
+                            warp_q_idx,
+                            warp_kv_idx,
+                            literal_key_base,
+                            num_mma_q,
+                            num_mma_kv,
+                            self.traits.num_mma_d_qk,
+                            tc_upcast_stride_qk,
+                            tc_upcast_stride_plane,
+                        )
                     else:
                         frag_S = cute.make_rmem_tensor(
                             frag_s_layout,
@@ -2934,78 +3150,49 @@ class PagedForwardKernel:
                             tc_upcast_stride_qk,
                             tc_upcast_stride_qk,
                         )
-                    if const_expr(self.use_paged_kv_tma_donor_gemm):
-                        _mask_donor_acc_s_tma(
-                            acc_S_tma,
-                            tScS_mn_tma,
-                            t0ScS_mn_tma,
-                            packed_tile_rows,
-                            tile_tokens,
-                            tile_base,
-                            cache_len,
-                            qo_len,
-                            group_size,
-                        )
-                        if const_expr(self.debug_dump_paged_kv_tma_s):
-                            _exit_thread()
-                        p_frag_scalar = None
-                        p_frag = _donor_update_mdo_states_fp32_pack_p(
-                            acc_S_tma,
-                            o_frag,
-                            m_frag,
-                            d_frag,
-                            self.softmax_scale_log2,
-                            num_mma_d_vo,
-                            self.dtype_q,
-                        )
-                    else:
-                        for mma_q in cutlass.range_constexpr(num_mma_q):
-                            for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                                for reg_id in cutlass.range_constexpr(8):
-                                    row_slot = (reg_id % 4) // 2
-                                    key_local = (
-                                        literal_key_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
-                                    )
-                                    valid = row_valid[mma_q, row_slot] != 0
-                                    if valid:
-                                        valid = valid and key_local < tile_tokens
-                                    if valid:
-                                        valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
-                                    if not valid:
-                                        frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
-
-                        if const_expr(self.debug_dump_paged_kv_tma_s):
-                            if work_idx == Int32(0) and kv_head_idx == Int32(0):
-                                _dump_s_frag_tile(
-                                    mO,
-                                    frag_S,
-                                    lane,
-                                    warp_q_idx,
-                                    warp_kv_idx,
-                                    num_mma_q,
-                                    num_mma_kv,
-                                    packed_tile_rows,
-                                    tile_tokens,
+                    for mma_q in cutlass.range_constexpr(num_mma_q):
+                        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                            for reg_id in cutlass.range_constexpr(8):
+                                row_slot = (reg_id % 4) // 2
+                                key_local = (
+                                    literal_key_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
                                 )
-                            _exit_thread()
+                                valid = row_valid[mma_q, row_slot] != 0
+                                if valid:
+                                    valid = valid and key_local < tile_tokens
+                                if valid:
+                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                if not valid:
+                                    frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
 
-                        p_frag_scalar = None
-                        p_frag = cute.make_rmem_tensor(
-                            frag_p_layout,
-                            Uint32,
-                        )
-                        _literal_update_mdo_states_fp32_pack_p(
-                            frag_S,
-                            o_frag,
-                            m_frag,
-                            d_frag,
-                            p_frag,
-                            self.softmax_scale_log2,
-                            num_mma_q,
-                            num_mma_kv,
-                            num_mma_d_vo,
-                            p_frag_scalar,
-                        )
+                    if const_expr(self.debug_dump_paged_kv_tma_s):
+                        if work_idx == Int32(0) and kv_head_idx == Int32(0):
+                            _dump_s_frag_tile(
+                                mO,
+                                frag_S,
+                                lane,
+                                warp_q_idx,
+                                warp_kv_idx,
+                                num_mma_q,
+                                num_mma_kv,
+                                packed_tile_rows,
+                                tile_tokens,
+                            )
+                        _exit_thread()
+
+                    p_frag_scalar = None
+                    _literal_update_mdo_states_fp32_pack_p(
+                        frag_S,
+                        o_frag,
+                        m_frag,
+                        d_frag,
+                        p_frag,
+                        self.softmax_scale_log2,
+                        num_mma_q,
+                        num_mma_kv,
+                        num_mma_d_vo,
+                        p_frag_scalar,
+                    )
                 if const_expr(self.debug_dump_paged_kv_pregs):
                     if (
                         work_idx == Int32(0)
@@ -3099,28 +3286,6 @@ class PagedForwardKernel:
                         kv_consumer_state,
                         pipeline_v.consumer_try_wait(kv_consumer_state),
                     )
-                    if const_expr(self.use_paged_kv_tma_repack_v):
-                        if const_expr(self.use_paged_kv_tma_repack_v_vec128):
-                            _permute_rowmajor_tile_in_place_to_permuted_128b_vec128(
-                                sVStageBytes,
-                                Int32(consume_stage_idx * v_stage_bytes),
-                                lane,
-                                warp_linear_idx,
-                                tile_tokens,
-                                self.traits.upcast_stride_v,
-                                self.total_warps,
-                            )
-                        else:
-                            _permute_rowmajor_tile_in_place_to_permuted_128b(
-                                sVStageBytes,
-                                Int32(consume_stage_idx * v_stage_bytes),
-                                lane,
-                                warp_linear_idx,
-                                tile_tokens,
-                                self.traits.upcast_stride_v,
-                                self.total_warps,
-                            )
-                        cute.arch.sync_threads()
                 elif const_expr(self.use_paged_k_tma):
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.sync_threads()
@@ -3134,17 +3299,30 @@ class PagedForwardKernel:
                     ):
                         mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
                         pv_row_base = Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base
-                        if const_expr(self.use_paged_v_tma and not self.use_paged_kv_tma_repack_v):
-                            _literal_pv_mma_into_ofrag_tma_bf16_packed(
+                        if const_expr(self.use_paged_v_tma):
+                            v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                            _literal_pv_mma_into_ofrag_plane_bf16_packed(
                                 o_frag,
                                 p_frag,
-                                sVTma,
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                ),
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                ),
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                                ),
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                                ),
                                 lane,
                                 warp_kv_idx,
                                 pv_row_base,
                                 num_mma_q,
                                 num_mma_kv,
                                 num_mma_d_vo,
+                                tc_upcast_stride_plane,
                                 v_scale,
                                 mDebugU32,
                             )
@@ -3167,72 +3345,17 @@ class PagedForwardKernel:
                             )
                     _exit_thread()
 
-                if const_expr(self.debug_dump_paged_kv_pvregs_donor):
-                    if (
-                        work_idx == Int32(0)
-                        and kv_head_idx == Int32(0)
-                        and warp_q_idx == Int32(0)
-                        and warp_kv_idx == Int32(0)
-                    ):
-                        mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
-                        sVDebugStageT = _transpose_view(
-                            sVTma[None, None, consume_stage_idx]
-                            if const_expr(self.use_paged_v_tma)
-                            else sV[None, None, consume_stage_idx]
-                        )
-                        tOrVt_dbg = thr_mma_pv_tma.make_fragment_B(thr_mma_pv_tma.partition_B(sVDebugStageT))
-                        tOsVt_dbg = smem_thr_copy_V_tma.partition_S(sVDebugStageT)
-                        _dump_pv_copyfrag_regs_raw(
-                            mDebugU32,
-                            tOrVt_dbg,
-                            tOsVt_dbg,
-                            smem_thr_copy_V_tma,
-                            lane,
-                            num_mma_d_vo,
-                        )
-                    _exit_thread()
-
                 if const_expr(self.debug_dump_paged_kv_svwords):
                     if work_idx == Int32(0) and kv_head_idx == Int32(0):
                         mDebugU32 = cute.flatten(cute.recast_tensor(mO, cutlass.Uint32))
                         _dump_flat_u32_words(
                             mDebugU32,
                             cute.recast_tensor(
-                                sV[None, None, consume_stage_idx]
-                                if const_expr(self.use_paged_kv_tma_repack_v)
-                                else (
-                                    sVTma[None, None, consume_stage_idx]
-                                if const_expr(self.use_paged_v_tma)
-                                    else sV[None, None, consume_stage_idx]
-                                ),
+                                sV[None, None, consume_stage_idx],
                                 cutlass.Uint32,
                             ),
                             tidx,
                             self.traits.num_threads,
-                        )
-                    _exit_thread()
-
-                if const_expr(self.debug_dump_paged_kv_vt):
-                    sVDebugStageT = _transpose_view(
-                        sVTma[None, None, consume_stage_idx]
-                        if const_expr(self.use_paged_v_tma)
-                        else sV[None, None, consume_stage_idx]
-                    )
-                    tOrVt_dbg = thr_mma_pv_tma.make_fragment_B(thr_mma_pv_tma.partition_B(sVDebugStageT))
-                    tOsVt_dbg = smem_thr_copy_V_tma.partition_S(sVDebugStageT)
-                    if (
-                        work_idx == Int32(0)
-                        and kv_head_idx == Int32(0)
-                        and warp_q_idx == Int32(0)
-                        and warp_kv_idx == Int32(0)
-                    ):
-                        _dump_pv_copyfrag_regs(
-                            cute.flatten(mO),
-                            tOrVt_dbg,
-                            tOsVt_dbg,
-                            smem_thr_copy_V_tma,
-                            lane,
-                            num_mma_d_vo,
                         )
                     _exit_thread()
 
@@ -3271,49 +3394,31 @@ class PagedForwardKernel:
                         sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes)
                     )
                     if const_expr(self.use_paged_v_tma):
-                        if const_expr(self.use_paged_kv_tma_repack_v):
-                            _literal_pv_mma_into_ofrag_bf16_packed(
-                                o_frag,
-                                p_frag,
-                                v_smem_base_addr,
-                                lane,
-                                warp_kv_idx,
-                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
-                                num_mma_q,
-                                num_mma_kv,
-                                num_mma_d_vo,
-                                tc_upcast_stride_vo,
-                                v_scale,
-                            )
-                        elif const_expr(self.use_paged_kv_tma_copyfrag_pv):
-                            sVTmaStageT = _transpose_view(sVTma[None, None, consume_stage_idx])
-                            tOrVt_tma = thr_mma_pv_tma.make_fragment_B(
-                                thr_mma_pv_tma.partition_B(sVTmaStageT)
-                            )
-                            tOsVt_tma = smem_thr_copy_V_tma.partition_S(sVTmaStageT)
-                            _literal_pv_mma_into_ofrag_tma_bf16_copyfrag(
-                                o_frag,
-                                p_frag,
-                                tOrVt_tma,
-                                tOsVt_tma,
-                                smem_thr_copy_V_tma,
-                                num_mma_q,
-                                num_mma_d_vo,
-                                v_scale,
-                            )
-                        else:
-                            _literal_pv_mma_into_ofrag_tma_bf16_packed(
-                                o_frag,
-                                p_frag,
-                                sVTma,
-                                lane,
-                                warp_kv_idx,
-                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
-                                num_mma_q,
-                                num_mma_kv,
-                                num_mma_d_vo,
-                                v_scale,
-                            )
+                        v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
+                        _literal_pv_mma_into_ofrag_plane_bf16_packed(
+                            o_frag,
+                            p_frag,
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator + v_stage_plane_offset + Int32(2 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator + v_stage_plane_offset + Int32(3 * kv_plane_total_bytes)
+                            ),
+                            lane,
+                            warp_kv_idx,
+                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            num_mma_q,
+                            num_mma_kv,
+                            num_mma_d_vo,
+                            tc_upcast_stride_plane,
+                            v_scale,
+                        )
                     else:
                         _literal_pv_mma_into_ofrag_bf16_packed(
                             o_frag,
@@ -3336,8 +3441,11 @@ class PagedForwardKernel:
                     if next_tile_base < chunk_end:
                         if warp_linear_idx == Int32(0):
                             if const_expr(self.use_paged_k_tma):
-                                self._issue_paged_kv_tma_copy(
-                                    load_K_tma,
+                                self._issue_paged_kv_tma_copy_planes(
+                                    load_K_tma0,
+                                    load_K_tma1,
+                                    load_K_tma2,
+                                    load_K_tma3,
                                     pipeline_k,
                                     kv_producer_state,
                                     mPageTable,
@@ -3346,8 +3454,11 @@ class PagedForwardKernel:
                                     page_size,
                                 )
                             if const_expr(self.use_paged_v_tma):
-                                self._issue_paged_kv_tma_copy(
-                                    load_V_tma,
+                                self._issue_paged_kv_tma_copy_planes(
+                                    load_V_tma0,
+                                    load_V_tma1,
+                                    load_V_tma2,
+                                    load_V_tma3,
                                     pipeline_v,
                                     kv_producer_state,
                                     mPageTable,
