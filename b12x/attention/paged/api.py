@@ -152,12 +152,9 @@ def _use_fp8_decode_raw_specialization(
     traits: PagedForwardTraits,
     *,
     split_kv: bool,
-    enable_paged_kv_tma: bool,
 ) -> bool:
     return (
-        enable_paged_kv_tma
-        and os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
-        and not split_kv
+        not split_kv
         and traits.kv_dtype == torch.float8_e4m3fn
         and traits.q_dtype == torch.bfloat16
         and traits.o_dtype == torch.bfloat16
@@ -176,13 +173,10 @@ def _use_fp8_extend_raw_specialization(
     traits: PagedForwardTraits,
     *,
     split_kv: bool,
-    enable_paged_kv_tma: bool,
 ) -> bool:
     del split_kv
     return (
-        enable_paged_kv_tma
-        and os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
-        and traits.kv_dtype == torch.float8_e4m3fn
+        traits.kv_dtype == torch.float8_e4m3fn
         and traits.q_dtype == torch.bfloat16
         and traits.o_dtype == torch.bfloat16
         and traits.num_warps_q == 4
@@ -200,13 +194,10 @@ def _use_bf16_extend_raw_specialization(
     traits: PagedForwardTraits,
     *,
     split_kv: bool,
-    enable_paged_kv_tma: bool,
 ) -> bool:
     del split_kv
     return (
-        enable_paged_kv_tma
-        and os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
-        and traits.kv_dtype == torch.bfloat16
+        traits.kv_dtype == torch.bfloat16
         and traits.q_dtype == torch.bfloat16
         and traits.o_dtype == torch.bfloat16
         and traits.num_warps_q == 4
@@ -227,7 +218,6 @@ def _build_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
-    enable_paged_kv_tma: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -238,7 +228,6 @@ def _build_forward_kernel(
         split_kv=split_kv,
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
-        enable_paged_kv_tma=enable_paged_kv_tma,
     )
 
 
@@ -248,9 +237,8 @@ def _build_fp8_decode_raw_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
-    enable_paged_kv_tma: bool,
 ) -> PagedFp8DecodeRawForwardKernel:
-    del traits, split_kv, mxfp8_turbo, enable_mxfp8_pv, enable_paged_kv_tma
+    del traits, split_kv, mxfp8_turbo, enable_mxfp8_pv
     return PagedFp8DecodeRawForwardKernel()
 
 
@@ -260,9 +248,8 @@ def _build_fp8_extend_raw_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
-    enable_paged_kv_tma: bool,
 ) -> PagedFp8ExtendRawForwardKernel:
-    del traits, mxfp8_turbo, enable_mxfp8_pv, enable_paged_kv_tma
+    del traits, mxfp8_turbo, enable_mxfp8_pv
     return PagedFp8ExtendRawForwardKernel(split_kv=split_kv)
 
 
@@ -272,9 +259,8 @@ def _build_bf16_extend_raw_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
-    enable_paged_kv_tma: bool,
 ) -> PagedBf16ExtendRawForwardKernel:
-    del traits, mxfp8_turbo, enable_mxfp8_pv, enable_paged_kv_tma
+    del traits, mxfp8_turbo, enable_mxfp8_pv
     return PagedBf16ExtendRawForwardKernel(split_kv=split_kv)
 
 
@@ -369,42 +355,35 @@ def paged_attention_forward(
     traits = select_paged_forward_traits_from_plan(plan)
     mxfp8_turbo = _attn_turbo_enabled(workspace.attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
     enable_mxfp8_pv = mxfp8_turbo and plan.mode == "decode" and plan.kv_chunk_size <= 384
-    enable_paged_kv_tma = os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
     if _use_fp8_decode_raw_specialization(
         traits,
         split_kv=plan.split_kv,
-        enable_paged_kv_tma=enable_paged_kv_tma,
     ):
         forward_kernel = _build_fp8_decode_raw_forward_kernel(
             traits,
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
-            enable_paged_kv_tma,
         )
     elif _use_bf16_extend_raw_specialization(
         traits,
         split_kv=plan.split_kv,
-        enable_paged_kv_tma=enable_paged_kv_tma,
     ):
         forward_kernel = _build_bf16_extend_raw_forward_kernel(
             traits,
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
-            enable_paged_kv_tma,
         )
     elif _use_fp8_extend_raw_specialization(
         traits,
         split_kv=plan.split_kv,
-        enable_paged_kv_tma=enable_paged_kv_tma,
     ):
         forward_kernel = _build_fp8_extend_raw_forward_kernel(
             traits,
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
-            enable_paged_kv_tma,
         )
     else:
         forward_kernel = _build_forward_kernel(
@@ -412,7 +391,6 @@ def paged_attention_forward(
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
-            enable_paged_kv_tma,
         )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse

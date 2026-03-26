@@ -13,7 +13,6 @@ No kernel-side split LUT or legacy scheduler assumptions live here.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -199,11 +198,7 @@ def _lookup_chunk_pages_from_table(
 
 
 def _use_paged_bf16_tma_exact_plane_chunk_tables() -> bool:
-    return (
-        os.environ.get("B12X_PAGED_KV_TMA", "0") == "1"
-        and os.environ.get("B12X_PAGED_KV_TMA_EXACT_PLANE_LAYOUT", "1") != "0"
-        and os.environ.get("B12X_PAGED_KV_TMA_DISABLE_EXACT_PLANE", "0") != "1"
-    )
+    return True
 
 
 def _paged_chunk_table_pages(

@@ -1568,7 +1568,6 @@ class PagedForwardKernel:
         split_kv: bool,
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
-        enable_paged_kv_tma: bool = False,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -1590,9 +1589,7 @@ class PagedForwardKernel:
             else (2 if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock else 1)
         )
         base_use_paged_kv_tma_decode = (
-            enable_paged_kv_tma
-            and os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
-            and dtype_q == cutlass.BFloat16
+            dtype_q == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
             and traits.head_dim_qk == 256
             and traits.head_dim_vo == 256

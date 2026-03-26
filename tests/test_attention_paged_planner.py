@@ -361,25 +361,44 @@ def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_4096() -> N
     assert plan.split_kv is True
 
 
-def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_extend_8192_and_16384() -> None:
-    for cache_len in (8192, 16384):
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-            q_seqlens=[6] * 8,
-            cache_seqlens=[cache_len] * 8,
-            kv_dtype=torch.bfloat16,
-        )
-        plan = create_paged_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-        )
+def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_8192() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[8192] * 8,
+        kv_dtype=torch.bfloat16,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+    )
 
-        assert plan.mode == "extend"
-        assert plan.kv_chunk_size == 6 * 64
-        assert plan.split_kv is True
+    assert plan.mode == "extend"
+    assert plan.kv_chunk_size == 3 * 64
+    assert plan.split_kv is True
+
+
+def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_extend_16384() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[16384] * 8,
+        kv_dtype=torch.bfloat16,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+    )
+
+    assert plan.mode == "extend"
+    assert plan.kv_chunk_size == 6 * 64
+    assert plan.split_kv is True
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_twenty_four_pages_for_extend_32768() -> None:
@@ -442,7 +461,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_decode_8192() -> Non
     assert plan.split_kv is True
 
 
-def test_paged_bf16_auto_chunk_heuristic_uses_sixty_four_pages_for_decode_32768() -> None:
+def test_paged_bf16_auto_chunk_heuristic_uses_forty_eight_pages_for_decode_32768() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1] * 8,
         cache_seqlens=[32768] * 8,
@@ -458,7 +477,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_sixty_four_pages_for_decode_32768(
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == 64 * 64
+    assert plan.kv_chunk_size == 48 * 64
     assert plan.split_kv is True
 
 
@@ -509,7 +528,7 @@ def test_paged_decode_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
             4096: 3,
             8192: 6,
             16384: 12,
-            32768: 64,
+            32768: 48,
             65536: 128,
             131072: 128,
         },
@@ -561,7 +580,7 @@ def test_paged_extend_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
             1024: 1,
             2048: 2,
             4096: 3,
-            8192: 6,
+            8192: 3,
             16384: 6,
             32768: 24,
             65536: 24,
