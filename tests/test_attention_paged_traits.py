@@ -52,18 +52,18 @@ def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -
     )
     traits = select_paged_forward_traits_from_plan(plan)
 
-    assert traits.cta_tile_q == 64
+    assert traits.cta_tile_q == 32
     assert traits.num_warps_q == 4
     assert traits.num_warps_kv == 1
     assert traits.num_mma_q == 1
-    assert traits.num_mma_kv == 2
-    assert traits.cta_tile_kv == 32
+    assert traits.num_mma_kv == 4
+    assert traits.cta_tile_kv == 64
     assert traits.shared_storage_bytes == 49152
 
 
 def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits() -> None:
     fp8_traits = select_paged_forward_traits(
-        cta_tile_q=64,
+        cta_tile_q=32,
         head_dim_qk=256,
         head_dim_vo=256,
         q_dtype=torch.bfloat16,
@@ -79,6 +79,6 @@ def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits() -> None:
         device="cuda",
     )
 
-    assert fp8_traits.num_mma_kv == 2
+    assert fp8_traits.num_mma_kv == 4
     assert bf16_traits.num_mma_kv == 1
     assert fp8_traits.cta_tile_kv > bf16_traits.cta_tile_kv

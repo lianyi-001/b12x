@@ -179,12 +179,7 @@ def _use_fp8_extend_raw_specialization(
         traits.kv_dtype == torch.float8_e4m3fn
         and traits.q_dtype == torch.bfloat16
         and traits.o_dtype == torch.bfloat16
-        and traits.num_warps_q == 4
-        and traits.num_warps_kv == 1
-        and traits.num_threads == 128
-        and traits.cta_tile_q == 64
-        and traits.num_mma_q == 1
-        and traits.num_mma_kv == 2
+        and traits.cta_tile_q == 32
         and traits.head_dim_qk == 256
         and traits.head_dim_vo == 256
     )

@@ -161,6 +161,22 @@ def _fa2_determine_cta_tile_q(avg_packed_qo_len: int, head_dim: int) -> int:
     return 16
 
 
+def _paged_determine_cta_tile_q(
+    *,
+    mode: Literal["decode", "extend"],
+    kv_dtype: torch.dtype,
+    packed_qo_len: int,
+    head_dim: int,
+) -> int:
+    cta_tile_q = _fa2_determine_cta_tile_q(packed_qo_len, head_dim)
+    # FP8 extend is occupancy-bound on the current exact-plane kernels.
+    # Use a smaller host Q tile so the specialized raw kernel can expose
+    # more CTAs and trim per-CTA shared state.
+    if mode == "extend" and kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 64:
+        return 32
+    return cta_tile_q
+
+
 def _prefill_binary_search_kv_chunk_size(
     *,
     enable_cuda_graph: bool,
@@ -392,11 +408,21 @@ def create_paged_plan(
         total_num_rows = total_q
         max_seq_len = total_num_rows - batch + 1
         max_qo_len = max_seq_len * gqa_group_size
-        cta_tile_q = _fa2_determine_cta_tile_q(max_qo_len, head_dim_qk)
+        cta_tile_q = _paged_determine_cta_tile_q(
+            mode=mode,
+            kv_dtype=k_cache.dtype,
+            packed_qo_len=max_qo_len,
+            head_dim=head_dim_qk,
+        )
         total_num_qo_tiles = _ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch - 1
     else:
         avg_packed_qo_len = sum(packed_qo_len_arr) // max(batch, 1)
-        cta_tile_q = _fa2_determine_cta_tile_q(avg_packed_qo_len, head_dim_qk)
+        cta_tile_q = _paged_determine_cta_tile_q(
+            mode=mode,
+            kv_dtype=k_cache.dtype,
+            packed_qo_len=avg_packed_qo_len,
+            head_dim=head_dim_qk,
+        )
         total_num_qo_tiles = sum(_ceil_div(packed_qo_len, cta_tile_q) for packed_qo_len in packed_qo_len_arr)
 
     effective_kv_len_arr = [
