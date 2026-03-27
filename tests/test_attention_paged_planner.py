@@ -201,7 +201,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_coarser_extend_chunks_at_very_long_
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 24 * 64
+    assert plan.kv_chunk_size == 12 * 64
     assert plan.split_kv is True
 
 
@@ -243,7 +243,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_single_page_chunks_for_small_mid_ex
     assert plan.split_kv is True
 
 
-def test_paged_fp8_auto_chunk_heuristic_uses_two_page_chunks_for_mid_extend() -> None:
+def test_paged_fp8_auto_chunk_heuristic_uses_three_page_chunks_for_mid_extend() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6] * 8,
         cache_seqlens=[2048] * 8,
@@ -258,7 +258,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_two_page_chunks_for_mid_extend() ->
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 2 * 64
+    assert plan.kv_chunk_size == 3 * 64
     assert plan.split_kv is True
 
 
@@ -551,13 +551,13 @@ def test_paged_extend_fp8_chunk_policy_is_explicit_out_to_128k() -> None:
             256: 1,
             512: 1,
             1024: 1,
-            2048: 2,
+            2048: 3,
             4096: 3,
             8192: 6,
             16384: 6,
-            32768: 24,
-            65536: 24,
-            131072: 24,
+            32768: 12,
+            65536: 12,
+            131072: 12,
         },
     )
 
