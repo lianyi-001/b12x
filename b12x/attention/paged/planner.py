@@ -25,13 +25,13 @@ _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
     (4, 1),
     (8, 1),
     (16, 1),
-    (32, 3),
+    (32, 2),
     (64, 3),
     (128, 6),
     (256, 6),
-    (512, 12),
-    (1024, 12),
-    (2048, 12),
+    (512, 24),
+    (1024, 24),
+    (2048, 24),
 )
 _PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES = (
     (1, 1),
@@ -39,13 +39,13 @@ _PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES = (
     (4, 1),
     (8, 1),
     (16, 1),
-    (32, 3),
+    (32, 2),
     (64, 3),
     (128, 6),
     (256, 6),
-    (512, 12),
-    (1024, 12),
-    (2048, 12),
+    (512, 24),
+    (1024, 24),
+    (2048, 24),
 )
 _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
     (1, 1),
@@ -167,13 +167,13 @@ def _paged_determine_cta_tile_q(
     kv_dtype: torch.dtype,
     packed_qo_len: int,
     head_dim: int,
+    max_effective_kv_pages: int,
 ) -> int:
     cta_tile_q = _fa2_determine_cta_tile_q(packed_qo_len, head_dim)
-    # FP8 extend is occupancy-bound on the current exact-plane kernels.
-    # Use a smaller host Q tile so the specialized raw kernel can expose
-    # more CTAs and trim per-CTA shared state.
     if mode == "extend" and kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 64:
-        return 32
+        if max_effective_kv_pages <= 8:
+            return 32
+        return 48
     return cta_tile_q
 
 
@@ -408,20 +408,30 @@ def create_paged_plan(
         total_num_rows = total_q
         max_seq_len = total_num_rows - batch + 1
         max_qo_len = max_seq_len * gqa_group_size
+        max_effective_kv_pages = max(kv_len_arr) if window_left < 0 else min(
+            _ceil_div(window_left + _fa2_determine_cta_tile_q(max_qo_len, head_dim_qk), page_size),
+            max(kv_len_arr),
+        )
         cta_tile_q = _paged_determine_cta_tile_q(
             mode=mode,
             kv_dtype=k_cache.dtype,
             packed_qo_len=max_qo_len,
             head_dim=head_dim_qk,
+            max_effective_kv_pages=max(max_effective_kv_pages, 1),
         )
         total_num_qo_tiles = _ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch - 1
     else:
         avg_packed_qo_len = sum(packed_qo_len_arr) // max(batch, 1)
+        max_effective_kv_pages = max(kv_len_arr) if window_left < 0 else min(
+            _ceil_div(window_left + _fa2_determine_cta_tile_q(avg_packed_qo_len, head_dim_qk), page_size),
+            max(kv_len_arr),
+        )
         cta_tile_q = _paged_determine_cta_tile_q(
             mode=mode,
             kv_dtype=k_cache.dtype,
             packed_qo_len=avg_packed_qo_len,
             head_dim=head_dim_qk,
+            max_effective_kv_pages=max(max_effective_kv_pages, 1),
         )
         total_num_qo_tiles = sum(_ceil_div(packed_qo_len, cta_tile_q) for packed_qo_len in packed_qo_len_arr)
 

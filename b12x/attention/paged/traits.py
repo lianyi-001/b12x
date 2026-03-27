@@ -109,6 +109,35 @@ def select_paged_forward_traits(
     if o_dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"unsupported output dtype {o_dtype}")
 
+    if kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 48:
+        device_props = torch.cuda.get_device_properties(torch.cuda.current_device() if device is None else device)
+        max_smem_per_sm = int(device_props.shared_memory_per_multiprocessor)
+        return PagedForwardTraits(
+            cta_tile_q=48,
+            cta_tile_kv=32,
+            num_mma_q=1,
+            num_mma_kv=2,
+            num_mma_d_qk=head_dim_qk // 16,
+            num_mma_d_vo=head_dim_vo // 16,
+            num_warps_q=3,
+            num_warps_kv=1,
+            num_threads=96,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            upcast_stride_q=head_dim_qk // 8,
+            upcast_stride_k=head_dim_qk // 16,
+            upcast_stride_v=head_dim_vo // 16,
+            upcast_stride_o=head_dim_vo // (16 // _dtype_num_bytes(o_dtype)),
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
+            q_smem_bytes=48 * head_dim_qk * _dtype_num_bytes(q_dtype),
+            shared_storage_bytes=49152,
+            max_smem_per_sm=max_smem_per_sm,
+            num_ctas_per_sm=2 if max_smem_per_sm >= 2 * 49152 else 1,
+            max_smem_per_threadblock=max_smem_per_sm // (2 if max_smem_per_sm >= 2 * 49152 else 1),
+        )
+
     num_mma_d_qk = head_dim_qk // 16
     num_mma_d_vo = head_dim_vo // 16
     num_warps_q = paged_get_num_warps_q(cta_tile_q)

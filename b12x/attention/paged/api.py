@@ -179,7 +179,7 @@ def _use_fp8_extend_raw_specialization(
         traits.kv_dtype == torch.float8_e4m3fn
         and traits.q_dtype == torch.bfloat16
         and traits.o_dtype == torch.bfloat16
-        and traits.cta_tile_q == 32
+        and traits.cta_tile_q in (32, 48)
         and traits.head_dim_qk == 256
         and traits.head_dim_vo == 256
     )
@@ -244,8 +244,8 @@ def _build_fp8_extend_raw_forward_kernel(
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
 ) -> PagedFp8ExtendRawForwardKernel:
-    del traits, mxfp8_turbo, enable_mxfp8_pv
-    return PagedFp8ExtendRawForwardKernel(split_kv=split_kv)
+    del mxfp8_turbo, enable_mxfp8_pv
+    return PagedFp8ExtendRawForwardKernel(split_kv=split_kv, cta_tile_q=traits.cta_tile_q)
 
 
 @lru_cache(maxsize=16)
