@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import random
 import statistics
 import sys
 from dataclasses import dataclass
@@ -47,6 +48,44 @@ def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
         ends[idx].record()
     torch.cuda.synchronize()
     return [start.elapsed_time(end) for start, end in zip(starts, ends)]
+
+
+def _quantile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        raise ValueError("quantile requires at least one value")
+    if q <= 0.0:
+        return sorted_values[0]
+    if q >= 1.0:
+        return sorted_values[-1]
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def _bootstrap_ratio_ci(
+    numerator_times_ms: list[float],
+    denominator_times_ms: list[float],
+    *,
+    samples: int,
+    ci_level: float,
+    seed: int,
+) -> tuple[float, float]:
+    if len(numerator_times_ms) != len(denominator_times_ms):
+        raise ValueError("bootstrap inputs must have the same replay count")
+    if samples <= 0:
+        raise ValueError("bootstrap sample count must be positive")
+    n = len(numerator_times_ms)
+    rng = random.Random(seed)
+    ratios: list[float] = []
+    for _ in range(samples):
+        num_sample = [numerator_times_ms[rng.randrange(n)] for _ in range(n)]
+        den_sample = [denominator_times_ms[rng.randrange(n)] for _ in range(n)]
+        ratios.append(statistics.median(num_sample) / statistics.median(den_sample))
+    ratios.sort()
+    alpha = (1.0 - ci_level) / 2.0
+    return _quantile(ratios, alpha), _quantile(ratios, 1.0 - alpha)
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -406,6 +445,8 @@ def main() -> None:
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
     parser.add_argument("--fixed-split-pages", type=int, default=0)
     parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
+    parser.add_argument("--bootstrap-samples", type=int, default=2000)
+    parser.add_argument("--ci-level", type=float, default=0.95)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
     parser.add_argument("--check", action="store_true")
@@ -414,6 +455,10 @@ def main() -> None:
     require_sm120()
     if args.replays < 100:
         raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
+    if not 0.0 < args.ci_level < 1.0:
+        raise ValueError("--ci-level must be between 0 and 1")
+    if args.bootstrap_samples <= 0:
+        raise ValueError("--bootstrap-samples must be positive")
     clear_attention_caches()
 
     dtype = _dtype_from_name(args.dtype)
@@ -537,11 +582,22 @@ def main() -> None:
             f"min={backend_metrics.min_us:8.1f} us"
         )
         if flashinfer_metrics is not None:
+            ratio = flashinfer_metrics.median_us / backend_metrics.median_us
+            ci_lo, ci_hi = _bootstrap_ratio_ci(
+                flashinfer_times_ms,
+                backend_times_ms,
+                samples=args.bootstrap_samples,
+                ci_level=args.ci_level,
+                seed=case_idx,
+            )
+            moe = max(ratio - ci_lo, ci_hi - ratio)
             line += (
                 f" | fa2 median={flashinfer_metrics.median_us:8.1f} us "
                 f"min={flashinfer_metrics.min_us:8.1f} us "
                 f"| fa2/{backend_metrics.backend}="
-                f"{flashinfer_metrics.median_us / backend_metrics.median_us:6.3f}x"
+                f"{ratio:6.3f}x"
+                f" +/- {moe:5.3f}x"
+                f" {int(args.ci_level * 100)}%CI=[{ci_lo:5.3f},{ci_hi:5.3f}]"
             )
         print(line + check_suffix)
 
