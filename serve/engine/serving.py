@@ -24,9 +24,11 @@ from serve.cache.prefix_checkpoint_cache import PrefixCheckpointCache
 from serve.engine.request import Request
 from serve.engine.sampling import SamplingParams, sample_batch
 from serve.engine.scheduler import BatchScheduler
-from serve.model.loader import load_model
+from serve.logging import get_logger, start_startup_session
+from serve.model.loader import load_model, LoadedModel
 from serve.tp.group import TPGroup
 
+LOGGER = get_logger(__name__)
 
 @dataclass
 class GenerationResult:
@@ -40,6 +42,90 @@ class GenerationResult:
     total_time_ms: float = 0.0
 
 
+def _should_enable_prefix_cache(
+    *,
+    is_hybrid: bool,
+    world_size: int,
+    has_state_snapshot_slots: bool,
+) -> bool:
+    """Decide whether prefix-cache reuse is safe for the current engine mode."""
+    if not is_hybrid:
+        return True
+    if world_size > 1:
+        return False
+    return has_state_snapshot_slots
+
+
+def _should_enable_layer_compile(
+    *,
+    is_hybrid: bool,
+    compile_layers: bool,
+) -> bool:
+    """Decide whether per-layer torch.compile should run."""
+    if not compile_layers:
+        return False
+    return not is_hybrid
+
+
+def _estimate_loaded_model_bytes(model: LoadedModel) -> int:
+    """Return the persistent GPU storage owned by *model*.
+
+    Walks the LoadedModel object graph and counts unique CUDA storages so
+    tied/shared tensors are only charged once. Many of the custom runtime
+    containers in `serve.model` and `b12x` hold tensors in plain attributes
+    or dataclass fields rather than registered parameters/buffers.
+    """
+
+    seen_storages: set[tuple[int, int]] = set()
+    seen_objects: set[int] = set()
+    total = 0
+
+    def visit(obj) -> None:
+        nonlocal total
+        if obj is None:
+            return
+        if isinstance(obj, (str, bytes, int, float, bool, torch.dtype, torch.device)):
+            return
+
+        if isinstance(obj, torch.Tensor):
+            if obj.device.type != "cuda":
+                return
+            storage = obj.untyped_storage()
+            key = (storage.data_ptr(), storage.nbytes())
+            if key in seen_storages:
+                return
+            seen_storages.add(key)
+            total += storage.nbytes()
+            return
+
+        obj_id = id(obj)
+        if obj_id in seen_objects:
+            return
+        seen_objects.add(obj_id)
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                visit(key)
+                visit(value)
+            return
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            for item in obj:
+                visit(item)
+            return
+
+        if hasattr(obj, "__dict__"):
+            for value in vars(obj).values():
+                visit(value)
+
+    visit(model)
+    return total
+
+
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f} GiB"
+
+
 class ServingEngine:
     """Unified serving engine for all ranks."""
 
@@ -48,11 +134,13 @@ class ServingEngine:
         model_path: str,
         device: str = "cuda",
         tp_group: Optional[TPGroup] = None,
+        load_backend: str = "auto",
         kv_dtype: torch.dtype = torch.bfloat16,
         warmup_prefill_lengths: list[int] | None = None,
         graph_batch_sizes: list[int] | None = None,
         prefill_chunk_size: int = 512,
         capture_prefill_graph: bool = False,
+        compile_layers: bool = False,
     ):
         torch.set_grad_enabled(False)
         self.tp_group = tp_group
@@ -64,11 +152,17 @@ class ServingEngine:
         self._lock = threading.Lock()  # Guards scheduler + _next_rid.
         self._loop_running = False
         self._work_event = threading.Event()  # Wakes the server loop on submit.
+        self._loop_error: str | None = None
 
         if self.rank == 0:
-            print(f"Loading model (TP={self.world_size})...")
+            LOGGER.info(f"Loading model [bold](TP={self.world_size})[/]")
 
-        self.model = load_model(model_path, device=device, tp_group=tp_group)
+        self.model = load_model(
+            model_path,
+            device=device,
+            tp_group=tp_group,
+            load_backend=load_backend,
+        )
         self.cfg = self.model.config
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
         if not self.tokenizer.chat_template:
@@ -83,16 +177,35 @@ class ServingEngine:
         if layer_types:
             num_kv_layers = sum(1 for t in layer_types if t == "attention")
 
-        total_mem = torch.cuda.mem_get_info()[1]
-        used_mem = total_mem - torch.cuda.mem_get_info()[0]
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        model_bytes = _estimate_loaded_model_bytes(self.model)
         # KV cache + model weights together should occupy mem_fraction of total GPU memory.
         mem_fraction = 0.75
-        kv_budget = max(0, int(total_mem * mem_fraction) - used_mem)
+        target_mem = int(total_mem * mem_fraction)
+        kv_budget = max(0, target_mem - model_bytes)
+        kv_budget_before_tp = kv_budget
+
+        model_bytes_min = model_bytes
+        model_bytes_max = model_bytes
+        free_mem_min = free_mem
+        free_mem_max = free_mem
 
         # All ranks must agree on num_pages for TP broadcast shapes.
         if self.world_size > 1:
+            model_bytes_min_t = torch.tensor([model_bytes], dtype=torch.long, device=device)
+            model_bytes_max_t = torch.tensor([model_bytes], dtype=torch.long, device=device)
+            free_mem_min_t = torch.tensor([free_mem], dtype=torch.long, device=device)
+            free_mem_max_t = torch.tensor([free_mem], dtype=torch.long, device=device)
             budget_t = torch.tensor([kv_budget], dtype=torch.long, device=device)
+            dist.all_reduce(model_bytes_min_t, op=dist.ReduceOp.MIN)
+            dist.all_reduce(model_bytes_max_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(free_mem_min_t, op=dist.ReduceOp.MIN)
+            dist.all_reduce(free_mem_max_t, op=dist.ReduceOp.MAX)
             dist.all_reduce(budget_t, op=dist.ReduceOp.MIN)
+            model_bytes_min = model_bytes_min_t.item()
+            model_bytes_max = model_bytes_max_t.item()
+            free_mem_min = free_mem_min_t.item()
+            free_mem_max = free_mem_max_t.item()
             kv_budget = budget_t.item()
 
         # Linear-attention state arena shared by live requests and cached
@@ -167,20 +280,54 @@ class ServingEngine:
             )
             kv_budget = max(0, kv_budget - snapshot_ssm_bytes)
             if self.rank == 0:
-                print(
+                LOGGER.info(
                     f"LinearStateArena: {live_ssm_slots} live + "
                     f"{snapshot_slots} checkpoint slots, "
                     f"{linear_state_arena.memory_bytes() / 1e6:.0f} MB"
                 )
 
+        kv_bytes_per_token_block = (
+            64
+            * self.cfg.num_kv_heads
+            * self.cfg.head_dim
+            * (torch.finfo(kv_dtype).bits // 8 if kv_dtype.is_floating_point else 1)
+            * 2
+            * num_kv_layers
+        )
+        num_pages = PagePool.estimate_num_pages(
+            kv_budget,
+            num_layers=num_kv_layers,
+            kv_heads=self.cfg.num_kv_heads,
+            head_dim=self.cfg.head_dim,
+            kv_dtype=kv_dtype,
+        )
+        kv_pool_bytes = num_pages * kv_bytes_per_token_block
+
+        if self.rank == 0:
+            LOGGER.debug(
+                "KV sizing: "
+                f"target={_format_gib(target_mem)} "
+                f"total={_format_gib(total_mem)} "
+                f"free_after_load[min,max]=[{_format_gib(free_mem_min)}, {_format_gib(free_mem_max)}] "
+                f"model_bytes[min,max]=[{_format_gib(model_bytes_min)}, {_format_gib(model_bytes_max)}] "
+                f"kv_budget_before_tp={_format_gib(kv_budget_before_tp)} "
+                f"kv_budget={_format_gib(kv_budget)}"
+            )
+            LOGGER.debug(
+                "KV layout: "
+                f"layers={num_kv_layers} "
+                f"kv_heads={self.cfg.num_kv_heads} "
+                f"head_dim={self.cfg.head_dim} "
+                f"dtype={kv_dtype} "
+                f"bytes_per_page={_format_gib(kv_bytes_per_token_block)} "
+                f"num_pages={num_pages} "
+                f"pool_bytes={_format_gib(kv_pool_bytes)} "
+                f"cuda_allocated={_format_gib(torch.cuda.memory_allocated())} "
+                f"cuda_reserved={_format_gib(torch.cuda.memory_reserved())}"
+            )
+
         self.pool = PagePool(
-            num_pages=PagePool.estimate_num_pages(
-                kv_budget,
-                num_layers=num_kv_layers,
-                kv_heads=self.cfg.num_kv_heads,
-                head_dim=self.cfg.head_dim,
-                kv_dtype=kv_dtype,
-            ),
+            num_pages=num_pages,
             num_layers=num_kv_layers,
             kv_heads=self.cfg.num_kv_heads,
             head_dim=self.cfg.head_dim,
@@ -200,49 +347,62 @@ class ServingEngine:
                                  pool=self.pool, ssm_pool=linear_state_arena)
 
         if self.rank == 0:
-            print(f"KV cache: {self.pool.num_pages} pages ({self.pool.num_pages * 64} tokens)")
+            LOGGER.info(f"KV cache: {self.pool.num_pages} pages ({self.pool.num_pages * 64} tokens)")
 
         is_hybrid = layer_types is not None and any(t == "linear_attention" for t in layer_types)
 
         graph_sizes = [1, 2, 4, 8] if graph_batch_sizes is None else graph_batch_sizes
+        enable_layer_compile = _should_enable_layer_compile(
+            is_hybrid=is_hybrid,
+            compile_layers=compile_layers,
+        )
+        startup = start_startup_session()
+        if self.rank == 0 and compile_layers and not enable_layer_compile:
+            LOGGER.warning("Layer compile disabled for hybrid models.")
 
         if not is_hybrid:
             # Warmup uses kv_mgr-based path which doesn't support SSM layers.
             if self.rank == 0:
-                print("Warming up...")
+                LOGGER.info("Warming up")
             prefill_lengths = warmup_prefill_lengths or [4, 64]
-            self.runner.warmup(batch_sizes=[1], prefill_lengths=prefill_lengths)
+            self.runner.warmup(batch_sizes=[1], prefill_lengths=prefill_lengths, startup=startup)
 
-        if not is_hybrid:
+        if enable_layer_compile:
             if self.rank == 0:
-                print("Compiling...")
+                LOGGER.info("Compiling layers")
             self.runner.compile_model()
 
-        if not is_hybrid:
-            self.runner.warmup(batch_sizes=[1], prefill_lengths=[4, prefill_chunk_size])
+        if enable_layer_compile:
+            self.runner.warmup(batch_sizes=[1], prefill_lengths=[4, prefill_chunk_size], startup=startup)
 
         if graph_sizes:
             if self.rank == 0:
-                print("Capturing CUDA graphs...")
+                LOGGER.info("Capturing CUDA graphs")
             self.runner.capture_decode_graphs(
                 batch_sizes=graph_sizes,
                 prefill_chunk_size=prefill_chunk_size if capture_prefill_graph else None,
+                startup=startup,
             )
-            # Graph capture warmup contaminates SSM and KV state. Reset all.
-            if linear_state_arena is not None:
-                linear_state_arena.zero_all()
-            for i in range(len(self.pool.k_cache)):
-                self.pool.k_cache[i].zero_()
-                self.pool.v_cache[i].zero_()
+
+        # Warmup/compile/graph capture all touch shared runtime state. Reset it
+        # before the scheduler starts serving real requests.
+        if linear_state_arena is not None:
+            linear_state_arena.zero_all()
+        for i in range(len(self.pool.k_cache)):
+            self.pool.k_cache[i].zero_()
+            self.pool.v_cache[i].zero_()
 
         # Scheduler.
-        hybrid_prefix_cache = (
-            (not is_hybrid)
-            or (
+        hybrid_prefix_cache = _should_enable_prefix_cache(
+            is_hybrid=is_hybrid,
+            world_size=self.world_size,
+            has_state_snapshot_slots=(
                 linear_state_arena is not None
                 and linear_state_arena.num_snapshot_slots > 0
-            )
+            ),
         )
+        if self.rank == 0 and is_hybrid and self.world_size > 1:
+            LOGGER.warning("Hybrid prefix cache disabled under TP until SSM snapshots are mirrored across ranks.")
 
         self.scheduler = BatchScheduler(
             cache=self.cache,
@@ -259,7 +419,7 @@ class ServingEngine:
             dist.barrier()
 
         if self.rank == 0:
-            print("Ready.")
+            LOGGER.info("Ready")
 
     # -- public API (rank 0) -----------------------------------------------
 
@@ -278,6 +438,7 @@ class ServingEngine:
         if params is None:
             params = SamplingParams()
         self._ensure_stop_ids(params)
+        self._raise_if_loop_unhealthy()
 
         req = Request(
             rid=self._next_rid,
@@ -397,6 +558,7 @@ class ServingEngine:
         """
         if hasattr(self, '_loop_thread') and self._loop_thread.is_alive():
             return
+        self._loop_error = None
         self._loop_running = True
         self._loop_thread = threading.Thread(target=self._server_loop, daemon=True)
         self._loop_thread.start()
@@ -407,19 +569,31 @@ class ServingEngine:
             self._loop_thread.join(timeout=5.0)
 
     def _has_server_loop(self) -> bool:
-        return self._loop_running
+        return (
+            self._loop_running
+            and hasattr(self, '_loop_thread')
+            and self._loop_thread.is_alive()
+        )
 
     def _server_loop(self) -> None:
         """Background loop: step while there's work, wait for signal otherwise."""
         torch.set_grad_enabled(False)
-        while self._loop_running:
+        try:
+            while self._loop_running:
+                with self._lock:
+                    has_work = self.scheduler.has_work
+                if has_work:
+                    self._step()
+                else:
+                    self._work_event.wait(timeout=0.1)
+                    self._work_event.clear()
+        except Exception as exc:
+            self._loop_error = f"{type(exc).__name__}: {exc}"
             with self._lock:
-                has_work = self.scheduler.has_work
-            if has_work:
-                self._step()
-            else:
-                self._work_event.wait(timeout=0.1)
-                self._work_event.clear()
+                self.scheduler.fail_all("engine_error")
+        finally:
+            self._loop_running = False
+            self._work_event.set()
 
     # -- core step ---------------------------------------------------------
 
@@ -513,6 +687,20 @@ class ServingEngine:
             ids.update(extra)
         params.stop_token_ids = list(ids)
 
+    def _raise_if_loop_unhealthy(self) -> None:
+        if self._loop_error is not None:
+            raise RuntimeError(f"server loop unhealthy: {self._loop_error}")
+
+    def server_loop_health(self) -> dict:
+        loop_alive = hasattr(self, '_loop_thread') and self._loop_thread.is_alive()
+        healthy = self._loop_error is None
+        return {
+            "running": self._loop_running,
+            "alive": loop_alive,
+            "healthy": healthy,
+            "last_error": self._loop_error,
+        }
+
     def _to_result(self, req: Request) -> GenerationResult:
         return GenerationResult(
             request_id=req.rid,
@@ -543,6 +731,7 @@ class ServingEngine:
             )
 
     def shutdown(self) -> None:
+        self.stop_server_loop()
         if self.rank == 0 and self.world_size > 1:
             # Send shutdown signal.
             header = torch.tensor([255, 0, 0, 0], dtype=torch.long, device=self.device)
@@ -550,7 +739,7 @@ class ServingEngine:
 
     # -- TP step-level broadcast -------------------------------------------
 
-    # Header: [mode_code, total_q, bs, graph_bs]
+    # Header: [mode_code, total_q, bs, graph_bs, page_table_width]
     # mode_code: 0=idle, 1=prefill, 2=decode, 255=shutdown.
 
     _MODE_IDLE = 0
@@ -560,7 +749,7 @@ class ServingEngine:
 
     def _broadcast_step_idle(self) -> None:
         """Tell followers there's no work this step."""
-        header = torch.tensor([self._MODE_IDLE, 0, 0, 0],
+        header = torch.tensor([self._MODE_IDLE, 0, 0, 0, 0],
                               dtype=torch.long, device=self.device)
         dist.broadcast(header, src=0)
 
@@ -570,8 +759,9 @@ class ServingEngine:
         total_q = batch.token_ids.shape[0]
         bs = batch.cache_seqlens.shape[0]
         graph_bs = batch.graph_bs or 0
+        page_table_width = batch.page_table.shape[1]
 
-        header = torch.tensor([mode_code, total_q, bs, graph_bs],
+        header = torch.tensor([mode_code, total_q, bs, graph_bs, page_table_width],
                               dtype=torch.long, device=self.device)
         dist.broadcast(header, src=0)
 
@@ -579,11 +769,7 @@ class ServingEngine:
         dist.broadcast(batch.token_ids, src=0)
         q_seqlens_t = torch.tensor(batch.q_seqlens, dtype=torch.int32, device=self.device)
         dist.broadcast(q_seqlens_t, src=0)
-        # Pad page_table to pool.num_pages columns for consistent shape.
-        pt = batch.page_table
-        if pt.shape[1] < self.pool.num_pages:
-            pt = torch.nn.functional.pad(pt, (0, self.pool.num_pages - pt.shape[1]))
-        dist.broadcast(pt, src=0)
+        dist.broadcast(batch.page_table, src=0)
         dist.broadcast(batch.cache_seqlens, src=0)
 
         # Broadcast SSM cache indices if hybrid model.
@@ -599,7 +785,7 @@ class ServingEngine:
 
         Returns "shutdown", None (idle), or (mode, token_ids, ...) tuple.
         """
-        header = torch.empty(4, dtype=torch.long, device=self.device)
+        header = torch.empty(5, dtype=torch.long, device=self.device)
         dist.broadcast(header, src=0)
 
         mode_code = header[0].item()
@@ -611,6 +797,7 @@ class ServingEngine:
         total_q = header[1].item()
         bs = header[2].item()
         graph_bs = header[3].item() or None
+        page_table_width = header[4].item()
         mode = "prefill" if mode_code == self._MODE_PREFILL else "decode"
 
         token_ids = torch.empty(total_q, dtype=torch.long, device=self.device)
@@ -619,9 +806,7 @@ class ServingEngine:
         dist.broadcast(q_seqlens_t, src=0)
         q_seqlens = q_seqlens_t.tolist()
 
-        # Page table: need to know shape. Use same max_pages as rank 0.
-        # Broadcast page_table shape first via its existing tensor.
-        page_table = torch.empty(bs, self.pool.num_pages, dtype=torch.int32, device=self.device)
+        page_table = torch.empty(bs, page_table_width, dtype=torch.int32, device=self.device)
         dist.broadcast(page_table, src=0)
         cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
         dist.broadcast(cache_seqlens, src=0)

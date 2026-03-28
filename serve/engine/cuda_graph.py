@@ -12,12 +12,11 @@ The GraphPool holds decode and prefill graphs keyed by batch size.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
-from b12x.integration.attention import allocate_paged_attention_workspace_pool
 from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
 
 from serve.engine.step_state import StepState
@@ -65,20 +64,37 @@ class CapturedGraph:
         # Static output buffer — only last token per request.
         self.output = torch.empty(bs, cfg.vocab_size, dtype=torch.bfloat16, device=device)
 
-        # Per-graph workspace pools.
-        self._attn_workspace = allocate_paged_attention_workspace_pool()
+        # Per-graph workspaces.
+        self._attn_workspaces = []
         self._moe_workspace = allocate_tp_moe_workspace_pool()
 
         # Per-layer output buffers for b12x kernels.
         layer_types = getattr(cfg, 'layer_types', None)
         self._attn_outputs = []
-        for i in range(cfg.num_layers):
+        kv_layer_idx = 0
+        for i, layer in enumerate(self.model.layers):
             lt = layer_types[i] if layer_types else "attention"
+            attn = getattr(layer, "attn", None)
             if lt == "attention" or lt is None:
                 self._attn_outputs.append(
                     torch.empty(total_q, cfg.num_q_heads, cfg.head_dim, dtype=torch.bfloat16, device=device))
+                if isinstance(attn, B12xPagedAttention):
+                    self._attn_workspaces.append(
+                        attn.allocate_workspaces(
+                            device=device,
+                            kv_dtype=pool.k_cache[kv_layer_idx].dtype,
+                            page_size=pool.page_size,
+                            num_cache_pages=pool.num_pages,
+                            max_total_q=total_q,
+                            use_cuda_graph=True,
+                        )
+                    )
+                else:
+                    self._attn_workspaces.append(None)
+                kv_layer_idx += 1
             else:
                 self._attn_outputs.append(None)
+                self._attn_workspaces.append(None)
         self._moe_outputs = [
             torch.empty(total_q, cfg.hidden_size, dtype=torch.bfloat16, device=device)
             for _ in range(cfg.num_layers)
@@ -89,6 +105,7 @@ class CapturedGraph:
     def capture(self) -> None:
         """Warmup and capture the graph."""
         self._inject_buffers()
+        self._prepare_attn_workspaces()
 
         capture_stream = torch.cuda.Stream()
         with torch.cuda.stream(capture_stream):
@@ -122,6 +139,7 @@ class CapturedGraph:
         if ssm_cache_indices is not None and self.mamba_cache_indices is not None:
             self.mamba_cache_indices[:bs].copy_(ssm_cache_indices)
 
+        self._prepare_attn_workspaces()
         self.graph.replay()
         return self.output[:bs]
 
@@ -186,11 +204,24 @@ class CapturedGraph:
             self._saved_moe_out.append(getattr(layer.ffn, '_moe_output_buffer', None))
 
             if is_paged:
-                attn.set_workspace(self._attn_workspace)
+                attn.set_workspace(self._attn_workspaces[i])
                 if self._attn_outputs[i] is not None:
                     attn.set_output_buffer(self._attn_outputs[i])
             layer.set_moe_workspace(self._moe_workspace)
             layer.set_moe_output_buffer(self._moe_outputs[i])
+
+    def _prepare_attn_workspaces(self) -> None:
+        post_write_seqlens = self.pre_write + (self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1])
+        mode = "decode" if self.tokens_per_req == 1 else "extend"
+        for workspace_set in self._attn_workspaces:
+            if workspace_set is None:
+                continue
+            workspace = workspace_set[mode]
+            workspace.prepare_for_cuda_graph_replay(
+                self.page_table,
+                post_write_seqlens,
+                self.cu_seqlens_q,
+            )
 
     def _restore_buffers(self) -> None:
         """Restore shared workspaces after capture."""
@@ -209,11 +240,19 @@ class CapturedGraph:
 class GraphPool:
     """Pool of captured graphs for decode and prefill."""
 
-    def __init__(self, model, pool, device, batch_sizes: list[int] | None = None,
-                 prefill_chunk_size: int | None = None):
+    def __init__(
+        self,
+        model,
+        pool,
+        device,
+        batch_sizes: list[int] | None = None,
+        prefill_chunk_size: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ):
         self.model = model
         self.pool = pool
         self.device = device
+        self._progress_callback = progress_callback
         self._decode_graphs: dict[int, CapturedGraph] = {}
         self._prefill_graphs: dict[int, CapturedGraph] = {}
 
@@ -226,6 +265,8 @@ class GraphPool:
         """Capture decode graphs (1 token per request)."""
         for bs in batch_sizes:
             if bs not in self._decode_graphs:
+                if self._progress_callback is not None:
+                    self._progress_callback(f"Capture CUDA graphs [dim](decode bs={bs})[/]")
                 g = CapturedGraph(self.model, self.pool, bs, self.device, tokens_per_req=1)
                 g.capture()
                 self._decode_graphs[bs] = g
@@ -234,6 +275,10 @@ class GraphPool:
         """Capture prefill graphs (chunk_size tokens per request)."""
         for bs in (batch_sizes or [1]):
             if bs not in self._prefill_graphs:
+                if self._progress_callback is not None:
+                    self._progress_callback(
+                        f"Capture CUDA graphs [dim](prefill bs={bs}, chunk={chunk_size})[/]"
+                    )
                 g = CapturedGraph(self.model, self.pool, bs, self.device, tokens_per_req=chunk_size)
                 g.capture()
                 self._prefill_graphs[bs] = g

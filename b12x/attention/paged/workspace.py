@@ -25,6 +25,26 @@ def _canonical_device(device: torch.device | str) -> torch.device:
     return device
 
 
+def _shape_only_cuda_tensor(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a tiny CUDA tensor view with the requested logical shape.
+
+    The paged planner only inspects shape, dtype, and device for the
+    contract-side KV tensors; it never reads their data. Represent the
+    contract with a single-element zero-stride view so graph workspaces do
+    not allocate full shadow copies of the KV cache.
+    """
+
+    if any(dim <= 0 for dim in shape):
+        raise ValueError(f"shape must be positive in every dimension, got {shape}")
+    base = torch.empty(1, dtype=dtype, device=device)
+    return base.as_strided(shape, (0,) * len(shape))
+
+
 @dataclass(kw_only=True)
 class PagedAttentionWorkspace:
     mode: Literal["decode", "extend"]
@@ -81,12 +101,12 @@ class PagedAttentionWorkspace:
         if num_cache_pages <= 0:
             raise ValueError("num_cache_pages must be positive")
         plan_q = torch.empty((max_total_q, num_q_heads, head_dim_qk), dtype=dtype, device=device)
-        plan_k_cache = torch.empty(
+        plan_k_cache = _shape_only_cuda_tensor(
             (num_cache_pages, page_size, num_kv_heads, head_dim_qk),
             dtype=kv_dtype,
             device=device,
         )
-        plan_v_cache = torch.empty(
+        plan_v_cache = _shape_only_cuda_tensor(
             (num_cache_pages, page_size, num_kv_heads, head_dim_vo),
             dtype=kv_dtype,
             device=device,
@@ -172,6 +192,14 @@ class PagedAttentionWorkspace:
         fixed_split_size: int | None = None,
         disable_split_kv: bool = False,
     ) -> PagedAttentionWorkspace:
+        if self.use_cuda_graph and torch.cuda.is_current_stream_capturing():
+            if self._plan is None:
+                raise RuntimeError(
+                    "graph-mode paged workspace must be prepared before CUDA graph capture"
+                )
+            self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+            return self
+
         inferred_mode = infer_paged_mode(cu_seqlens_q)
         if inferred_mode != self.mode:
             raise ValueError(f"workspace mode {self.mode} does not match prepared mode {inferred_mode}")
@@ -195,7 +223,7 @@ class PagedAttentionWorkspace:
             mode=self.mode,
             fixed_split_size=-1 if fixed_split_size is None else int(fixed_split_size),
             disable_split_kv=disable_split_kv,
-            enable_cuda_graph=False,
+            enable_cuda_graph=self.use_cuda_graph,
             graph_chunk_policy=self.use_cuda_graph,
         )
         self._ensure_capacity(plan)
@@ -203,6 +231,25 @@ class PagedAttentionWorkspace:
         self._copy_plan_metadata(plan)
         self._plan = plan
         return self
+
+    def prepare_for_cuda_graph_replay(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        *,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool = False,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError("prepare_for_cuda_graph_replay is only valid for graph-mode workspaces")
+        return self.prepare(
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+        )
 
     def _ensure_plan_contract(self, active_total_q: int) -> None:
         if self._plan_q is None or self._plan_k_cache is None or self._plan_v_cache is None:
@@ -276,12 +323,14 @@ class PagedAttentionWorkspace:
 
     def _ensure_capacity(self, plan: PagedPlan) -> None:
         work_items_needed = int(plan.new_batch_size)
+        block_valid_needed = int(plan.padded_batch_size)
         total_q_needed = int(plan.total_q)
         batch_needed = int(plan.page_table_shape[0])
         page_table_width_needed = int(plan.page_table_shape[1])
         partial_rows_needed = int(plan.total_num_partial_rows) if plan.split_kv else 0
 
         work_items_capacity = 0 if self.request_indices is None else int(self.request_indices.shape[0])
+        block_valid_capacity = 0 if self.block_valid_mask is None else int(self.block_valid_mask.shape[0])
         total_q_capacity = 0 if self.lse is None else int(self.lse.shape[1])
         batch_capacity = 0 if self.o_indptr is None else int(self.o_indptr.shape[0] - 1)
         page_table_width_capacity = 0 if self.page_table is None else int(self.page_table.shape[1])
@@ -289,6 +338,7 @@ class PagedAttentionWorkspace:
 
         needs_growth = (
             work_items_needed > work_items_capacity
+            or block_valid_needed > block_valid_capacity
             or total_q_needed > total_q_capacity
             or batch_needed > batch_capacity
             or page_table_width_needed > page_table_width_capacity
@@ -302,6 +352,7 @@ class PagedAttentionWorkspace:
             )
 
         work_items_capacity = max(work_items_capacity, work_items_needed)
+        block_valid_capacity = max(block_valid_capacity, block_valid_needed)
         total_q_capacity = max(total_q_capacity, total_q_needed)
         batch_capacity = max(batch_capacity, batch_needed)
         page_table_width_capacity = max(page_table_width_capacity, page_table_width_needed)
@@ -310,7 +361,7 @@ class PagedAttentionWorkspace:
         self.request_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
         self.qo_tile_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
         self.kv_tile_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
-        self.block_valid_mask = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
+        self.block_valid_mask = torch.empty(block_valid_capacity, dtype=torch.int32, device=self.device)
         self.page_table = torch.empty(
             (batch_capacity, page_table_width_capacity), dtype=torch.int32, device=self.device
         )

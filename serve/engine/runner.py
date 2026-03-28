@@ -12,13 +12,14 @@ import os
 import torch
 import torch.nn.functional as F
 
-
 from serve.cache.kv_cache import KVCacheManager
 from serve.cache.page_pool import PagePool
+from serve.logging import StartupSession, get_logger
 from serve.model.attention import B12xPagedAttention
 from serve.model.loader import LoadedModel
 from serve.model.ops import rms_norm
 
+LOGGER = get_logger(__name__)
 
 class ModelRunner:
     """Runs forward passes through the full model stack."""
@@ -42,10 +43,8 @@ class ModelRunner:
         self.max_batch_size = max_batch_size
         self.max_total_tokens = max_total_tokens
 
-        # Inject shared workspace pools and bind per-layer cache refs.
-        from b12x.integration.attention import allocate_paged_attention_workspace_pool
+        # Inject per-layer workspaces and bind per-layer cache refs.
         from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
-        attn_workspace = allocate_paged_attention_workspace_pool()
         moe_workspace = allocate_tp_moe_workspace_pool()
 
         kv_layer_idx = 0
@@ -54,12 +53,21 @@ class ModelRunner:
 
         for i, layer in enumerate(model.layers):
             attn = getattr(layer, 'attn', None)
+            lt = layer_types[i] if layer_types else None
             if isinstance(attn, B12xPagedAttention):
-                attn.set_workspace(attn_workspace)
+                attn.set_workspace(
+                    attn.allocate_workspaces(
+                        device=self.device,
+                        kv_dtype=self.pool.k_cache[kv_layer_idx].dtype,
+                        page_size=self.pool.page_size,
+                        num_cache_pages=self.pool.num_pages,
+                        max_total_q=self.max_total_tokens,
+                        use_cuda_graph=False,
+                    )
+                )
             layer.set_moe_workspace(moe_workspace)
 
             # Bind cache refs so layers own their slice.
-            lt = layer_types[i] if layer_types else None
             if lt == "linear_attention" and ssm_pool is not None:
                 layer.bind_cache(
                     ssm_state=ssm_pool.ssm_state_for_layer(ssm_layer_idx),
@@ -75,6 +83,8 @@ class ModelRunner:
 
         # CUDA graph pool (lazily populated).
         self._graph_pool = None
+        self._compiled_layers = None
+        self._workspace_refresh_needed = False
 
     def prefill(
         self,
@@ -98,36 +108,78 @@ class ModelRunner:
         return self._forward(token_ids, request_ids, q_seqlens, mode="extend")
 
     def compile_model(self, mode: str = "max-autotune-no-cudagraphs") -> None:
-        """Apply torch.compile to each layer's forward pass.
+        """Compile per-layer wrappers for prefill/extend only.
 
         b12x kernel calls within each layer are wrapped with
         @torch.compiler.disable so dynamo doesn't trace into them.
-        Compiling per-layer means CapturedGraph._run_forward() calls
-        the compiled layers directly.
+        Decode still uses eager layers: compiled TransformerLayer wrappers
+        are producing non-finite outputs on the first decode step even when
+        the same submodules run correctly in eager mode.
 
         """
-        for i in range(len(self.model.layers)):
-            self.model.layers[i] = torch.compile(self.model.layers[i], mode=mode)
+        self._compiled_layers = [
+            torch.compile(layer, mode=mode)
+            for layer in self.model.layers
+        ]
+
+    def _refresh_paged_attention_workspaces(self) -> None:
+        """Recreate paged-attention workspaces after compiled prefill/extend.
+
+        The compiled prefill path can leave the next eager decode unstable for
+        one-page KV pools. Rebinding fresh workspaces before decode avoids
+        reusing that poisoned runtime metadata.
+        """
+        if self.pool is None:
+            return
+
+        kv_layer_idx = 0
+        for layer in self.model.layers:
+            attn = getattr(layer, "attn", None)
+            if not isinstance(attn, B12xPagedAttention):
+                continue
+            attn.set_workspace(
+                attn.allocate_workspaces(
+                    device=self.device,
+                    kv_dtype=self.pool.k_cache[kv_layer_idx].dtype,
+                    page_size=self.pool.page_size,
+                    num_cache_pages=self.pool.num_pages,
+                    max_total_q=self.max_total_tokens,
+                    use_cuda_graph=False,
+                )
+            )
+            kv_layer_idx += 1
 
     def capture_decode_graphs(
         self,
         batch_sizes: list[int] | None = None,
         prefill_chunk_size: int | None = None,
+        startup: StartupSession | None = None,
     ) -> None:
         """Capture CUDA graphs for decode and optionally prefill."""
         if batch_sizes is None:
             batch_sizes = [1, 2, 4, 8]
         from serve.engine.cuda_graph import GraphPool
+        total_graphs = len(batch_sizes) + (1 if prefill_chunk_size else 0)
+        if startup is not None:
+            startup.start("Capture CUDA graphs", total=total_graphs)
         self._graph_pool = GraphPool(
             self.model, self.pool, self.device,
             batch_sizes=batch_sizes,
             prefill_chunk_size=prefill_chunk_size,
+            progress_callback=(
+                None
+                if startup is None
+                else lambda desc: startup.advance(description=desc)
+            ),
         )
+        if startup is not None:
+            startup.finish()
 
     def warmup(
         self,
         batch_sizes: list[int] | None = None,
         prefill_lengths: list[int] | None = None,
+        startup: StartupSession | None = None,
     ) -> None:
         """Pre-compile kernels for common shapes.
 
@@ -142,11 +194,28 @@ class ModelRunner:
 
         import time
         t0 = time.time()
+        total_steps = 0
+        for plen in prefill_lengths:
+            if self._warmup_shape_fits(batch_size=1, prefill_len=plen, decode_steps=1):
+                total_steps += 2
+        for bs in batch_sizes:
+            if bs == 1:
+                continue
+            if self._warmup_shape_fits(batch_size=bs, prefill_len=4, decode_steps=2):
+                total_steps += bs + 2
+        if startup is not None:
+            startup.start("Warmup kernels", total=total_steps)
 
         for plen in prefill_lengths:
+            if not self._warmup_shape_fits(batch_size=1, prefill_len=plen, decode_steps=1):
+                continue
             # Prefill at various lengths to compile attention for those shapes.
+            if startup is not None:
+                startup.advance(description=f"Warmup kernels [dim](prefill {plen} tok)[/]")
             dummy_ids = torch.ones(plen, dtype=torch.long, device=self.device)
             self.prefill(dummy_ids, request_ids=[10000], q_seqlens=[plen])
+            if startup is not None:
+                startup.advance(description=f"Warmup kernels [dim](decode after {plen} tok)[/]")
             # One decode step.
             dummy_tok = torch.ones(1, dtype=torch.long, device=self.device)
             self.decode(dummy_tok, request_ids=[10000])
@@ -155,18 +224,34 @@ class ModelRunner:
         for bs in batch_sizes:
             if bs == 1:
                 continue  # Already covered above.
+            if not self._warmup_shape_fits(batch_size=bs, prefill_len=4, decode_steps=2):
+                continue
             for i in range(bs):
+                if startup is not None:
+                    startup.advance(description=f"Warmup kernels [dim](prefill bs={bs}, req={i + 1}/{bs})[/]")
                 dummy_ids = torch.ones(4, dtype=torch.long, device=self.device)
                 self.prefill(dummy_ids, request_ids=[10000 + i], q_seqlens=[4])
             rids = [10000 + i for i in range(bs)]
             for _ in range(2):
+                if startup is not None:
+                    startup.advance(description=f"Warmup kernels [dim](decode bs={bs})[/]")
                 dummy_tok = torch.ones(bs, dtype=torch.long, device=self.device)
                 self.decode(dummy_tok, request_ids=rids)
             for i in range(bs):
                 self.kv_mgr.free_request(10000 + i)
 
         torch.cuda.synchronize()
-        print(f"Warmup complete ({time.time() - t0:.1f}s)")
+        if startup is not None:
+            startup.finish()
+        LOGGER.info(f"Warmup complete ({time.time() - t0:.1f}s)")
+
+    def _warmup_shape_fits(self, *, batch_size: int, prefill_len: int, decode_steps: int) -> bool:
+        """Return whether a dummy warmup shape fits the currently bound KV pool."""
+        if self.pool is None:
+            return True
+        total_len_per_request = prefill_len + decode_steps
+        pages_per_request = (total_len_per_request + self.pool.page_size - 1) // self.pool.page_size
+        return batch_size * pages_per_request <= self.pool.num_pages
 
     def decode(
         self,
@@ -292,10 +377,21 @@ class ModelRunner:
             is_decode=(mode == "decode"),
         )
 
-        for layer in self.model.layers:
+        if mode == "decode" and self._workspace_refresh_needed:
+            self._refresh_paged_attention_workspaces()
+            self._workspace_refresh_needed = False
+
+        layers = self.model.layers
+        if mode != "decode" and self._compiled_layers is not None:
+            layers = self._compiled_layers
+
+        for layer in layers:
             hidden = layer(hidden, state)
             if layer_stds is not None:
                 layer_stds.append(float(hidden.float().std().item()))
+
+        if mode != "decode" and self._compiled_layers is not None:
+            self._workspace_refresh_needed = True
 
         hidden = rms_norm(hidden, self.model.final_norm_weight, cfg.rms_norm_eps,
                           gemma_style=getattr(cfg, 'gemma_norm', False))

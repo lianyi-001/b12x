@@ -33,3 +33,9 @@ def test_no_sglang_imports_in_model():
     source = inspect.getsource(gdn)
     # No "from sglang" in the module source.
     assert "from sglang" not in source, f"Found sglang import in gdn.py: {source}"
+
+
+def test_paged_attention_module_imports():
+    from serve.model.attention import B12xPagedAttention
+
+    assert B12xPagedAttention is not None
