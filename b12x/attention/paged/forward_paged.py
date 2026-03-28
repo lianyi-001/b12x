@@ -1556,6 +1556,127 @@ def _literal_update_mdo_states_fp32_pack_p(
             m_frag[mma_q, row_slot] = Float32(m_new)
 
 
+@cute.jit
+def _literal_update_mdo_states_fp32_pack_p_pairwise(
+    s_frag0: cute.Tensor,
+    s_frag1: cute.Tensor,
+    o_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    p_frag0: cute.Tensor,
+    p_frag1: cute.Tensor,
+    sm_scale_log2: Float32,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_vo,
+):
+    for mma_q in cutlass.range_constexpr(num_mma_q):
+        for row_slot in cutlass.range_constexpr(2):
+            m_prev = Float32(m_frag[mma_q, row_slot])
+            m_new = Float32(m_prev)
+            for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                m_local0 = attention_utils.fmax(
+                    attention_utils.fmax(
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 0],
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 1],
+                    ),
+                    attention_utils.fmax(
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 4],
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 5],
+                    ),
+                )
+                m_local1 = attention_utils.fmax(
+                    attention_utils.fmax(
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 0],
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 1],
+                    ),
+                    attention_utils.fmax(
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 4],
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 5],
+                    ),
+                )
+                m_new = attention_utils.fmax(m_new, attention_utils.fmax(m_local0, m_local1))
+            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+            m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+
+            scale_term = (
+                Float32(1.0)
+                if m_new == -Float32.inf
+                else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+            )
+            d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * scale_term)
+            for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                o_frag[mma_q, mma_d, row_slot * 2 + 0] *= scale_term
+                o_frag[mma_q, mma_d, row_slot * 2 + 1] *= scale_term
+                o_frag[mma_q, mma_d, row_slot * 2 + 4] *= scale_term
+                o_frag[mma_q, mma_d, row_slot * 2 + 5] *= scale_term
+
+            m_scaled = Float32(m_new * sm_scale_log2)
+            for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                p00 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p01 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p02 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p03 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p10 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p11 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p12 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p13 = (
+                    Float32(0.0)
+                    if m_new == -Float32.inf
+                    else _exp2_approx_ftz_f32(
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2 - m_scaled
+                    )
+                )
+                p_frag0[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p00, p01)
+                p_frag0[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p02, p03)
+                p_frag1[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p10, p11)
+                p_frag1[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p12, p13)
+
+            m_frag[mma_q, row_slot] = Float32(m_new)
+
+
 class PagedForwardKernel:
     def __init__(
         self,
@@ -4939,6 +5060,7 @@ class PagedBf16ExtendRawForwardKernel:
         m_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32)
         d_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Float32)
         p_frag = cute.make_rmem_tensor(frag_p_layout, Uint32)
+        p_frag_pair = cute.make_rmem_tensor(frag_p_layout, Uint32)
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
         k_plane0_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes))
         k_plane1_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes))
@@ -5025,8 +5147,8 @@ class PagedBf16ExtendRawForwardKernel:
                 cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
             cute.arch.sync_threads()
 
-            for subtile_iter in cutlass.range_constexpr(4):
-                subtile_row_base = Int32(subtile_iter * self.compute_tile_rows)
+            for subtile_pair_iter in cutlass.range_constexpr(2):
+                subtile_row_base = Int32(subtile_pair_iter * 2 * self.compute_tile_rows)
                 if subtile_row_base < tile_tokens:
                     frag_S = cute.make_rmem_tensor(frag_s_layout, Float32)
                     frag_S.fill(0.0)
@@ -5059,46 +5181,151 @@ class PagedBf16ExtendRawForwardKernel:
                             if not valid:
                                 frag_S[mma_q, 0, reg_id] = Float32(-Float32.inf)
 
-                    _literal_update_mdo_states_fp32_pack_p(
-                        frag_S,
-                        o_frag,
-                        m_frag,
-                        d_frag,
-                        p_frag,
-                        self.softmax_scale_log2,
-                        self.num_mma_q,
-                        self.num_mma_kv,
-                        self.num_mma_d_vo,
-                        None,
-                    )
-                    for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                        d0, d1 = bf16_rowsum_m16k16_f32(
-                            d_frag[mma_q, 0],
-                            d_frag[mma_q, 1],
-                            p_frag[mma_q, 0, 0],
-                            p_frag[mma_q, 0, 1],
-                            p_frag[mma_q, 0, 2],
-                            p_frag[mma_q, 0, 3],
+                    next_subtile_row_base = subtile_row_base + Int32(self.compute_tile_rows)
+                    if next_subtile_row_base < tile_tokens:
+                        frag_S_pair = cute.make_rmem_tensor(frag_s_layout, Float32)
+                        frag_S_pair.fill(0.0)
+                        _literal_qk_mma_into_sfrag_plane_bf16(
+                            frag_S_pair,
+                            q_smem_base_addr,
+                            k_plane0_base_addr,
+                            k_plane1_base_addr,
+                            k_plane2_base_addr,
+                            k_plane3_base_addr,
+                            lane,
+                            warp_q_idx,
+                            Int32(0),
+                            next_subtile_row_base,
+                            self.num_mma_q,
+                            self.num_mma_kv,
+                            self.num_mma_d_qk,
+                            tc_upcast_stride_q,
+                            tc_upcast_stride_plane,
                         )
-                        d_frag[mma_q, 0] = d0
-                        d_frag[mma_q, 1] = d1
+                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
+                            for reg_id in cutlass.range_constexpr(8):
+                                row_slot = (reg_id % 4) // 2
+                                key_local = (
+                                    next_subtile_row_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                )
+                                valid = row_valid[mma_q, row_slot] != 0
+                                if valid:
+                                    valid = valid and key_local < tile_tokens
+                                if valid:
+                                    valid = valid and (
+                                        (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                    )
+                                if not valid:
+                                    frag_S_pair[mma_q, 0, reg_id] = Float32(-Float32.inf)
 
-                    _literal_pv_mma_into_ofrag_plane_bf16_packed(
-                        o_frag,
-                        p_frag,
-                        v_plane0_base_addr,
-                        v_plane1_base_addr,
-                        v_plane2_base_addr,
-                        v_plane3_base_addr,
-                        lane,
-                        Int32(0),
-                        subtile_row_base,
-                        self.num_mma_q,
-                        self.num_mma_kv,
-                        self.num_mma_d_vo,
-                        tc_upcast_stride_plane,
-                        Float32(1.0),
-                    )
+                        _literal_update_mdo_states_fp32_pack_p_pairwise(
+                            frag_S,
+                            frag_S_pair,
+                            o_frag,
+                            m_frag,
+                            d_frag,
+                            p_frag,
+                            p_frag_pair,
+                            self.softmax_scale_log2,
+                            self.num_mma_q,
+                            self.num_mma_kv,
+                            self.num_mma_d_vo,
+                        )
+                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
+                            d0, d1 = bf16_rowsum_m16k16_f32(
+                                d_frag[mma_q, 0],
+                                d_frag[mma_q, 1],
+                                p_frag[mma_q, 0, 0],
+                                p_frag[mma_q, 0, 1],
+                                p_frag[mma_q, 0, 2],
+                                p_frag[mma_q, 0, 3],
+                            )
+                            d_frag[mma_q, 0] = d0
+                            d_frag[mma_q, 1] = d1
+                            d0, d1 = bf16_rowsum_m16k16_f32(
+                                d_frag[mma_q, 0],
+                                d_frag[mma_q, 1],
+                                p_frag_pair[mma_q, 0, 0],
+                                p_frag_pair[mma_q, 0, 1],
+                                p_frag_pair[mma_q, 0, 2],
+                                p_frag_pair[mma_q, 0, 3],
+                            )
+                            d_frag[mma_q, 0] = d0
+                            d_frag[mma_q, 1] = d1
+
+                        _literal_pv_mma_into_ofrag_plane_bf16_packed(
+                            o_frag,
+                            p_frag,
+                            v_plane0_base_addr,
+                            v_plane1_base_addr,
+                            v_plane2_base_addr,
+                            v_plane3_base_addr,
+                            lane,
+                            Int32(0),
+                            subtile_row_base,
+                            self.num_mma_q,
+                            self.num_mma_kv,
+                            self.num_mma_d_vo,
+                            tc_upcast_stride_plane,
+                            Float32(1.0),
+                        )
+                        _literal_pv_mma_into_ofrag_plane_bf16_packed(
+                            o_frag,
+                            p_frag_pair,
+                            v_plane0_base_addr,
+                            v_plane1_base_addr,
+                            v_plane2_base_addr,
+                            v_plane3_base_addr,
+                            lane,
+                            Int32(0),
+                            next_subtile_row_base,
+                            self.num_mma_q,
+                            self.num_mma_kv,
+                            self.num_mma_d_vo,
+                            tc_upcast_stride_plane,
+                            Float32(1.0),
+                        )
+                    else:
+                        _literal_update_mdo_states_fp32_pack_p(
+                            frag_S,
+                            o_frag,
+                            m_frag,
+                            d_frag,
+                            p_frag,
+                            self.softmax_scale_log2,
+                            self.num_mma_q,
+                            self.num_mma_kv,
+                            self.num_mma_d_vo,
+                            None,
+                        )
+                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
+                            d0, d1 = bf16_rowsum_m16k16_f32(
+                                d_frag[mma_q, 0],
+                                d_frag[mma_q, 1],
+                                p_frag[mma_q, 0, 0],
+                                p_frag[mma_q, 0, 1],
+                                p_frag[mma_q, 0, 2],
+                                p_frag[mma_q, 0, 3],
+                            )
+                            d_frag[mma_q, 0] = d0
+                            d_frag[mma_q, 1] = d1
+
+                        _literal_pv_mma_into_ofrag_plane_bf16_packed(
+                            o_frag,
+                            p_frag,
+                            v_plane0_base_addr,
+                            v_plane1_base_addr,
+                            v_plane2_base_addr,
+                            v_plane3_base_addr,
+                            lane,
+                            Int32(0),
+                            subtile_row_base,
+                            self.num_mma_q,
+                            self.num_mma_kv,
+                            self.num_mma_d_vo,
+                            tc_upcast_stride_plane,
+                            Float32(1.0),
+                        )
 
             consumer_state.advance()
             tile_base += Int32(self.stage_tile_rows)
