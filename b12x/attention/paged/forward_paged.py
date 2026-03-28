@@ -5441,12 +5441,12 @@ class PagedFp8ExtendRawForwardKernel:
     def __init__(self, *, split_kv: bool, cta_tile_q: int):
         self.split_kv = split_kv
         self.cta_tile_q = cta_tile_q
-        self.long_context_pipeline = cta_tile_q == 48
-        self.stage_tile_rows = 32 if self.long_context_pipeline else 64
-        self.num_stages = 2 if self.long_context_pipeline else 1
-        self.compute_tile_rows = 16 if self.long_context_pipeline else 32
+        self.use_q48_long_form = cta_tile_q == 48
+        self.stage_tile_rows = 32 if self.use_q48_long_form else 64
+        self.num_stages = 2 if self.use_q48_long_form else 1
+        self.compute_tile_rows = 16 if self.use_q48_long_form else 32
         self.num_mma_q = 1
-        self.num_mma_kv = 1 if self.long_context_pipeline else 2
+        self.num_mma_kv = 1 if self.use_q48_long_form else 2
         self.num_mma_d_qk = 16
         self.num_mma_d_vo = 16
         self.num_warps_q = 2 if cta_tile_q == 32 else 3
@@ -5699,12 +5699,6 @@ class PagedFp8ExtendRawForwardKernel:
         row_local_idx = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
         row_valid = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
         q_token_local = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        if const_expr(self.cta_tile_q != 48):
-            q_head_idx_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-            q_row_idx_frag = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
-        else:
-            q_head_idx_frag = None
-            q_row_idx_frag = None
         causal_k_limit = cute.make_rmem_tensor(cute.make_layout((self.num_mma_q, 2), stride=(2, 1)), Int32)
         frag_s_layout = cute.make_layout((self.num_mma_q, self.num_mma_kv, 8), stride=(self.num_mma_kv * 8, 8, 1))
         frag_p_layout = cute.make_layout((self.num_mma_q, self.num_mma_kv, 4), stride=(self.num_mma_kv * 4, 4, 1))
@@ -5727,17 +5721,10 @@ class PagedFp8ExtendRawForwardKernel:
                 if valid_row:
                     packed_q_idx = packed_tile_start + packed_row_local
                     token_local = packed_q_idx // group_size
-                    q_group_lane = packed_q_idx - token_local * group_size
                     q_token_local[mma_q, row_slot] = Int32(token_local)
-                    if const_expr(self.cta_tile_q != 48):
-                        q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
-                        q_row_idx_frag[mma_q, row_slot] = Int32(q_start + token_local)
                     causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
                 else:
                     q_token_local[mma_q, row_slot] = Int32(0)
-                    if const_expr(self.cta_tile_q != 48):
-                        q_head_idx_frag[mma_q, row_slot] = Int32(0)
-                        q_row_idx_frag[mma_q, row_slot] = Int32(0)
                     causal_k_limit[mma_q, row_slot] = Int32(-1)
 
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
@@ -6070,12 +6057,10 @@ class PagedFp8ExtendRawForwardKernel:
         for mma_q in cutlass.range_constexpr(self.num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
                 token_local = q_token_local[mma_q, row_slot]
-                if const_expr(self.cta_tile_q == 48):
-                    q_head_idx = Int32(kv_head_idx * group_size + ((packed_tile_start + row_local_idx[mma_q, row_slot]) - token_local * group_size))
-                    q_row_idx = Int32(q_start + token_local)
-                else:
-                    q_head_idx = q_head_idx_frag[mma_q, row_slot]
-                    q_row_idx = q_row_idx_frag[mma_q, row_slot]
+                packed_q_idx = packed_tile_start + row_local_idx[mma_q, row_slot]
+                q_group_lane = packed_q_idx - token_local * group_size
+                q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
+                q_row_idx = Int32(q_start + token_local)
                 valid_row_store = row_valid[mma_q, row_slot] != 0
                 merged_m = m_frag[mma_q, row_slot]
                 merged_d = d_frag[mma_q, row_slot]
