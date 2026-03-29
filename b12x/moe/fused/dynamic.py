@@ -1170,7 +1170,11 @@ class MoEDynamicKernel:
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
                 MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
                 MmaNPerEpiN = self.epi_tile[1] // mma_tile_n
+                fc2_m_tiles = cute.size(tCrA, mode=[1])
+                fc2_n_tiles = cute.size(tCrB, mode=[1])
 
+                fc1_m_tiles = cute.size(tCrA, mode=[1])
+                fc1_n_tiles = cute.size(tCrB, mode=[1])
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
                     # ============================================================
@@ -1208,8 +1212,8 @@ class MoEDynamicKernel:
                                 fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                 fz_csSFB_p = cute.filter_zeros(csSFB_p)
                                 ml_pipeline.consumer_wait(cons_state, peek)
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
+                            for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                                for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                     mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
                                     mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
                                     cute.gemm(
@@ -1235,8 +1239,8 @@ class MoEDynamicKernel:
                             cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
                             cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
                             cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
-                        for _mt in range(self.num_m_tiles):
-                            for _nt in range(self.num_n_tiles):
+                        for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                            for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                 mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
                                 mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
                                 cute.gemm(
@@ -1280,8 +1284,8 @@ class MoEDynamicKernel:
                                 fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                 fz_csSFB_p = cute.filter_zeros(csSFB_p)
                                 up_pipeline.consumer_wait(up_cons_state, peek)
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
+                            for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                                for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                     mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
                                     mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
                                     cute.gemm(
@@ -1305,8 +1309,8 @@ class MoEDynamicKernel:
                             cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
                             cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
                             cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
-                        for _mt in range(self.num_m_tiles):
-                            for _nt in range(self.num_n_tiles):
+                        for _mt in cutlass.range_constexpr(fc1_m_tiles):
+                            for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                 mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
                                 mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
                                 cute.gemm(
@@ -1475,8 +1479,8 @@ class MoEDynamicKernel:
                                 f2 = cute.filter_zeros(csSFB_phase2)
                                 f4 = cute.filter_zeros(crSFB)
                                 cute.copy(smem_copy_SFB, f2[None, None, k_next], f4[None, None, k_next])
-                            for _mt in range(self.num_m_tiles):
-                                for _nt in range(self.num_n_tiles):
+                            for _mt in cutlass.range_constexpr(fc2_m_tiles):
+                                for _nt in cutlass.range_constexpr(fc2_n_tiles):
                                     mma_atom.set(WarpField.SFA, tCrSFA[None, _mt, k_block_idx].iterator)
                                     mma_atom.set(WarpField.SFB, tCrSFB[None, _nt, k_block_idx].iterator)
                                     cute.gemm(mma_atom, down_acc[None, _mt, _nt], tCrA[None, _mt, k_block_idx], tCrB[None, _nt, k_block_idx], down_acc[None, _mt, _nt])
@@ -1506,7 +1510,6 @@ class MoEDynamicKernel:
                             # No cross-warp barrier needed before scatter:
                             # StMatrix is warp-local, and each warp only reads
                             # its own 64×64 quadrant of sC below.
-
                             rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
                             # Per-warp scatter: each warp scatters its own quadrant
