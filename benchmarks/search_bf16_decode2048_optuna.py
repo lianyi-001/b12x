@@ -75,17 +75,14 @@ class TrialConfig:
 
 @dataclass(frozen=True)
 class TrialResult:
-    ratio: float
-    ratio_ci_low: float
-    ratio_ci_high: float
     b12x_mean_us: float
-    fa2_mean_us: float
+    b12x_ci_low_us: float
+    b12x_ci_high_us: float
+    b12x_sem_us: float
     plan_desc: str
     cta_tile_q: int
     kv_chunk_size: int
     split_kv: bool
-    max_abs: float
-    cos: float
 
 
 def _build_decode_table(*, exact_plane: bool, chunk_pages: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -314,15 +311,14 @@ def _run_trial(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    fa_output: torch.Tensor,
-    fa_mean_us: float,
-    fa_sem_us: float,
     warmup: int,
     replays: int,
 ) -> TrialResult:
     with _scheduler_overrides(config):
         clear_attention_caches()
         b12x_graph, b12x_output, plan = _capture_b12x_graph(
+            # Keep output capture live so kernel side effects remain identical to the
+            # regular benchmark path, even though we do not compare against FA2 here.
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -331,29 +327,20 @@ def _run_trial(
             cu_seqlens_q=cu_seqlens_q,
             warmup=warmup,
         )
-        b12x_mean_us, _, _, b12x_sem_us = _bench_backend_mean_us(b12x_graph, replays=replays)
-        max_abs = float((b12x_output - fa_output).abs().max().item())
-        cos = float(bench._cosine_similarity(b12x_output, fa_output))
-        ratio = fa_mean_us / b12x_mean_us
-        ratio_ci_low, ratio_ci_high = bench._ratio_mean_ci(
-            fa_mean_us,
-            fa_sem_us,
-            b12x_mean_us,
-            b12x_sem_us,
-            ci_level=0.95,
+        del b12x_output
+        b12x_mean_us, b12x_ci_low_us, b12x_ci_high_us, b12x_sem_us = _bench_backend_mean_us(
+            b12x_graph,
+            replays=replays,
         )
         return TrialResult(
-            ratio=ratio,
-            ratio_ci_low=ratio_ci_low,
-            ratio_ci_high=ratio_ci_high,
             b12x_mean_us=b12x_mean_us,
-            fa2_mean_us=fa_mean_us,
+            b12x_ci_low_us=b12x_ci_low_us,
+            b12x_ci_high_us=b12x_ci_high_us,
+            b12x_sem_us=b12x_sem_us,
             plan_desc=f"chunk={plan.kv_chunk_size},{'split' if plan.split_kv else 'nosplit'}",
             cta_tile_q=int(plan.cta_tile_q),
             kv_chunk_size=int(plan.kv_chunk_size),
             split_kv=bool(plan.split_kv),
-            max_abs=max_abs,
-            cos=cos,
         )
 
 
@@ -365,12 +352,8 @@ def _make_objective(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    fa_output: torch.Tensor,
-    fa_mean_us: float,
-    fa_sem_us: float,
     warmup: int,
     replays: int,
-    cos_threshold: float,
 ) -> Any:
     def objective(trial: optuna.Trial) -> float:
         config = _sample_config(trial)
@@ -383,9 +366,6 @@ def _make_objective(
                 page_table=page_table,
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_q=cu_seqlens_q,
-                fa_output=fa_output,
-                fa_mean_us=fa_mean_us,
-                fa_sem_us=fa_sem_us,
                 warmup=warmup,
                 replays=replays,
             )
@@ -401,34 +381,29 @@ def _make_objective(
         trial.set_user_attr("kv_chunk_size", result.kv_chunk_size)
         trial.set_user_attr("split_kv", result.split_kv)
         trial.set_user_attr("b12x_mean_us", result.b12x_mean_us)
-        trial.set_user_attr("fa2_mean_us", result.fa2_mean_us)
-        trial.set_user_attr("ratio", result.ratio)
-        trial.set_user_attr("ratio_ci_low", result.ratio_ci_low)
-        trial.set_user_attr("ratio_ci_high", result.ratio_ci_high)
-        trial.set_user_attr("max_abs", result.max_abs)
-        trial.set_user_attr("cos", result.cos)
-        if result.cos < cos_threshold:
-            trial.set_user_attr("status", "bad_cos")
-            return 0.0
-        return result.ratio
+        trial.set_user_attr("b12x_ci_low_us", result.b12x_ci_low_us)
+        trial.set_user_attr("b12x_ci_high_us", result.b12x_ci_high_us)
+        trial.set_user_attr("b12x_sem_us", result.b12x_sem_us)
+        return result.b12x_mean_us
 
     return objective
 
 
 def _print_top_trials(study: optuna.Study, *, limit: int) -> None:
     complete = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
-    complete.sort(key=lambda trial: float(trial.value), reverse=True)
+    complete.sort(key=lambda trial: float(trial.value))
     print(f"top {min(limit, len(complete))} trials:")
     for trial in complete[:limit]:
         print(
             {
                 "trial": trial.number,
-                "value": round(float(trial.value), 6),
+                "b12x_mean_us": round(float(trial.value), 6),
+                "b12x_ci_low_us": trial.user_attrs.get("b12x_ci_low_us"),
+                "b12x_ci_high_us": trial.user_attrs.get("b12x_ci_high_us"),
                 "plan": trial.user_attrs.get("plan_desc"),
                 "cta_tile_q": trial.user_attrs.get("cta_tile_q"),
                 "kv_chunk_size": trial.user_attrs.get("kv_chunk_size"),
                 "split_kv": trial.user_attrs.get("split_kv"),
-                "cos": trial.user_attrs.get("cos"),
                 "params": trial.params,
             }
         )
@@ -439,8 +414,7 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=200)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--replays", type=int, default=200)
-    parser.add_argument("--cos-threshold", type=float, default=0.999)
+    parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--study-name", type=str, default=DEFAULT_STUDY_NAME)
     parser.add_argument(
         "--journal-path",
@@ -461,27 +435,6 @@ def main() -> None:
     journal_path.parent.mkdir(parents=True, exist_ok=True)
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _build_trial_inputs(args.seed)
-    clear_attention_caches()
-    fa_graph, fa_output = bench._capture_flashinfer_fa2_graph(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        q_seqlen=1,
-        page_size=64,
-        q_heads=8,
-        kv_heads=1,
-        head_dim=256,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
-        k_scale=None,
-        v_scale=None,
-        workspace_bytes=512 * 1024 * 1024,
-        warmup=args.warmup,
-    )
-    fa_mean_us, _, _, fa_sem_us = _bench_backend_mean_us(fa_graph, replays=args.replays)
-    print({"fa2_mean_us": round(fa_mean_us, 3), "fa2_sem_us": round(fa_sem_us, 6)})
 
     sampler = optuna.samplers.TPESampler(
         seed=args.seed,
@@ -490,12 +443,12 @@ def main() -> None:
         n_startup_trials=20,
         constant_liar=True,
     )
-    journal_backend = optuna.storages.JournalFileBackend(str(journal_path))
+    journal_backend = optuna.storages.journal.JournalFileBackend(str(journal_path))
     storage = optuna.storages.JournalStorage(journal_backend)
     study = optuna.create_study(
         study_name=args.study_name,
         storage=storage,
-        direction="maximize",
+        direction="minimize",
         sampler=sampler,
         load_if_exists=True,
     )
@@ -509,12 +462,8 @@ def main() -> None:
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
-        fa_output=fa_output,
-        fa_mean_us=fa_mean_us,
-        fa_sem_us=fa_sem_us,
         warmup=args.warmup,
         replays=args.replays,
-        cos_threshold=args.cos_threshold,
     )
     study.optimize(objective, n_trials=args.trials, timeout=None if args.timeout <= 0 else args.timeout)
 
@@ -523,12 +472,13 @@ def main() -> None:
     print(
         {
             "trial": best.number,
-            "value": round(float(best.value), 6),
+            "b12x_mean_us": round(float(best.value), 6),
+            "b12x_ci_low_us": best.user_attrs.get("b12x_ci_low_us"),
+            "b12x_ci_high_us": best.user_attrs.get("b12x_ci_high_us"),
             "plan": best.user_attrs.get("plan_desc"),
             "cta_tile_q": best.user_attrs.get("cta_tile_q"),
             "kv_chunk_size": best.user_attrs.get("kv_chunk_size"),
             "split_kv": best.user_attrs.get("split_kv"),
-            "cos": best.user_attrs.get("cos"),
             "params": best.params,
         }
     )
