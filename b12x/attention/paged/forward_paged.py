@@ -414,72 +414,6 @@ def _dump_flat_u32_words_offset(
 
 
 @cute.jit
-def _issue_paged_kv_tma_copy_4planes_bf16_raw_impl(
-    mDescPtrsFlat: cute.Tensor,
-    kv_head_idx,
-    kv_tma_plane_head_dim,
-    sStageBytes: cute.Tensor,
-    stage_plane_offset,
-    kv_plane_total_bytes,
-    producer_state,
-    mbar_ptr,
-    expected_bytes,
-    mPageTable: cute.Tensor,
-    request_idx,
-    tile_token_base,
-    page_size,
-):
-    page_idx = tile_token_base // page_size
-    page_row_offset = tile_token_base - page_idx * page_size
-    page_id = (
-        Int32(0)
-        if const_expr(os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
-        else mPageTable[request_idx, page_idx]
-    )
-    page_row_base = page_id * page_size + page_row_offset
-    desc_ptr = Int64(mDescPtrsFlat[kv_head_idx])
-    full_mbar_ptr = mbar_ptr + producer_state.index
-    with cute.arch.elect_one():
-        cute.arch.mbarrier_arrive_and_expect_tx(
-            full_mbar_ptr,
-            expected_bytes,
-        )
-        tma_bar_addr = shared_ptr_to_u32(full_mbar_ptr)
-        plane0_dst = shared_ptr_to_u32(sStageBytes.iterator + stage_plane_offset + Int32(0 * kv_plane_total_bytes))
-        plane1_dst = shared_ptr_to_u32(sStageBytes.iterator + stage_plane_offset + Int32(1 * kv_plane_total_bytes))
-        plane2_dst = shared_ptr_to_u32(sStageBytes.iterator + stage_plane_offset + Int32(2 * kv_plane_total_bytes))
-        plane3_dst = shared_ptr_to_u32(sStageBytes.iterator + stage_plane_offset + Int32(3 * kv_plane_total_bytes))
-        _cp_async_bulk_tensor_2d(
-            plane0_dst,
-            desc_ptr,
-            Int32(0),
-            page_row_base,
-            tma_bar_addr,
-        )
-        _cp_async_bulk_tensor_2d(
-            plane1_dst,
-            desc_ptr,
-            Int32(kv_tma_plane_head_dim),
-            page_row_base,
-            tma_bar_addr,
-        )
-        _cp_async_bulk_tensor_2d(
-            plane2_dst,
-            desc_ptr,
-            Int32(2 * kv_tma_plane_head_dim),
-            page_row_base,
-            tma_bar_addr,
-        )
-        _cp_async_bulk_tensor_2d(
-            plane3_dst,
-            desc_ptr,
-            Int32(3 * kv_tma_plane_head_dim),
-            page_row_base,
-            tma_bar_addr,
-        )
-
-
-@cute.jit
 def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
     mQBytes: cute.Tensor,
     q_start,
@@ -4323,11 +4257,10 @@ class PagedFp8DecodeRawForwardKernel:
 
 
 class PagedBf16ExtendRawForwardKernel:
-    def __init__(self, *, split_kv: bool, long_context_pipeline: bool = False):
+    def __init__(self, *, split_kv: bool):
         self.split_kv = split_kv
-        self.long_context_pipeline = long_context_pipeline
         self.cta_tile_q = 64
-        self.stage_tile_rows = 32 if long_context_pipeline else 64
+        self.stage_tile_rows = 32
         self.compute_tile_rows = 16
         self.num_mma_q = 1
         self.num_mma_kv = 1
@@ -4343,7 +4276,7 @@ class PagedBf16ExtendRawForwardKernel:
         self.o_dtype = cutlass.BFloat16
         self.kv_storage_dtype = cutlass.BFloat16
         self.use_paged_kv_tma = True
-        self.num_stages = 2 if long_context_pipeline else 1
+        self.num_stages = 2
         self.kv_tma_plane_head_dim = 64
         self.kv_tma_plane_count = 4
         self.q_bytes = self.cta_tile_q * self.head_dim_qk * 2
@@ -4372,38 +4305,6 @@ class PagedBf16ExtendRawForwardKernel:
             ],
         }
         return cute.struct(SharedStorage)
-
-    @cute.jit
-    def _issue_paged_kv_tma_copy_4planes_bf16_raw(
-        self,
-        mDescPtrsFlat: cute.Tensor,
-        kv_head_idx,
-        sStageBytes: cute.Tensor,
-        stage_plane_offset,
-        kv_plane_total_bytes,
-        producer_state,
-        mbar_ptr,
-        expected_bytes,
-        mPageTable: cute.Tensor,
-        request_idx,
-        tile_token_base,
-        page_size,
-    ):
-        _issue_paged_kv_tma_copy_4planes_bf16_raw_impl(
-            mDescPtrsFlat,
-            kv_head_idx,
-            Int32(self.kv_tma_plane_head_dim),
-            sStageBytes,
-            stage_plane_offset,
-            kv_plane_total_bytes,
-            producer_state,
-            mbar_ptr,
-            expected_bytes,
-            mPageTable,
-            request_idx,
-            tile_token_base,
-            page_size,
-        )
 
     @cute.jit
     def __call__(
@@ -4740,6 +4641,7 @@ class PagedBf16ExtendRawForwardKernel:
             )
             producer_state.advance()
         cute.arch.sync_threads()
+
         prefetch_base = tile_base + Int32(self.stage_tile_rows)
 
         while tile_base < chunk_end:
@@ -4753,7 +4655,7 @@ class PagedBf16ExtendRawForwardKernel:
                 cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state.index, phase=consumer_state.phase)
                 cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
             cute.arch.sync_threads()
-            if const_expr(self.num_stages > 1) and prefetch_base < chunk_end and warp_q_idx == Int32(0):
+            if prefetch_base < chunk_end and warp_q_idx == Int32(0):
                 _issue_paged_kv_tma_copy_4planes_tma_manual(
                     load_K_tma0,
                     load_K_tma1,
@@ -4975,36 +4877,6 @@ class PagedBf16ExtendRawForwardKernel:
 
             consumer_state.advance()
             tile_base += Int32(self.stage_tile_rows)
-            if const_expr(self.num_stages == 1) and tile_base < chunk_end and warp_q_idx == Int32(0):
-                _issue_paged_kv_tma_copy_4planes_tma_manual(
-                    load_K_tma0,
-                    load_K_tma1,
-                    load_K_tma2,
-                    load_K_tma3,
-                    producer_state,
-                    mbar_ptr_K,
-                    self.kv_tma_copy_bytes_k,
-                    mPageTable,
-                    request_idx,
-                    prefetch_base,
-                    Int32(self.page_size),
-                    Int32(self.stage_tile_rows),
-                )
-                _issue_paged_kv_tma_copy_4planes_tma_manual(
-                    load_V_tma0,
-                    load_V_tma1,
-                    load_V_tma2,
-                    load_V_tma3,
-                    producer_state,
-                    mbar_ptr_V,
-                    self.kv_tma_copy_bytes_v,
-                    mPageTable,
-                    request_idx,
-                    prefetch_base,
-                    Int32(self.page_size),
-                    Int32(self.stage_tile_rows),
-                )
-                producer_state.advance()
             prefetch_base += Int32(self.stage_tile_rows)
             cute.arch.sync_threads()
 
