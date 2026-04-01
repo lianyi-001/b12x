@@ -43,8 +43,6 @@ import functools
 import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
-from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfa
-from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfb
 
 from b12x.cute.utils import (
     current_cuda_stream,
@@ -53,6 +51,8 @@ from b12x.cute.utils import (
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
+    sm120_make_smem_layout_sfa,
+    sm120_make_smem_layout_sfb,
 )
 
 

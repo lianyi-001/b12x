@@ -85,6 +85,20 @@ class PagedAttentionWorkspace:
     _compiled_forward_kernel: object | None = None
     _compiled_key: tuple | None = None
 
+    @staticmethod
+    def eager_extend_work_items_capacity(
+        *,
+        max_total_q: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+    ) -> int:
+        if max_total_q <= 0:
+            raise ValueError("max_total_q must be positive")
+        if num_q_heads <= 0 or num_kv_heads <= 0:
+            raise ValueError("head counts must be positive")
+        gqa_group_size = num_q_heads // num_kv_heads
+        return max((int(max_total_q) * int(gqa_group_size) + 15) // 16, 1)
+
     @classmethod
     def for_contract(
         cls,
@@ -194,6 +208,49 @@ class PagedAttentionWorkspace:
             partial_rows_capacity=int(max_partial_rows),
         )
         return workspace
+
+    @classmethod
+    def for_eager_extend_capacity(
+        cls,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        page_size: int,
+        max_total_q: int,
+        max_batch: int,
+        max_page_table_width: int,
+        num_cache_pages: int,
+        use_cuda_graph: bool = False,
+        attn_mode: Literal["default", "turbo"] | None = None,
+    ) -> PagedAttentionWorkspace:
+        return cls.for_fixed_capacity(
+            mode="extend",
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            max_total_q=max_total_q,
+            max_batch=max_batch,
+            max_page_table_width=max_page_table_width,
+            max_work_items=cls.eager_extend_work_items_capacity(
+                max_total_q=max_total_q,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+            ),
+            max_partial_rows=0,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=use_cuda_graph,
+            attn_mode=attn_mode,
+        )
 
     @classmethod
     def for_tensors(
@@ -322,6 +379,58 @@ class PagedAttentionWorkspace:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+
+    def prepare_for_capacity(
+        self,
+        *,
+        batch: int,
+        total_q_capacity: int,
+        max_page_table_width: int,
+        max_cache_seqlen: int,
+    ) -> PagedAttentionWorkspace:
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        if total_q_capacity <= 0:
+            raise ValueError("total_q_capacity must be positive")
+        if max_page_table_width <= 0:
+            raise ValueError("max_page_table_width must be positive")
+        if max_cache_seqlen <= 0:
+            raise ValueError("max_cache_seqlen must be positive")
+
+        max_cache_seqlens = torch.full(
+            (batch,),
+            int(max_cache_seqlen),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        num_cache_pages = int(self._plan_k_cache.shape[0]) if self._plan_k_cache is not None else 0
+        if num_cache_pages <= 0:
+            raise RuntimeError("paged workspace planning contract is not initialized")
+        max_page_ids = torch.arange(max_page_table_width, dtype=torch.int32, device=self.device)
+        max_page_table = (max_page_ids % num_cache_pages).unsqueeze(0).expand(batch, -1).contiguous()
+        max_cu_seqlens_q = self._build_capacity_cu_seqlens_q(
+            batch=batch,
+            total_q_capacity=total_q_capacity,
+        )
+        return self.prepare(max_page_table, max_cache_seqlens, max_cu_seqlens_q)
+
+    def _build_capacity_cu_seqlens_q(
+        self,
+        *,
+        batch: int,
+        total_q_capacity: int,
+    ) -> torch.Tensor:
+        if self.mode == "decode":
+            return torch.arange(0, batch + 1, dtype=torch.int32, device=self.device)
+        if total_q_capacity < batch:
+            raise ValueError(
+                f"extend graph bucket requires total_q_capacity >= batch, got {total_q_capacity} < {batch}"
+            )
+        q_lens = torch.ones(batch, dtype=torch.int32, device=self.device)
+        q_lens[-1] = int(total_q_capacity - (batch - 1))
+        cu_seqlens_q = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(q_lens, dim=0, out=cu_seqlens_q[1:])
+        return cu_seqlens_q
 
     def _ensure_plan_contract(self, active_total_q: int) -> None:
         if self._plan_q is None or self._plan_k_cache is None or self._plan_v_cache is None:

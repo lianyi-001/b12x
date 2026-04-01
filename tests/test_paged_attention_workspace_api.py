@@ -618,6 +618,74 @@ def test_fixed_capacity_extend_workspace_rejects_overflow() -> None:
         workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
 
 
+def test_for_eager_extend_capacity_uses_nosplit_budget() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    workspace = PagedAttentionWorkspace.for_eager_extend_capacity(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        max_total_q=128,
+        max_batch=8,
+        max_page_table_width=64,
+        num_cache_pages=512,
+    )
+
+    assert workspace.fixed_capacity is True
+    assert workspace.tmp_output is None
+    assert workspace.tmp_lse is None
+    assert workspace.request_indices is not None
+    assert int(workspace.request_indices.shape[0]) == PagedAttentionWorkspace.eager_extend_work_items_capacity(
+        max_total_q=128,
+        num_q_heads=8,
+        num_kv_heads=1,
+    )
+    assert workspace.planner_budget is not None
+    assert workspace.planner_budget.max_partial_rows == 0
+
+
+def test_prepare_for_capacity_primes_extend_graph_bucket() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, _page_table, _cache_seqlens, _cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4, 4, 4, 4],
+        cache_seqlens=[2048, 2048, 2048, 2048],
+        page_size=64,
+        seed=97,
+        page_table_width=64,
+        num_pages=512,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=q.device),
+        use_cuda_graph=True,
+    )
+
+    workspace.prepare_for_capacity(
+        batch=4,
+        total_q_capacity=16,
+        max_page_table_width=64,
+        max_cache_seqlen=4096,
+    )
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.split_kv is False
+    assert workspace.plan.total_q == 16
+    assert workspace.page_table is not None
+    assert tuple(workspace.page_table.shape) == (4, 64)
+    assert workspace.cache_seqlens is not None
+    assert int(workspace.cache_seqlens[0].item()) == 4096
+
+
 def test_workspace_mode_validation_rejects_mismatched_prepare() -> None:
     require_sm120()
     clear_attention_caches()
