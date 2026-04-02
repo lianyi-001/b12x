@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import inspect
 import os
+import sys
 from functools import lru_cache
 from functools import wraps
 from pathlib import Path
@@ -73,6 +75,61 @@ def _tree_fingerprint(root: Path) -> str:
 
 def _b12x_package_fingerprint() -> str:
     return _tree_fingerprint(_B12X_PACKAGE_ROOT)
+
+
+def _distribution_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
+@lru_cache(maxsize=1)
+def _runtime_toolchain_key() -> tuple[object, ...]:
+    torch_version = _distribution_version("torch")
+    torch_cuda_version = ""
+    try:
+        import torch
+
+        if not torch_version:
+            torch_version = getattr(torch, "__version__", "")
+        torch_cuda_version = getattr(torch.version, "cuda", "") or ""
+    except Exception:
+        pass
+
+    cutlass_version = _distribution_version("nvidia-cutlass-dsl")
+    if not cutlass_version:
+        cutlass_version = _distribution_version("cutlass")
+    if not cutlass_version:
+        try:
+            import cutlass
+
+            cutlass_version = getattr(cutlass, "__version__", "")
+        except Exception:
+            cutlass_version = ""
+
+    return (
+        ("python", sys.implementation.name, sys.version_info[:3]),
+        ("torch", torch_version),
+        ("torch_cuda", torch_cuda_version),
+        ("cutlass_dsl", cutlass_version),
+        ("cuda_bindings", _distribution_version("cuda-bindings")),
+    )
+
+
+def _compile_environment_key() -> tuple[tuple[str, str], ...]:
+    compile_env_vars = (
+        "CC",
+        "CXX",
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "CUDA_TOOLKIT_PATH",
+        "CUDACXX",
+        "CUTE_DSL_ARCH",
+        "NVCC_APPEND_FLAGS",
+        "NVCC_PREPEND_FLAGS",
+    )
+    return tuple((name, os.environ.get(name, "")) for name in compile_env_vars)
 
 
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
@@ -254,14 +311,14 @@ def _build_compile_disk_cache_key(
     kwargs: dict[str, Any],
 ) -> str:
     payload = (
-        "b12x_cute_compile_cache_v1",
+        "b12x_cute_compile_cache_v2",
         _normalize_compile_target(func, set()),
         _b12x_package_fingerprint(),
+        _runtime_toolchain_key(),
         _structural_cache_key(args),
         _structural_cache_key(kwargs),
         _compile_options_cache_key(compile_callable),
-        os.environ.get("CUTE_DSL_ARCH", ""),
-        os.environ.get("CUDA_TOOLKIT_PATH", ""),
+        _compile_environment_key(),
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 

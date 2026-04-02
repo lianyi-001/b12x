@@ -16,6 +16,7 @@ from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_nu
 from b12x.integration.triton_compact import compact_topk_ids as triton_compact_topk_ids
 from b12x.integration.triton_route import route_topk as triton_route_topk
 from b12x.moe.fused import MoEDynamicKernel, MoEMicroKernel, MoEStaticKernel
+from b12x.moe.tuning import lookup_max_active_clusters
 
 _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
@@ -181,9 +182,9 @@ _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 _PLAIN_PARAM_CACHE: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int], torch.Tensor] = {}
-_MICRO_CUTOVER_TOKENS_DEFAULT = 2
-_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = _LEVEL_TILE_M
-_MICRO_CUTOVER_TOKENS_CACHE: int | None = None
+_MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
+_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
+_MICRO_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
@@ -197,12 +198,22 @@ def clear_tp_moe_caches() -> None:
     Explicit workspaces and workspace pools are caller-owned and intentionally
     unaffected by this helper.
     """
-    global _LAST_WEIGHTS, _LAST_KERNEL
+    global _LAST_WEIGHTS
+    global _LAST_KERNEL
+    global _MICRO_COMPACT_CUTOVER_PAIRS_CACHE
+    global _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
+    global _DYNAMIC_MULTICTA_CACHE
+    global _DYNAMIC_CHUNK_MULTIPLIER_CACHE
     _WEIGHT_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
+    _MAC_CACHE.clear()
     _PLAIN_PARAM_CACHE.clear()
+    _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = None
+    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = None
+    _DYNAMIC_MULTICTA_CACHE = None
+    _DYNAMIC_CHUNK_MULTIPLIER_CACHE = None
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
 
@@ -240,15 +251,18 @@ def _get_static_compact_cutover_pairs() -> int:
     return _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
 
 
-def _get_micro_cutover_tokens() -> int:
-    global _MICRO_CUTOVER_TOKENS_CACHE
-    if _MICRO_CUTOVER_TOKENS_CACHE is None:
-        cutover = os.environ.get("B12X_MICRO_CUTOVER_TOKENS")
+def _get_micro_compact_cutover_pairs() -> int:
+    global _MICRO_COMPACT_CUTOVER_PAIRS_CACHE
+    if _MICRO_COMPACT_CUTOVER_PAIRS_CACHE is None:
+        cutover = _first_env(
+            "B12X_MICRO_COMPACT_CUTOVER_PAIRS",
+            "B12X_MICRO_CUTOVER_TOKENS",
+        )
         if cutover is None:
-            _MICRO_CUTOVER_TOKENS_CACHE = _MICRO_CUTOVER_TOKENS_DEFAULT
+            _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT
         else:
-            _MICRO_CUTOVER_TOKENS_CACHE = max(0, int(cutover))
-    return _MICRO_CUTOVER_TOKENS_CACHE
+            _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = max(0, int(cutover))
+    return _MICRO_COMPACT_CUTOVER_PAIRS_CACHE
 
 
 def _dynamic_multicta_enabled() -> bool:
@@ -441,7 +455,7 @@ def select_tp_moe_backend(
 ) -> str:
     """Pick the fused MoE backend from the intrinsic routed workload shape."""
     routed_rows = num_tokens * num_topk
-    if routed_rows < _get_static_compact_cutover_pairs():
+    if routed_rows <= _get_static_compact_cutover_pairs():
         return "static"
     return "dynamic"
 
@@ -1032,13 +1046,10 @@ def _get_kernel_cache(impl: str) -> Dict[Tuple, Tuple]:
     raise ValueError(f"unsupported implementation {impl!r}")
 
 
-def _get_impl_mac(impl: str) -> int:
+def _get_impl_mac(impl: str, *, routed_rows: int | None = None) -> int:
     dev_idx = torch.cuda.current_device()
     key = (dev_idx, impl)
     mac = _MAC_CACHE.get(key)
-    if mac is not None:
-        return mac
-
     sm_count = get_num_sm(torch.device("cuda"))
     mac_limit = min(get_max_active_clusters(1), sm_count)
     override_name = f"B12X_{impl.upper()}_MAX_ACTIVE_CLUSTERS"
@@ -1046,11 +1057,22 @@ def _get_impl_mac(impl: str) -> int:
         mac_override = _first_env(override_name, "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS")
     else:
         mac_override = _first_env(override_name)
+    if mac is None:
+        if mac_override is not None:
+            mac = max(1, min(int(mac_override), mac_limit))
+        else:
+            mac = mac_limit
+        _MAC_CACHE[key] = mac
     if mac_override is not None:
-        mac = max(1, min(int(mac_override), mac_limit))
-    else:
-        mac = mac_limit
-    _MAC_CACHE[key] = mac
+        return mac
+    if routed_rows is not None:
+        tuned_mac = lookup_max_active_clusters(
+            regime="decode",
+            backend=impl,
+            routed_rows=int(routed_rows),
+        )
+        if tuned_mac is not None:
+            return max(1, min(int(tuned_mac), mac_limit))
     return mac
 
 
@@ -1207,7 +1229,7 @@ def _get_micro_kernel(
     mac_override: int | None = None,
 ):
     sf_vec_size = 16
-    mac = mac_override if mac_override is not None else _get_impl_mac("static")
+    mac = mac_override if mac_override is not None else _get_impl_mac("micro")
 
     global _LAST_KERNEL
     cache_key = (
@@ -1604,7 +1626,7 @@ def _launch_dynamic(
     fast_math: bool,
     stream,
 ) -> None:
-    effective_mac = _get_impl_mac("dynamic")
+    effective_mac = _get_impl_mac("dynamic", routed_rows=routed_rows)
     if not _dynamic_multicta_enabled():
         effective_mac = 1
     compiled, mac = _get_dynamic_kernel(
@@ -1671,19 +1693,19 @@ def _launch_compact_static(
     fast_math: bool,
     stream,
 ) -> None:
-    use_micro = m <= _get_micro_cutover_tokens()
-    static_mac = None
+    use_micro = routed_rows <= _get_micro_compact_cutover_pairs()
+    static_mac = _get_impl_mac("static", routed_rows=routed_rows)
     if not use_micro and routed_rows < 40:
         # Tiny compact launches have very little FC2 tile work, so capping
         # resident clusters avoids idle CTA participation in the barrier phases.
-        static_mac = min(_get_impl_mac("static"), 64)
+        static_mac = min(static_mac, 64)
     if use_micro:
         # Micro work can cover at most one m-tile per routed pair and one
         # FC2 output tile per N tile. Launching more persistent CTAs than that
         # upper bound only creates idle clusters that sit through the grid
         # barriers without owning useful work.
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
-        micro_mac = min(_get_impl_mac("static"), micro_work_tiles)
+        micro_mac = min(_get_impl_mac("micro", routed_rows=routed_rows), micro_work_tiles)
         compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
         triton_compact_topk_ids(
             flat_ids,

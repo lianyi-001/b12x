@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.dsl import BaseDSL
 
+import b12x.cute.runtime_patches as runtime_patches
 from b12x.cute.runtime_patches import _build_compile_disk_cache_key
 from b12x.cute.utils import make_ptr
 
@@ -56,3 +57,57 @@ def test_compile_disk_cache_key_ignores_pointer_address_and_stream_value() -> No
     )
 
     assert key_a == key_b
+
+
+def test_compile_disk_cache_key_changes_with_compile_env(monkeypatch) -> None:
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    compile_callable = cute.compile
+
+    monkeypatch.delenv("NVCC_PREPEND_FLAGS", raising=False)
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_compile_disk_cache_key_changes_with_compile_env,
+        (fake, 0),
+        {},
+    )
+
+    monkeypatch.setenv("NVCC_PREPEND_FLAGS", "--use_fast_math")
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_compile_disk_cache_key_changes_with_compile_env,
+        (fake, 0),
+        {},
+    )
+
+    assert key_a != key_b
+
+
+def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
+    fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (4, 8), assumed_align=4)
+    compile_callable = cute.compile
+
+    monkeypatch.setattr(
+        runtime_patches,
+        "_runtime_toolchain_key",
+        lambda: (("cutlass_dsl", "4.4.1"),),
+    )
+    key_a = _build_compile_disk_cache_key(
+        compile_callable,
+        test_compile_disk_cache_key_changes_with_toolchain_key,
+        (fake, 0),
+        {},
+    )
+
+    monkeypatch.setattr(
+        runtime_patches,
+        "_runtime_toolchain_key",
+        lambda: (("cutlass_dsl", "4.4.2"),),
+    )
+    key_b = _build_compile_disk_cache_key(
+        compile_callable,
+        test_compile_disk_cache_key_changes_with_toolchain_key,
+        (fake, 0),
+        {},
+    )
+
+    assert key_a != key_b

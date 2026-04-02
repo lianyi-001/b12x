@@ -59,6 +59,18 @@ class CtaContext:
     replay_cu_seqlens_q_cpu: torch.Tensor
 
 
+@dataclass(frozen=True)
+class SharedDecodeInputs:
+    q: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    k_descale: torch.Tensor | None
+    v_descale: torch.Tensor | None
+    replay_page_table_cpu: torch.Tensor
+    replay_cache_seqlens_cpu: torch.Tensor
+    replay_cu_seqlens_q_cpu: torch.Tensor
+
+
 @dataclass
 class ChunkCandidateState:
     fixed_split_pages: int
@@ -187,6 +199,23 @@ def _progressive_sample_page_counts(
     return sorted(set(pages))
 
 
+def _uniform_sample_page_counts(
+    *,
+    page_start: int,
+    page_stop: int,
+    stride: int,
+) -> list[int]:
+    if stride <= 0:
+        return sorted({int(page_start), int(page_stop)})
+    pages = {int(page_start), int(page_stop)}
+    first_multiple = int(math.ceil(float(page_start) / float(stride)) * int(stride))
+    page = max(int(stride), first_multiple)
+    while page <= int(page_stop):
+        pages.add(int(page))
+        page += int(stride)
+    return sorted(pages)
+
+
 def _capacity_probe_page_counts(
     *,
     page_start: int,
@@ -226,10 +255,36 @@ def _page_cta_result(page_payload: dict[str, object], graph_ctas_per_sm: int) ->
     )
 
 
+def _page_cta_tied_winner_splits(page_payload: dict[str, object], graph_ctas_per_sm: int) -> list[int]:
+    result = _page_cta_result(page_payload, graph_ctas_per_sm)
+    tied = result.get("tied_chunk_winners")
+    if not isinstance(tied, list):
+        return []
+    return sorted({int(summary["fixed_split_pages"]) for summary in tied})
+
+
+def _page_cta_preferred_split(page_payload: dict[str, object], graph_ctas_per_sm: int) -> int | None:
+    result = _page_cta_result(page_payload, graph_ctas_per_sm)
+    preferred = result.get("preferred_chunk_winner")
+    if not isinstance(preferred, dict):
+        return None
+    value = preferred.get("fixed_split_pages")
+    return None if value is None else int(value)
+
+
 def _page_cta_best_chunk_mean_us(page_payload: dict[str, object], graph_ctas_per_sm: int) -> float | None:
     result = _page_cta_result(page_payload, graph_ctas_per_sm)
     value = result["best_chunk_mean_us"]
     return None if value is None else float(value)
+
+
+def _format_split_window(page_payload: dict[str, object]) -> str | None:
+    searched = [int(value) for value in page_payload.get("searched_fixed_split_pages", [])]
+    if not searched:
+        return None
+    if len(searched) == 1:
+        return f"{searched[0]}"
+    return f"{searched[0]}..{searched[-1]} n={len(searched)}"
 
 
 def _relative_gap(best_value: float | None, other_value: float | None) -> float | None:
@@ -385,6 +440,11 @@ def _render_output_payload(
             "cta_max_refinement_rounds": int(args.cta_max_refinement_rounds),
             "cta_survivor_threshold": float(args.cta_survivor_threshold),
             "cta_max_survivors": int(args.cta_max_survivors),
+            "chunk_fill_windowed": bool(args.chunk_fill_windowed),
+            "chunk_fill_window_probe_stride": int(args.chunk_fill_window_probe_stride),
+            "chunk_fill_window_sample_divisor": int(args.chunk_fill_window_sample_divisor),
+            "chunk_fill_window_relative_pad": float(args.chunk_fill_window_relative_pad),
+            "chunk_fill_window_absolute_pad": int(args.chunk_fill_window_absolute_pad),
         },
         "batches": batch_payloads,
     }
@@ -485,48 +545,173 @@ def _collapsed_smallest_chunk_ladder(
     return collapsed
 
 
+def _split_window_padding(*, value: int, relative_pad: float, absolute_pad: int) -> int:
+    return max(int(absolute_pad), int(math.ceil(float(value) * float(relative_pad))))
+
+
+def _split_window_without_padding(
+    *,
+    candidate_splits: list[int],
+    winners: list[int],
+) -> list[int]:
+    if not winners:
+        return [int(value) for value in candidate_splits]
+    lo = min(int(value) for value in winners)
+    hi = max(int(value) for value in winners)
+    window = [
+        int(value)
+        for value in candidate_splits
+        if int(lo) <= int(value) <= int(hi)
+    ]
+    return window if window else [int(value) for value in candidate_splits]
+
+
+def _split_window_from_winners(
+    *,
+    candidate_splits: list[int],
+    winners: list[int],
+    relative_pad: float,
+    absolute_pad: int,
+) -> list[int]:
+    if not winners:
+        return [int(value) for value in candidate_splits]
+    lo = min(int(value) for value in winners)
+    hi = max(int(value) for value in winners)
+    lower_bound = lo - _split_window_padding(
+        value=lo,
+        relative_pad=relative_pad,
+        absolute_pad=absolute_pad,
+    )
+    upper_bound = hi + _split_window_padding(
+        value=hi,
+        relative_pad=relative_pad,
+        absolute_pad=absolute_pad,
+    )
+    window = [
+        int(value)
+        for value in candidate_splits
+        if int(lower_bound) <= int(value) <= int(upper_bound)
+    ]
+    return window if window else [int(value) for value in candidate_splits]
+
+
+def _split_window_from_bounds(
+    *,
+    candidate_splits: list[int],
+    lower_bound: int,
+    upper_bound: int,
+    relative_pad: float,
+    absolute_pad: int,
+) -> list[int]:
+    lo = int(min(lower_bound, upper_bound))
+    hi = int(max(lower_bound, upper_bound))
+    return _split_window_from_winners(
+        candidate_splits=candidate_splits,
+        winners=[lo, hi],
+        relative_pad=relative_pad,
+        absolute_pad=absolute_pad,
+    )
+
+
+def _anchor_winner_window_for_page(
+    *,
+    page_count: int,
+    anchor_pages: list[int],
+    pages_by_page: dict[int, dict[str, object]],
+    graph_ctas_per_sm: int,
+    candidate_splits: list[int],
+    relative_pad: float,
+    absolute_pad: int,
+) -> list[int]:
+    if not anchor_pages:
+        return [int(value) for value in candidate_splits]
+    right_index = next(
+        (idx for idx, anchor_page in enumerate(anchor_pages) if int(anchor_page) >= int(page_count)),
+        len(anchor_pages) - 1,
+    )
+    left_index = max(0, right_index - 1)
+    if int(anchor_pages[right_index]) < int(page_count):
+        left_index = right_index
+    winners: set[int] = set()
+    for anchor_page in {int(anchor_pages[left_index]), int(anchor_pages[right_index])}:
+        preferred = _page_cta_preferred_split(pages_by_page[anchor_page], graph_ctas_per_sm)
+        if preferred is not None:
+            winners.add(int(preferred))
+            continue
+        winners.update(_page_cta_tied_winner_splits(pages_by_page[anchor_page], graph_ctas_per_sm))
+    return _split_window_without_padding(
+        candidate_splits=candidate_splits,
+        winners=sorted(winners),
+    )
+
+
+def _page_hits_split_window_edge(
+    *,
+    page_payload: dict[str, object],
+    graph_ctas_per_sm: int,
+    candidate_window: list[int],
+    full_candidate_splits: list[int],
+) -> bool:
+    if not candidate_window or candidate_window == full_candidate_splits:
+        return False
+    winners = _page_cta_tied_winner_splits(page_payload, graph_ctas_per_sm)
+    if not winners:
+        return False
+    return min(winners) <= int(candidate_window[0]) or max(winners) >= int(candidate_window[-1])
+
+
+def _expanded_split_window(
+    *,
+    candidate_splits: list[int],
+    current_window: list[int],
+    winners: list[int],
+    relative_pad: float,
+    absolute_pad: int,
+) -> list[int]:
+    if not winners:
+        return [int(value) for value in candidate_splits]
+    lower_ref = int(current_window[0]) if min(winners) <= int(current_window[0]) else min(winners)
+    upper_ref = int(current_window[-1]) if max(winners) >= int(current_window[-1]) else max(winners)
+    lower_bound = lower_ref - _split_window_padding(
+        value=lower_ref,
+        relative_pad=relative_pad,
+        absolute_pad=absolute_pad,
+    )
+    upper_bound = upper_ref + _split_window_padding(
+        value=upper_ref,
+        relative_pad=relative_pad,
+        absolute_pad=absolute_pad,
+    )
+    expanded = [
+        int(value)
+        for value in candidate_splits
+        if int(lower_bound) <= int(value) <= int(upper_bound)
+    ]
+    if not expanded:
+        return [int(value) for value in candidate_splits]
+    return expanded
+
+
+def _union_split_windows(*windows: list[int]) -> list[int]:
+    return sorted({int(value) for window in windows for value in window})
+
+
 def _capture_cta_context(
     *,
     args: argparse.Namespace,
     graph_ctas_per_sm: int,
     candidate_splits: list[int],
     capacity_probe_page_counts: list[int],
+    shared_inputs: SharedDecodeInputs,
 ) -> CtaContext:
     _log_summary(
         f"# ctas={graph_ctas_per_sm} capture start capture_page_count={args.capture_page_count}"
     )
-    cache_seqlen = args.capture_page_count * args.page_size
-    (
-        q,
-        k_cache,
-        v_cache,
-        replay_page_table,
-        replay_cache_seqlens,
-        _capture_page_table,
-        _capture_cache_seqlens,
-        cu_seqlens_q,
-    ) = _make_uniform_paged_inputs(
-        batch=args.batch,
-        q_seqlen=1,
-        cache_seqlen=cache_seqlen,
-        capture_cache_seqlen=None,
-        page_size=args.page_size,
-        q_heads=args.q_heads,
-        kv_heads=args.kv_heads,
-        head_dim=args.head_dim,
-        dtype=torch.bfloat16,
-        seed=1000 + args.batch * 17 + graph_ctas_per_sm,
-    )
-    kv_dtype = _resolve_kv_dtype(args.kv_dtype, torch.bfloat16)
-    k_descale = None
-    v_descale = None
-    if kv_dtype == torch.float8_e4m3fn:
-        k_cache, v_cache, k_descale, v_descale, _, _ = _quantize_paged_kv_cache_global_e4m3(
-            k_cache,
-            v_cache,
-            batch=args.batch,
-            kv_heads=args.kv_heads,
-        )
+    q = shared_inputs.q
+    k_cache = shared_inputs.k_cache
+    v_cache = shared_inputs.v_cache
+    k_descale = shared_inputs.k_descale
+    v_descale = shared_inputs.v_descale
 
     workspace = PagedAttentionWorkspace.for_tensors(
         mode="decode",
@@ -539,15 +724,15 @@ def _capture_cta_context(
     assert workspace._plan_q is not None
     assert workspace._plan_k_cache is not None
     assert workspace._plan_v_cache is not None
-    replay_page_table_cpu = replay_page_table.detach().cpu().to(torch.int32).contiguous()
-    replay_cache_seqlens_cpu = replay_cache_seqlens.detach().cpu().to(torch.int32).contiguous()
-    replay_cu_seqlens_q_cpu = cu_seqlens_q.detach().cpu().to(torch.int32).contiguous()
+    replay_page_table_cpu = shared_inputs.replay_page_table_cpu
+    replay_cache_seqlens_cpu = shared_inputs.replay_cache_seqlens_cpu
+    replay_cu_seqlens_q_cpu = shared_inputs.replay_cu_seqlens_q_cpu
     active_total_q = int(replay_cu_seqlens_q_cpu[-1].item())
     batch = int(args.batch)
     max_pages_per_request = int(replay_page_table_cpu.shape[1])
-    plan_page_table = replay_page_table.detach().clone().to(torch.int32).contiguous()
-    plan_cache_seqlens = replay_cache_seqlens.detach().clone().to(torch.int32).contiguous()
-    plan_cu_seqlens_q = cu_seqlens_q.detach().clone().to(torch.int32).contiguous()
+    plan_page_table = replay_page_table_cpu.to(device=q.device, dtype=torch.int32).contiguous()
+    plan_cache_seqlens = replay_cache_seqlens_cpu.to(device=q.device, dtype=torch.int32).contiguous()
+    plan_cu_seqlens_q = replay_cu_seqlens_q_cpu.to(device=q.device, dtype=torch.int32).contiguous()
 
     def graph_plan_for(runtime_cache_seqlen: int, fixed_split_pages: int):
         plan_cache_seqlens.fill_(int(runtime_cache_seqlen))
@@ -630,6 +815,54 @@ def _capture_cta_context(
         replay_page_table_cpu=replay_page_table_cpu,
         replay_cache_seqlens_cpu=replay_cache_seqlens_cpu,
         replay_cu_seqlens_q_cpu=replay_cu_seqlens_q_cpu,
+    )
+
+
+def _build_shared_decode_inputs(
+    *,
+    args: argparse.Namespace,
+) -> SharedDecodeInputs:
+    cache_seqlen = int(args.capture_page_count * args.page_size)
+    (
+        q,
+        k_cache,
+        v_cache,
+        replay_page_table,
+        replay_cache_seqlens,
+        _capture_page_table,
+        _capture_cache_seqlens,
+        cu_seqlens_q,
+    ) = _make_uniform_paged_inputs(
+        batch=args.batch,
+        q_seqlen=1,
+        cache_seqlen=cache_seqlen,
+        capture_cache_seqlen=None,
+        page_size=args.page_size,
+        q_heads=args.q_heads,
+        kv_heads=args.kv_heads,
+        head_dim=args.head_dim,
+        dtype=torch.bfloat16,
+        seed=1000 + args.batch * 17,
+    )
+    kv_dtype = _resolve_kv_dtype(args.kv_dtype, torch.bfloat16)
+    k_descale = None
+    v_descale = None
+    if kv_dtype == torch.float8_e4m3fn:
+        k_cache, v_cache, k_descale, v_descale, _, _ = _quantize_paged_kv_cache_global_e4m3(
+            k_cache,
+            v_cache,
+            batch=args.batch,
+            kv_heads=args.kv_heads,
+        )
+    return SharedDecodeInputs(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        replay_page_table_cpu=replay_page_table.detach().cpu().to(torch.int32).contiguous(),
+        replay_cache_seqlens_cpu=replay_cache_seqlens.detach().cpu().to(torch.int32).contiguous(),
+        replay_cu_seqlens_q_cpu=cu_seqlens_q.detach().cpu().to(torch.int32).contiguous(),
     )
 
 
@@ -946,6 +1179,7 @@ def _measure_single_page_payload(
     return {
         "page_count": int(page_count),
         "cache_seqlen": int(page_count * args.page_size),
+        "searched_fixed_split_pages": [int(value) for value in candidate_splits],
         "cta_results": cta_results,
     }
 
@@ -957,6 +1191,7 @@ def _measure_pages_payload(
     candidate_splits: list[int],
     page_counts: list[int],
     capacity_probe_page_counts: list[int],
+    page_candidate_splits: dict[int, list[int]] | None = None,
     on_page_result: callable | None = None,
 ) -> tuple[dict[int, CtaContext], dict[int, str], list[dict[str, object]]]:
     contexts: dict[int, CtaContext] = {}
@@ -976,17 +1211,24 @@ def _measure_pages_payload(
             raise
     pages_payload: list[dict[str, object]] = []
     for page_count in page_counts:
+        effective_candidate_splits = (
+            [int(value) for value in candidate_splits]
+            if page_candidate_splits is None
+            else [int(value) for value in page_candidate_splits.get(int(page_count), candidate_splits)]
+        )
         page_payload = _measure_single_page_payload(
             page_count=page_count,
             args=args,
             candidate_ctas_per_sm=candidate_ctas_per_sm,
-            candidate_splits=candidate_splits,
+            candidate_splits=effective_candidate_splits,
             contexts=contexts,
             capture_errors=capture_errors,
         )
         pages_payload.append(page_payload)
         if on_page_result is not None:
             on_page_result(page_payload)
+        split_window = _format_split_window(page_payload)
+        split_window_suffix = "" if split_window is None else f" split_window={split_window}"
         _log_summary(
             f"# page={page_count} cta_pref_chunks="
             + ",".join(
@@ -994,6 +1236,7 @@ def _measure_pages_payload(
                 f"{result['preferred_chunk_winner']['fixed_split_pages'] if result['preferred_chunk_winner'] is not None else 'NA'}"
                 for result in page_payload["cta_results"]
             )
+            + split_window_suffix
         )
     return contexts, capture_errors, pages_payload
 
@@ -1120,6 +1363,7 @@ def _single_cta_page_payload(
     return {
         "page_count": int(page_payload["page_count"]),
         "cache_seqlen": int(page_payload["cache_seqlen"]),
+        "searched_fixed_split_pages": [int(value) for value in page_payload.get("searched_fixed_split_pages", [])],
         "cta_results": [_page_cta_result(page_payload, graph_ctas_per_sm)],
     }
 
@@ -1183,7 +1427,9 @@ def _summarize_page_completion(*, page: dict[str, object], phase: str) -> None:
         f"{result['preferred_chunk_winner']['fixed_split_pages'] if result['preferred_chunk_winner'] is not None else 'NA'}"
         for result in page["cta_results"]
     )
-    _log_summary(f"# phase={phase} page={page['page_count']} cta_pref_chunks={cta_pref}")
+    split_window = _format_split_window(page)
+    split_window_suffix = "" if split_window is None else f" split_window={split_window}"
+    _log_summary(f"# phase={phase} page={page['page_count']} cta_pref_chunks={cta_pref}{split_window_suffix}")
 
 
 def _reset_worker_cache(*, clear_capacity_probe_override: bool = True) -> None:
@@ -1220,6 +1466,7 @@ def _build_worker_cache(
     global _WORKER_CACHE_KEY, _WORKER_CONTEXTS, _WORKER_CAPTURE_ERRORS
     contexts: dict[int, CtaContext] = {}
     capture_errors: dict[int, str] = {}
+    shared_inputs = _build_shared_decode_inputs(args=args)
     for graph_ctas_per_sm in cache_candidate_ctas_per_sm:
         try:
             contexts[graph_ctas_per_sm] = _capture_cta_context(
@@ -1227,6 +1474,7 @@ def _build_worker_cache(
                 graph_ctas_per_sm=graph_ctas_per_sm,
                 candidate_splits=candidate_splits,
                 capacity_probe_page_counts=capacity_probe_page_counts,
+                shared_inputs=shared_inputs,
             )
         except Exception as exc:
             if _is_graph_budget_infeasible(exc) or "no feasible capture split" in str(exc):
@@ -1249,6 +1497,7 @@ def _worker_measure_page(task: dict[str, object]) -> dict[str, object]:
     candidate_ctas_per_sm = [int(value) for value in task["candidate_ctas_per_sm"]]
     cache_candidate_ctas_per_sm = [int(value) for value in task["cache_candidate_ctas_per_sm"]]
     candidate_splits = [int(value) for value in task["candidate_splits"]]
+    cache_candidate_splits = [int(value) for value in task.get("cache_candidate_splits", task["candidate_splits"])]
     page_count = int(task["page_count"])
     requested_capacity_probe_page_counts = [int(value) for value in task["capacity_probe_page_counts"]]
     effective_capacity_probe_page_counts = sorted(
@@ -1260,7 +1509,7 @@ def _worker_measure_page(task: dict[str, object]) -> dict[str, object]:
     cache_key = _worker_cache_key(
         args=args,
         candidate_ctas_per_sm=cache_candidate_ctas_per_sm,
-        candidate_splits=candidate_splits,
+        candidate_splits=cache_candidate_splits,
         capacity_probe_page_counts=effective_capacity_probe_page_counts,
     )
     if cache_key != _WORKER_CACHE_KEY or _WORKER_CONTEXTS is None or _WORKER_CAPTURE_ERRORS is None:
@@ -1269,7 +1518,7 @@ def _worker_measure_page(task: dict[str, object]) -> dict[str, object]:
         _build_worker_cache(
             args=args,
             cache_candidate_ctas_per_sm=cache_candidate_ctas_per_sm,
-            candidate_splits=candidate_splits,
+            candidate_splits=cache_candidate_splits,
             capacity_probe_page_counts=effective_capacity_probe_page_counts,
         )
     for _attempt in range(2):
@@ -1294,7 +1543,7 @@ def _worker_measure_page(task: dict[str, object]) -> dict[str, object]:
             _build_worker_cache(
                 args=args,
                 cache_candidate_ctas_per_sm=cache_candidate_ctas_per_sm,
-                candidate_splits=candidate_splits,
+                candidate_splits=cache_candidate_splits,
                 capacity_probe_page_counts=effective_capacity_probe_page_counts,
             )
     else:
@@ -1313,7 +1562,9 @@ def _run_parallel_workers(
     candidate_splits: list[int],
     page_counts: list[int],
     cache_candidate_ctas_per_sm: list[int] | None = None,
+    cache_candidate_splits: list[int] | None = None,
     capacity_probe_page_counts: list[int] | None = None,
+    page_candidate_splits: dict[int, list[int]] | None = None,
     executor: ProcessPoolExecutor | None = None,
     phase_label: str,
     on_page_result: callable | None = None,
@@ -1336,6 +1587,7 @@ def _run_parallel_workers(
             candidate_splits=candidate_splits,
             page_counts=page_counts,
             capacity_probe_page_counts=capacity_probe_page_counts,
+            page_candidate_splits=page_candidate_splits,
             on_page_result=on_page_result,
         )
         return pages
@@ -1346,6 +1598,11 @@ def _run_parallel_workers(
         [int(value) for value in candidate_ctas_per_sm]
         if cache_candidate_ctas_per_sm is None
         else [int(value) for value in cache_candidate_ctas_per_sm]
+    )
+    cache_candidate_splits = (
+        [int(value) for value in candidate_splits]
+        if cache_candidate_splits is None
+        else [int(value) for value in cache_candidate_splits]
     )
     capacity_probe_page_counts = (
         [int(value) for value in page_counts]
@@ -1360,7 +1617,15 @@ def _run_parallel_workers(
                 "args": {**vars(args)},
                 "candidate_ctas_per_sm": [int(value) for value in candidate_ctas_per_sm],
                 "cache_candidate_ctas_per_sm": [int(value) for value in cache_candidate_ctas_per_sm],
-                "candidate_splits": [int(value) for value in candidate_splits],
+                "candidate_splits": [
+                    int(value)
+                    for value in (
+                        candidate_splits
+                        if page_candidate_splits is None
+                        else page_candidate_splits.get(int(page_count), candidate_splits)
+                    )
+                ],
+                "cache_candidate_splits": [int(value) for value in cache_candidate_splits],
                 "capacity_probe_page_counts": [int(value) for value in capacity_probe_page_counts],
                 "page_count": int(page_count),
             },
@@ -1376,6 +1641,190 @@ def _run_parallel_workers(
         _summarize_page_completion(page=page, phase=phase_label)
     all_pages.sort(key=lambda page: int(page["page_count"]))
     return all_pages
+
+
+def _run_windowed_chunk_fill(
+    *,
+    args: argparse.Namespace,
+    batch: int,
+    best_cta: int,
+    all_page_counts: list[int],
+    dense_pages_by_page: dict[int, dict[str, object]],
+    candidate_splits: list[int],
+    capacity_probe_page_counts: list[int],
+    worker_count: int,
+    executor: ProcessPoolExecutor | None,
+    on_page_result: callable | None = None,
+) -> None:
+    probe_stride = int(getattr(args, "chunk_fill_window_probe_stride", 64))
+    if probe_stride > 0:
+        anchor_targets = _uniform_sample_page_counts(
+            page_start=args.page_start,
+            page_stop=args.page_stop,
+            stride=probe_stride,
+        )
+    else:
+        anchor_targets = _progressive_sample_page_counts(
+            page_start=args.page_start,
+            page_stop=args.page_stop,
+            sample_divisor=args.chunk_fill_window_sample_divisor,
+        )
+    anchor_targets = sorted(set(int(page) for page in anchor_targets if int(page) in set(all_page_counts)))
+    missing_anchor_pages = [int(page) for page in anchor_targets if int(page) not in dense_pages_by_page]
+    if missing_anchor_pages:
+        _log_summary(
+            f"# batch={batch} chunk_fill coarse dispatch pages={len(missing_anchor_pages)} workers={worker_count}"
+        )
+        _run_parallel_workers(
+            args=args,
+            candidate_ctas_per_sm=[best_cta],
+            candidate_splits=candidate_splits,
+            page_counts=missing_anchor_pages,
+            cache_candidate_ctas_per_sm=[best_cta],
+            cache_candidate_splits=candidate_splits,
+            capacity_probe_page_counts=capacity_probe_page_counts,
+            executor=executor,
+            phase_label="chunk_fill",
+            on_page_result=on_page_result,
+        )
+
+    anchor_pages = sorted(int(page) for page in dense_pages_by_page)
+    missing_dense_pages = [int(page) for page in all_page_counts if int(page) not in dense_pages_by_page]
+    if not missing_dense_pages:
+        return
+
+    interval_pages_by_right_probe: dict[int, list[int]] = {
+        int(right_probe): [
+            int(page)
+            for page in missing_dense_pages
+            if int(left_probe) < int(page) < int(right_probe)
+        ]
+        for left_probe, right_probe in zip(anchor_pages, anchor_pages[1:])
+    }
+    previous_interval_min: int | None = None
+    previous_interval_max: int | None = None
+    for left_probe, right_probe in zip(anchor_pages, anchor_pages[1:]):
+        interval_pages = interval_pages_by_right_probe[int(right_probe)]
+        if not interval_pages:
+            preferred = _page_cta_preferred_split(dense_pages_by_page[int(right_probe)], best_cta)
+            if preferred is not None:
+                previous_interval_min = int(preferred)
+                previous_interval_max = int(preferred)
+            continue
+        right_ties = _page_cta_tied_winner_splits(dense_pages_by_page[int(right_probe)], best_cta)
+        left_preferred = _page_cta_preferred_split(dense_pages_by_page[int(left_probe)], best_cta)
+        left_ties = _page_cta_tied_winner_splits(dense_pages_by_page[int(left_probe)], best_cta)
+        lower_bound = (
+            int(previous_interval_min)
+            if previous_interval_min is not None
+            else (
+                int(left_preferred)
+                if left_preferred is not None
+                else (int(min(left_ties)) if left_ties else int(candidate_splits[0]))
+            )
+        )
+        if not right_ties:
+            initial_window = [int(value) for value in candidate_splits]
+        else:
+            upper_bound = int(max(right_ties))
+            if previous_interval_max is not None:
+                upper_bound = max(int(previous_interval_max), upper_bound)
+            if upper_bound < lower_bound:
+                upper_bound = lower_bound
+            initial_window = _split_window_from_bounds(
+                candidate_splits=candidate_splits,
+                lower_bound=lower_bound,
+                upper_bound=upper_bound,
+                relative_pad=float(args.chunk_fill_window_relative_pad),
+                absolute_pad=int(args.chunk_fill_window_absolute_pad),
+            )
+        page_candidate_splits = {
+            int(page_count): [int(value) for value in initial_window]
+            for page_count in interval_pages
+        }
+        _log_summary(
+            f"# batch={batch} chunk_fill windowed dispatch right_probe={right_probe} "
+            f"pages={len(interval_pages)} workers={worker_count}"
+        )
+        _run_parallel_workers(
+            args=args,
+            candidate_ctas_per_sm=[best_cta],
+            candidate_splits=candidate_splits,
+            page_counts=interval_pages,
+            cache_candidate_ctas_per_sm=[best_cta],
+            cache_candidate_splits=candidate_splits,
+            capacity_probe_page_counts=capacity_probe_page_counts,
+            page_candidate_splits=page_candidate_splits,
+            executor=executor,
+            phase_label="chunk_fill",
+            on_page_result=on_page_result,
+        )
+
+        retry_round = 0
+        while True:
+            retry_page_candidate_splits: dict[int, list[int]] = {}
+            for page_count in interval_pages:
+                page_payload = dense_pages_by_page[int(page_count)]
+                current_window = [int(value) for value in page_candidate_splits[int(page_count)]]
+                if not _page_hits_split_window_edge(
+                    page_payload=page_payload,
+                    graph_ctas_per_sm=best_cta,
+                    candidate_window=current_window,
+                    full_candidate_splits=candidate_splits,
+                ):
+                    continue
+                winners = _page_cta_tied_winner_splits(page_payload, best_cta)
+                expanded_window = _expanded_split_window(
+                    candidate_splits=candidate_splits,
+                    current_window=current_window,
+                    winners=winners,
+                    relative_pad=float(args.chunk_fill_window_relative_pad),
+                    absolute_pad=int(args.chunk_fill_window_absolute_pad),
+                )
+                if expanded_window == current_window:
+                    expanded_window = [int(value) for value in candidate_splits]
+                if expanded_window == current_window:
+                    continue
+                retry_page_candidate_splits[int(page_count)] = expanded_window
+            if not retry_page_candidate_splits:
+                break
+            retry_round += 1
+            _log_summary(
+                f"# batch={batch} chunk_fill windowed retry={retry_round} "
+                f"right_probe={right_probe} pages={len(retry_page_candidate_splits)}"
+            )
+            _run_parallel_workers(
+                args=args,
+                candidate_ctas_per_sm=[best_cta],
+                candidate_splits=candidate_splits,
+                page_counts=sorted(retry_page_candidate_splits),
+                cache_candidate_ctas_per_sm=[best_cta],
+                cache_candidate_splits=candidate_splits,
+                capacity_probe_page_counts=capacity_probe_page_counts,
+                page_candidate_splits=retry_page_candidate_splits,
+                executor=executor,
+                phase_label="chunk_fill",
+                on_page_result=on_page_result,
+            )
+            for page_count, window in retry_page_candidate_splits.items():
+                page_candidate_splits[int(page_count)] = [int(value) for value in window]
+
+        interval_preferreds = [
+            preferred
+            for preferred in (
+                _page_cta_preferred_split(dense_pages_by_page[int(page_count)], best_cta)
+                for page_count in interval_pages
+            )
+            if preferred is not None
+        ]
+        if interval_preferreds:
+            previous_interval_min = int(min(interval_preferreds))
+            previous_interval_max = int(max(interval_preferreds))
+        else:
+            preferred = _page_cta_preferred_split(dense_pages_by_page[int(right_probe)], best_cta)
+            if preferred is not None:
+                previous_interval_min = int(preferred)
+                previous_interval_max = int(preferred)
 
 
 def _run_batch(
@@ -1481,20 +1930,34 @@ def _run_batch(
             _log_summary(f"# batch={batch} chunk_fill start best_cta={best_cta}")
             missing_dense_pages = list(all_page_counts)
             if missing_dense_pages:
-                _log_summary(
-                    f"# batch={batch} chunk_fill dispatch pages={len(missing_dense_pages)} workers={worker_count}"
-                )
-                _run_parallel_workers(
-                    args=batch_args,
-                    candidate_ctas_per_sm=[best_cta],
-                    candidate_splits=candidate_splits,
-                    page_counts=missing_dense_pages,
-                    cache_candidate_ctas_per_sm=[best_cta],
-                    capacity_probe_page_counts=capacity_probe_page_counts,
-                    executor=pool_context,
-                    phase_label="chunk_fill",
-                    on_page_result=_record_dense_page,
-                )
+                if batch_args.chunk_fill_windowed:
+                    _run_windowed_chunk_fill(
+                        args=batch_args,
+                        batch=batch,
+                        best_cta=best_cta,
+                        all_page_counts=all_page_counts,
+                        dense_pages_by_page=dense_pages_by_page,
+                        candidate_splits=candidate_splits,
+                        capacity_probe_page_counts=capacity_probe_page_counts,
+                        worker_count=worker_count,
+                        executor=pool_context,
+                        on_page_result=_record_dense_page,
+                    )
+                else:
+                    _log_summary(
+                        f"# batch={batch} chunk_fill dispatch pages={len(missing_dense_pages)} workers={worker_count}"
+                    )
+                    _run_parallel_workers(
+                        args=batch_args,
+                        candidate_ctas_per_sm=[best_cta],
+                        candidate_splits=candidate_splits,
+                        page_counts=missing_dense_pages,
+                        cache_candidate_ctas_per_sm=[best_cta],
+                        capacity_probe_page_counts=capacity_probe_page_counts,
+                        executor=pool_context,
+                        phase_label="chunk_fill",
+                        on_page_result=_record_dense_page,
+                    )
             chunk_fill_payload = _build_batch_payload(
                 args=batch_args,
                 batch=batch,
@@ -1655,20 +2118,34 @@ def _run_batch(
             page for page in all_page_counts if page not in dense_pages_by_page
         ]
         if missing_dense_pages:
-            _log_summary(
-                f"# batch={batch} chunk_fill dispatch pages={len(missing_dense_pages)} workers={worker_count}"
-            )
-            _run_parallel_workers(
-                args=batch_args,
-                candidate_ctas_per_sm=[best_cta],
-                candidate_splits=candidate_splits,
-                page_counts=missing_dense_pages,
-                cache_candidate_ctas_per_sm=[best_cta],
-                capacity_probe_page_counts=capacity_probe_page_counts,
-                executor=pool_context,
-                phase_label="chunk_fill",
-                on_page_result=_record_dense_page,
-            )
+            if batch_args.chunk_fill_windowed:
+                _run_windowed_chunk_fill(
+                    args=batch_args,
+                    batch=batch,
+                    best_cta=best_cta,
+                    all_page_counts=all_page_counts,
+                    dense_pages_by_page=dense_pages_by_page,
+                    candidate_splits=candidate_splits,
+                    capacity_probe_page_counts=capacity_probe_page_counts,
+                    worker_count=worker_count,
+                    executor=pool_context,
+                    on_page_result=_record_dense_page,
+                )
+            else:
+                _log_summary(
+                    f"# batch={batch} chunk_fill dispatch pages={len(missing_dense_pages)} workers={worker_count}"
+                )
+                _run_parallel_workers(
+                    args=batch_args,
+                    candidate_ctas_per_sm=[best_cta],
+                    candidate_splits=candidate_splits,
+                    page_counts=missing_dense_pages,
+                    cache_candidate_ctas_per_sm=[best_cta],
+                    capacity_probe_page_counts=capacity_probe_page_counts,
+                    executor=pool_context,
+                    phase_label="chunk_fill",
+                    on_page_result=_record_dense_page,
+                )
     finally:
         if pool_context is not None:
             pool_context.shutdown(wait=True, cancel_futures=False)
@@ -1714,6 +2191,11 @@ def main() -> None:
     parser.add_argument("--cta-max-refinement-rounds", type=int, default=3)
     parser.add_argument("--cta-survivor-threshold", type=float, default=0.01)
     parser.add_argument("--cta-max-survivors", type=int, default=8)
+    parser.add_argument("--chunk-fill-windowed", action="store_true")
+    parser.add_argument("--chunk-fill-window-probe-stride", type=int, default=64)
+    parser.add_argument("--chunk-fill-window-sample-divisor", type=int, default=18)
+    parser.add_argument("--chunk-fill-window-relative-pad", type=float, default=0.10)
+    parser.add_argument("--chunk-fill-window-absolute-pad", type=int, default=10)
     parser.add_argument("--fixed-cta", type=int, default=0)
     parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
     parser.add_argument("--kv-dtype", choices=["bf16", "fp16", "fp8_e4m3fn"], default="bf16")
@@ -1747,6 +2229,14 @@ def main() -> None:
         raise ValueError("--cta-survivor-threshold must be between 0 and 1")
     if args.cta_max_survivors <= 0:
         raise ValueError("--cta-max-survivors must be positive")
+    if args.chunk_fill_window_sample_divisor <= 0:
+        raise ValueError("--chunk-fill-window-sample-divisor must be positive")
+    if args.chunk_fill_window_probe_stride < 0:
+        raise ValueError("--chunk-fill-window-probe-stride must be non-negative")
+    if args.chunk_fill_window_relative_pad < 0.0:
+        raise ValueError("--chunk-fill-window-relative-pad must be non-negative")
+    if args.chunk_fill_window_absolute_pad < 0:
+        raise ValueError("--chunk-fill-window-absolute-pad must be non-negative")
     if args.fixed_cta < 0:
         raise ValueError("--fixed-cta must be non-negative")
     if args.capture_page_count <= 0:

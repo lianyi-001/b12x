@@ -99,6 +99,10 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
   - `chunked-prefill` batch profile: `[8192, 16384, 24576, 32768]`
 - `benchmarks/benchmark_paged_attention.py`
   - Paged attention vs FlashInfer across decode and extend shapes
+- `scripts/sweep_decode_graph_policy.py`
+  - Two-stage decode graph tuning sweep:
+    - stage 1 picks `graph_ctas_per_sm` for a specific batch size
+    - stage 2 fills the dense per-page chunk table for that same batch size
 - `benchmarks/benchmark_dense_gemm.py`
   - Dense FP4 GEMM vs FlashInfer/cuDNN/CUTLASS
 - `benchmarks/benchmark_mxfp8_pv.py`
@@ -149,4 +153,71 @@ pytest tests/test_attention_cuda_graphs.py tests/test_paged_attention_workspace_
 python tests/test_tp_moe_reference.py --impls b12x --scale-contract per-expert
 
 pytest tests/test_moe_equivalence.py
+```
+
+
+## Decode CTA/Chunk Sweep
+
+Use `scripts/sweep_decode_graph_policy.py` to tune decode graph policy for one
+specific batch size. The batch size is controlled by `--batch-list`; if you
+pass a single value, the sweep only runs that one batch.
+
+Environment:
+
+```bash
+source ~/projects/sglang/.venv/bin/activate
+export CUTE_DSL_ARCH=sm_120a
+```
+
+Template:
+
+```bash
+python scripts/sweep_decode_graph_policy.py \
+  --kv-dtype bf16 \
+  --batch-list <batch_size> \
+  --page-start 1 \
+  --page-stop 4096 \
+  --capture-page-count 4096 \
+  --candidate-ctas-per-sm 1,16 \
+  --candidate-splits 1,512 \
+  --parallel-workers 8 \
+  --replays 100 \
+  --probe-batch-replays 10 \
+  --ci-level 0.99 \
+  --output /tmp/<kv_dtype>_decode_graph_policy_bs<batch_size>.json \
+  --summary
+```
+
+Example for batch size `1`:
+
+```bash
+python scripts/sweep_decode_graph_policy.py \
+  --kv-dtype bf16 \
+  --batch-list 1 \
+  --page-start 1 \
+  --page-stop 4096 \
+  --capture-page-count 4096 \
+  --candidate-ctas-per-sm 1,16 \
+  --candidate-splits 1,512 \
+  --parallel-workers 8 \
+  --replays 100 \
+  --probe-batch-replays 10 \
+  --ci-level 0.99 \
+  --output /tmp/bf16_decode_graph_policy_bs1.json \
+  --summary
+```
+
+Notes:
+
+- The sweep writes the final combined result to `--output`.
+- It also writes an incremental JSONL checkpoint next to it as
+  `*.checkpoint.jsonl`.
+- If you already know the decode CTA and only want the dense chunk fill, add
+  `--fixed-cta <n>` to skip the CTA search stage.
+
+After the sweep finishes, generate the registered tuning module with:
+
+```bash
+python scripts/generate_decode_policy_tuning.py \
+  --input /tmp/<kv_dtype>_decode_graph_policy_bs<batch_size>.json
 ```

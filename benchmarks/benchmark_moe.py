@@ -29,7 +29,6 @@ from b12x.moe.fused.reference import (
     moe_reference_f32,
     moe_reference_nvfp4,
 )
-from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
 
 
@@ -472,6 +471,8 @@ def bench_flashinfer(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> tuple[Callable[[], None], torch.Tensor]:
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+
     output = torch.empty(x.shape[0], weights.spec.hidden_size, dtype=torch.bfloat16, device=x.device)
     quant_scales = [
         weights.w13_input_scale_quant,

@@ -13,6 +13,8 @@ fi
 : "${TWINE_USERNAME:=__token__}"
 : "${TWINE_PASSWORD:?TWINE_PASSWORD must be set in .env or the environment}"
 
+rm -rf dist/
+
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   python -m venv "$VENV_DIR"
 fi
