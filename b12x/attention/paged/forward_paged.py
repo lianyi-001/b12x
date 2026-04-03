@@ -1137,11 +1137,11 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         upcast_stride_k,
     )
     for mma_pair in cutlass.range_constexpr(num_mma_d_qk // 2):
-        a_regs_k0 = cute.make_rmem_tensor(
+        a_regs_k1 = cute.make_rmem_tensor(
             cute.make_layout((num_mma_q, 4), stride=(4, 1)),
             Uint32,
         )
-        a_regs_k1 = cute.make_rmem_tensor(
+        q_regs = cute.make_rmem_tensor(
             cute.make_layout((num_mma_q, 4), stride=(4, 1)),
             Uint32,
         )
@@ -1149,10 +1149,10 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         q_offset_cur = q_offset
         for mma_q in cutlass.range_constexpr(num_mma_q):
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
-            a_regs_k0[mma_q, 0] = a0
-            a_regs_k0[mma_q, 1] = a1
-            a_regs_k0[mma_q, 2] = a2
-            a_regs_k0[mma_q, 3] = a3
+            q_regs[mma_q, 0] = cvt_bf16x2_to_e4m3x2(a0) & mask16
+            q_regs[mma_q, 1] = cvt_bf16x2_to_e4m3x2(a1) & mask16
+            q_regs[mma_q, 2] = cvt_bf16x2_to_e4m3x2(a2) & mask16
+            q_regs[mma_q, 3] = cvt_bf16x2_to_e4m3x2(a3) & mask16
             q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
 
         mma_d0 = mma_pair * 2
@@ -1171,21 +1171,17 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             num_mma_q * 16 * upcast_stride_q
         )
 
-        q_regs = cute.make_rmem_tensor(
-            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
-            Uint32,
-        )
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            q_regs[mma_q, 0] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 0]) & mask16) | (
+            q_regs[mma_q, 0] = q_regs[mma_q, 0] | (
                 (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 0]) & mask16) << shift16
             )
-            q_regs[mma_q, 1] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
+            q_regs[mma_q, 1] = q_regs[mma_q, 1] | (
                 (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) << shift16
             )
-            q_regs[mma_q, 2] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) | (
+            q_regs[mma_q, 2] = q_regs[mma_q, 2] | (
                 (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 2]) & mask16) << shift16
             )
-            q_regs[mma_q, 3] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) | (
+            q_regs[mma_q, 3] = q_regs[mma_q, 3] | (
                 (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 3]) & mask16) << shift16
             )
 
