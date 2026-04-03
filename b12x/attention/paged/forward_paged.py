@@ -1437,6 +1437,108 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
 
 
 @cute.jit
+def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
+    o_frag: cute.Tensor,
+    p_frag: cute.Tensor,
+    v_plane0_base_addr: Int32,
+    v_plane1_base_addr: Int32,
+    lane,
+    warp_kv_idx,
+    row_base,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_vo,
+    upcast_stride_plane,
+    v_scale,
+    debug_regs: cute.Tensor | None = None,
+):
+    v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
+    upcast_stride_full = upcast_stride_plane * Int32(2)
+    v_offset = _permuted_offset_128b(
+        row_base + warp_kv_idx * num_mma_kv * 16 + lane % 16,
+        lane // 16,
+        upcast_stride_full,
+    )
+    for mma_kv in cutlass.range_constexpr(num_mma_kv):
+        a_regs = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
+            Uint32,
+        )
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            a_regs[mma_q, 0] = bfloat2_mul(p_frag[mma_q, mma_kv, 0], v_scale_bf2)
+            a_regs[mma_q, 1] = Uint32(0)
+            a_regs[mma_q, 2] = bfloat2_mul(p_frag[mma_q, mma_kv, 2], v_scale_bf2)
+            a_regs[mma_q, 3] = Uint32(0)
+
+        v_offset_cur = v_offset
+        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+            v_addr = _smem_addr_from_split_planes_128b(
+                v_plane0_base_addr,
+                v_plane1_base_addr,
+                v_offset_cur,
+                upcast_stride_full,
+            )
+            if const_expr(mma_d % 2 == 0):
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_left_half_b16(
+                    v_addr
+                )
+            else:
+                b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(
+                    v_addr
+                )
+            b_f8_0 = frag_layout_swizzle_16b_to_8b_trans(b_f8_0)
+            b_f8_1 = frag_layout_swizzle_16b_to_8b_trans(b_f8_1)
+            b0, b1 = fp8x4_e4m3_to_bfloat2x2(b_f8_0)
+            b2, b3 = fp8x4_e4m3_to_bfloat2x2(b_f8_1)
+            tmp = b1
+            b1 = b2
+            b2 = tmp
+            if const_expr(debug_regs is not None):
+                lane_words = num_mma_kv * num_mma_d_vo * 4
+                dst_words = cute.size(debug_regs.shape)
+                dst_idx = lane * lane_words + (mma_kv * num_mma_d_vo + mma_d) * 4
+                if dst_idx + 0 < dst_words:
+                    debug_regs[dst_idx + 0] = b0
+                if dst_idx + 1 < dst_words:
+                    debug_regs[dst_idx + 1] = b1
+                if dst_idx + 2 < dst_words:
+                    debug_regs[dst_idx + 2] = b2
+                if dst_idx + 3 < dst_words:
+                    debug_regs[dst_idx + 3] = b3
+            if const_expr(mma_d % 2 == 1):
+                v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+                    o_frag[mma_q, mma_d, 0],
+                    o_frag[mma_q, mma_d, 1],
+                    o_frag[mma_q, mma_d, 2],
+                    o_frag[mma_q, mma_d, 3],
+                    o_frag[mma_q, mma_d, 4],
+                    o_frag[mma_q, mma_d, 5],
+                    o_frag[mma_q, mma_d, 6],
+                    o_frag[mma_q, mma_d, 7],
+                    a_regs[mma_q, 0],
+                    a_regs[mma_q, 1],
+                    a_regs[mma_q, 2],
+                    a_regs[mma_q, 3],
+                    b0,
+                    b1,
+                    b2,
+                    b3,
+                )
+                o_frag[mma_q, mma_d, 0] = d0
+                o_frag[mma_q, mma_d, 1] = d1
+                o_frag[mma_q, mma_d, 2] = d2
+                o_frag[mma_q, mma_d, 3] = d3
+                o_frag[mma_q, mma_d, 4] = d4
+                o_frag[mma_q, mma_d, 5] = d5
+                o_frag[mma_q, mma_d, 6] = d6
+                o_frag[mma_q, mma_d, 7] = d7
+        v_offset = _advance_offset_by_row_128b(v_offset_cur, 16, upcast_stride_full) - Int32(num_mma_d_vo)
+    v_offset -= Int32(16 * num_mma_kv * upcast_stride_full)
+
+
+@cute.jit
 def _literal_pv_mma_into_ofrag_mxfp8_raw(
     o_frag: cute.Tensor,
     p_frag: cute.Tensor,
@@ -3541,24 +3643,64 @@ class PagedForwardKernel:
                     )
                 elif const_expr(self.kv_is_fp8):
                     v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
-                    _literal_pv_mma_into_ofrag_plane_fp8_raw(
-                        o_frag,
-                        p_frag,
-                        shared_ptr_to_u32(
-                            sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
-                        ),
-                        shared_ptr_to_u32(
-                            sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
-                        ),
-                        lane,
-                        warp_kv_idx,
-                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
-                        num_mma_q,
-                        num_mma_kv,
-                        num_mma_d_vo,
-                        tc_upcast_stride_plane,
-                        v_scale,
-                    )
+                    if const_expr(self.decode_only and self.traits.num_warps_q == 1 and num_mma_q == 1):
+                        if group_size == Int32(8):
+                            _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
+                                o_frag,
+                                p_frag,
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                ),
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                ),
+                                lane,
+                                warp_kv_idx,
+                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                num_mma_q,
+                                num_mma_kv,
+                                num_mma_d_vo,
+                                tc_upcast_stride_plane,
+                                v_scale,
+                            )
+                        else:
+                            _literal_pv_mma_into_ofrag_plane_fp8_raw(
+                                o_frag,
+                                p_frag,
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                ),
+                                shared_ptr_to_u32(
+                                    sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                ),
+                                lane,
+                                warp_kv_idx,
+                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                num_mma_q,
+                                num_mma_kv,
+                                num_mma_d_vo,
+                                tc_upcast_stride_plane,
+                                v_scale,
+                            )
+                    else:
+                        _literal_pv_mma_into_ofrag_plane_fp8_raw(
+                            o_frag,
+                            p_frag,
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                            ),
+                            lane,
+                            warp_kv_idx,
+                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            num_mma_q,
+                            num_mma_kv,
+                            num_mma_d_vo,
+                            tc_upcast_stride_plane,
+                            v_scale,
+                        )
                 else:
                     v_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
                     _literal_pv_mma_into_ofrag_plane_bf16_packed(
