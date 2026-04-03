@@ -2382,6 +2382,8 @@ class PagedForwardKernel:
             and self.traits.num_warps_q == 1
             and self.traits.num_mma_q == 1
             and self.traits.num_mma_d_qk == 16
+            and not self.single_request_decode_graph
+            and not self.single_qtile_decode_graph
         ):
             _async_copy_q_tile_permuted_128b_fp8_decode_impl(
                 mQBytes,
