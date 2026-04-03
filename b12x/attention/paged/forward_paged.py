@@ -1626,6 +1626,86 @@ def _literal_update_mdo_states_fp32_pack_p(
 
 
 @cute.jit
+def _literal_update_mdo_states_fp32_pack_p_row0(
+    s_frag: cute.Tensor,
+    o_frag: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    p_frag: cute.Tensor,
+    sm_scale_log2: Float32,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_vo,
+):
+    for mma_q in cutlass.range_constexpr(num_mma_q):
+        m_prev = Float32(m_frag[mma_q, 0])
+        m_new = Float32(m_prev)
+        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+            m_local = attention_utils.fmax(
+                attention_utils.fmax(
+                    s_frag[mma_q, mma_kv, 0],
+                    s_frag[mma_q, mma_kv, 1],
+                ),
+                attention_utils.fmax(
+                    s_frag[mma_q, mma_kv, 4],
+                    s_frag[mma_q, mma_kv, 5],
+                ),
+            )
+            m_new = attention_utils.fmax(m_new, m_local)
+        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+        m_new = attention_utils.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
+
+        scale_term = (
+            Float32(1.0)
+            if m_new == -Float32.inf
+            else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new * sm_scale_log2)
+        )
+        d_frag[mma_q, 0] = Float32(d_frag[mma_q, 0] * scale_term)
+        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+            o_frag[mma_q, mma_d, 0] *= scale_term
+            o_frag[mma_q, mma_d, 1] *= scale_term
+            o_frag[mma_q, mma_d, 4] *= scale_term
+            o_frag[mma_q, mma_d, 5] *= scale_term
+
+        m_scaled = Float32(m_new * sm_scale_log2)
+        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+            p0 = (
+                Float32(0.0)
+                if m_new == -Float32.inf
+                else _exp2_approx_ftz_f32(
+                    s_frag[mma_q, mma_kv, 0] * sm_scale_log2 - m_scaled
+                )
+            )
+            p1 = (
+                Float32(0.0)
+                if m_new == -Float32.inf
+                else _exp2_approx_ftz_f32(
+                    s_frag[mma_q, mma_kv, 1] * sm_scale_log2 - m_scaled
+                )
+            )
+            p2 = (
+                Float32(0.0)
+                if m_new == -Float32.inf
+                else _exp2_approx_ftz_f32(
+                    s_frag[mma_q, mma_kv, 4] * sm_scale_log2 - m_scaled
+                )
+            )
+            p3 = (
+                Float32(0.0)
+                if m_new == -Float32.inf
+                else _exp2_approx_ftz_f32(
+                    s_frag[mma_q, mma_kv, 5] * sm_scale_log2 - m_scaled
+                )
+            )
+            p_frag[mma_q, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
+            p_frag[mma_q, mma_kv, 2] = pack_f32x2_to_bfloat2(p2, p3)
+            p_frag[mma_q, mma_kv, 1] = Uint32(0)
+            p_frag[mma_q, mma_kv, 3] = Uint32(0)
+
+        m_frag[mma_q, 0] = Float32(m_new)
+
+
+@cute.jit
 def _literal_update_mdo_states_fp32_pack_p_pairwise(
     s_frag0: cute.Tensor,
     s_frag1: cute.Tensor,
@@ -3256,17 +3336,43 @@ class PagedForwardKernel:
                             )
                         _exit_thread()
 
-                _literal_update_mdo_states_fp32_pack_p(
-                    frag_S,
-                    o_frag,
-                    m_frag,
-                    d_frag,
-                    p_frag,
-                    self.softmax_scale_log2,
-                    num_mma_q,
-                    num_mma_kv,
-                    num_mma_d_vo,
-                )
+                if const_expr(self.decode_only and self.kv_is_fp8 and self.traits.num_warps_q == 1 and num_mma_q == 1):
+                    if group_size == Int32(8):
+                        _literal_update_mdo_states_fp32_pack_p_row0(
+                            frag_S,
+                            o_frag,
+                            m_frag,
+                            d_frag,
+                            p_frag,
+                            self.softmax_scale_log2,
+                            num_mma_q,
+                            num_mma_kv,
+                            num_mma_d_vo,
+                        )
+                    else:
+                        _literal_update_mdo_states_fp32_pack_p(
+                            frag_S,
+                            o_frag,
+                            m_frag,
+                            d_frag,
+                            p_frag,
+                            self.softmax_scale_log2,
+                            num_mma_q,
+                            num_mma_kv,
+                            num_mma_d_vo,
+                        )
+                else:
+                    _literal_update_mdo_states_fp32_pack_p(
+                        frag_S,
+                        o_frag,
+                        m_frag,
+                        d_frag,
+                        p_frag,
+                        self.softmax_scale_log2,
+                        num_mma_q,
+                        num_mma_kv,
+                        num_mma_d_vo,
+                    )
                 if const_expr(self.debug_dump_paged_kv_pregs):
                     if (
                         work_idx == Int32(0)
