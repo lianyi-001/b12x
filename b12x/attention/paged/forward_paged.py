@@ -425,24 +425,41 @@ def _async_copy_q_tile_permuted_128b_fp8_decode_impl(
 ):
     lane_row = lane // 8
     lane_col = lane % 8
-    for row_iter in cutlass.range_constexpr(4):
-        packed_q_idx = Int32(packed_tile_start + lane_row + row_iter * 4)
-        row_valid = packed_q_idx < (packed_tile_start + packed_tile_rows)
-        q_row_local = packed_q_idx // group_size
-        q_group_lane = packed_q_idx - q_row_local * group_size
-        q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
-        q_row_idx = Int32(q_start + q_row_local)
-        row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
-        row_idx = Int32(lane_row + row_iter * 4)
-        for mma_do in cutlass.range_constexpr(4):
-            vec_idx = Int32(lane_col + mma_do * 8)
-            src_byte_idx = row_byte_base + vec_idx * 16
-            dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
-            _cp_async_load_128b_pred(
-                shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
-                get_ptr_as_int64(mQBytes, src_byte_idx),
-                Int32(row_valid),
-                    )
+    if group_size == Int32(8):
+        q_row_idx = Int32(q_start)
+        q_head_base = Int32(kv_head_idx * 8 + packed_tile_start)
+        for row_iter in cutlass.range_constexpr(2):
+            q_head_idx = Int32(q_head_base + lane_row + row_iter * 4)
+            row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
+            row_idx = Int32(lane_row + row_iter * 4)
+            for mma_do in cutlass.range_constexpr(4):
+                vec_idx = Int32(lane_col + mma_do * 8)
+                src_byte_idx = row_byte_base + vec_idx * 16
+                dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                _cp_async_load_128b_pred(
+                    shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
+                    get_ptr_as_int64(mQBytes, src_byte_idx),
+                    Int32(1),
+                )
+    else:
+        for row_iter in cutlass.range_constexpr(4):
+            packed_q_idx = Int32(packed_tile_start + lane_row + row_iter * 4)
+            row_valid = packed_q_idx < (packed_tile_start + packed_tile_rows)
+            q_row_local = packed_q_idx // group_size
+            q_group_lane = packed_q_idx - q_row_local * group_size
+            q_head_idx = Int32(kv_head_idx * group_size + q_group_lane)
+            q_row_idx = Int32(q_start + q_row_local)
+            row_byte_base = ((q_row_idx * num_q_heads) + q_head_idx) * row_bytes
+            row_idx = Int32(lane_row + row_iter * 4)
+            for mma_do in cutlass.range_constexpr(4):
+                vec_idx = Int32(lane_col + mma_do * 8)
+                src_byte_idx = row_byte_base + vec_idx * 16
+                dst_byte_idx = _permuted_offset_128b(row_idx, vec_idx, upcast_stride_q) * 16
+                _cp_async_load_128b_pred(
+                    shared_ptr_to_u32(sQBytes.iterator + dst_byte_idx),
+                    get_ptr_as_int64(mQBytes, src_byte_idx),
+                    Int32(row_valid),
+                )
 
 
 @cute.jit
@@ -2045,6 +2062,27 @@ class PagedForwardKernel:
         lane,
         warp_q_idx,
     ):
+        if const_expr(
+            self.decode_only
+            and self.kv_is_fp8
+            and self.traits.num_warps_q == 1
+            and self.traits.num_mma_q == 1
+            and self.traits.num_mma_d_qk == 16
+        ):
+            _async_copy_q_tile_permuted_128b_fp8_decode_impl(
+                mQBytes,
+                q_start,
+                packed_tile_start,
+                packed_tile_rows,
+                kv_head_idx,
+                group_size,
+                num_q_heads,
+                row_bytes,
+                sQBytes,
+                lane,
+                self.traits.upcast_stride_q,
+            )
+            return
         lane_row = lane // 8
         lane_col = lane % 8
         warp_row_base = Int32(warp_q_idx * self.traits.num_mma_q * 16)
