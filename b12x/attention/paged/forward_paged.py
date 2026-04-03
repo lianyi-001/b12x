@@ -30,12 +30,8 @@ from b12x.cute.fp4 import (
     bf16_mma_m16n16k16_f32,
     bf16_rowsum_m16k16_f32,
     bfloat2_mul,
-    bfloat2_to_float2_scaled,
     broadcast_f32_to_bfloat2,
     cvt_bf16x2_to_e4m3x2,
-    cvt_f32_to_ue8m0,
-    fabs_f32,
-    fmax_f32,
     fp8x4_e4m3_to_bfloat2x2,
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
@@ -50,7 +46,6 @@ from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b_trans,
     st_global_v4_u32,
     st_shared_v4_u32,
-    ue8m0_to_output_scale,
 )
 
 from .traits import PagedForwardTraits
@@ -1113,46 +1108,6 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw(
             k_offset = k_offset_cur - Int32(num_mma_kv * 16 * upcast_stride_full)
 
 
-@cute.jit
-def _mxfp8_q_scale_from_bf16_regs(
-    a0: Uint32,
-    a1: Uint32,
-    a2: Uint32,
-    a3: Uint32,
-    b0: Uint32,
-    b1: Uint32,
-    b2: Uint32,
-    b3: Uint32,
-):
-    one = Float32(1.0)
-    e4m3_inv_max = Float32(1.0 / 448.0)
-
-    x0, x1 = bfloat2_to_float2_scaled(a0, one)
-    max_abs = fmax_f32(fabs_f32(x0), fabs_f32(x1))
-
-    x0, x1 = bfloat2_to_float2_scaled(a1, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-    x0, x1 = bfloat2_to_float2_scaled(a2, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-    x0, x1 = bfloat2_to_float2_scaled(a3, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-    x0, x1 = bfloat2_to_float2_scaled(b0, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-    x0, x1 = bfloat2_to_float2_scaled(b1, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-    x0, x1 = bfloat2_to_float2_scaled(b2, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-    x0, x1 = bfloat2_to_float2_scaled(b3, one)
-    max_abs = fmax_f32(max_abs, fmax_f32(fabs_f32(x0), fabs_f32(x1)))
-
-    scale_byte = cvt_f32_to_ue8m0(max_abs * e4m3_inv_max)
-    scale_pack = scale_byte | (scale_byte << Uint32(8))
-    scale_pack = scale_pack | (scale_pack << Uint32(16))
-    q_output_scale_bf2 = broadcast_f32_to_bfloat2(ue8m0_to_output_scale(scale_byte))
-    return scale_pack, q_output_scale_bf2
-
-
-@cute.jit
 def _literal_qk_mma_into_sfrag_mxfp8_raw(
     s_frag: cute.Tensor,
     q_base_addr: Int32,
@@ -1219,33 +1174,18 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             cute.make_layout((num_mma_q, 4), stride=(4, 1)),
             Uint32,
         )
-        q_scales = cute.make_rmem_tensor(
-            cute.make_layout((num_mma_q,), stride=(1,)),
-            Uint32,
-        )
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            q_scale_pack, q_output_scale_bf2 = _mxfp8_q_scale_from_bf16_regs(
-                a_regs_k0[mma_q, 0],
-                a_regs_k0[mma_q, 1],
-                a_regs_k0[mma_q, 2],
-                a_regs_k0[mma_q, 3],
-                a_regs_k1[mma_q, 0],
-                a_regs_k1[mma_q, 1],
-                a_regs_k1[mma_q, 2],
-                a_regs_k1[mma_q, 3],
+            q_regs[mma_q, 0] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 0]) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 0]) & mask16) << shift16
             )
-            q_scales[mma_q] = q_scale_pack
-            q_regs[mma_q, 0] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k0[mma_q, 0], q_output_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k1[mma_q, 0], q_output_scale_bf2)) & mask16) << shift16
+            q_regs[mma_q, 1] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) << shift16
             )
-            q_regs[mma_q, 1] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k0[mma_q, 1], q_output_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k1[mma_q, 1], q_output_scale_bf2)) & mask16) << shift16
+            q_regs[mma_q, 2] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 2]) & mask16) << shift16
             )
-            q_regs[mma_q, 2] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k0[mma_q, 2], q_output_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k1[mma_q, 2], q_output_scale_bf2)) & mask16) << shift16
-            )
-            q_regs[mma_q, 3] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k0[mma_q, 3], q_output_scale_bf2)) & mask16) | (
-                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(a_regs_k1[mma_q, 3], q_output_scale_bf2)) & mask16) << shift16
+            q_regs[mma_q, 3] = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 3]) & mask16) << shift16
             )
 
         k_offset_cur = k_offset
@@ -1267,7 +1207,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
                 qa1 = q_regs[mma_q, 1]
                 qa2 = q_regs[mma_q, 2]
                 qa3 = q_regs[mma_q, 3]
-                q_scale_pack = q_scales[mma_q]
 
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
                     s_frag[mma_q, mma_kv, 0],
@@ -1280,7 +1219,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
                     qa3,
                     b0_k0,
                     b0_k1,
-                    q_scale_pack,
+                    unit_scale,
                     unit_scale,
                 )
                 d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
@@ -1294,7 +1233,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
                     qa3,
                     b1_k0,
                     b1_k1,
-                    q_scale_pack,
+                    unit_scale,
                     unit_scale,
                 )
                 s_frag[mma_q, mma_kv, 0] = d0
