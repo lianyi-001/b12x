@@ -2746,6 +2746,12 @@ class PagedForwardKernel:
             and self.traits.num_warps_q == 1
             and self.traits.num_warps_kv == 4
         )
+        decode_row_metadata_fastpath = const_expr(
+            self.decode_only
+            and not self.single_request_decode_graph
+            and not self.single_qtile_decode_graph
+            and not self.regularized_decode_graph
+        )
         sOStage = cute.make_tensor(
             sQ.iterator,
             cute.make_layout(
@@ -2827,10 +2833,15 @@ class PagedForwardKernel:
         lane_pair_base = 2 * (lane % 4)
         row_local_idx = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
         row_valid = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-        q_token_local = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-        q_head_idx_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-        q_row_idx_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
-        causal_k_limit = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
+        q_token_local = None
+        q_head_idx_frag = None
+        q_row_idx_frag = None
+        causal_k_limit = None
+        if const_expr(not decode_row_metadata_fastpath):
+            q_token_local = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
+            q_head_idx_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
+            q_row_idx_frag = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
+            causal_k_limit = cute.make_rmem_tensor(cute.make_layout((num_mma_q, 2), stride=(2, 1)), Int32)
         frag_s_layout = cute.make_layout((num_mma_q, num_mma_kv, 8), stride=(num_mma_kv * 8, 8, 1))
         frag_p_layout = cute.make_layout((num_mma_q, num_mma_kv, 4), stride=(num_mma_kv * 4, 4, 1))
         frag_o_layout = cute.make_layout((num_mma_q, num_mma_d_vo, 8), stride=(num_mma_d_vo * 8, 8, 1))
@@ -2860,6 +2871,13 @@ class PagedForwardKernel:
             Uint32,
         )
         q_smem_base_addr = shared_ptr_to_u32(sQ.iterator)
+        decode_q_head_base = Int32(kv_head_idx * group_size) if const_expr(decode_row_metadata_fastpath) else Int32(0)
+        decode_q_row_idx = Int32(request_idx) if const_expr(decode_row_metadata_fastpath) else Int32(0)
+        decode_partial_row_idx = (
+            Int32(request_partial_start + kv_tile_idx)
+            if const_expr(decode_row_metadata_fastpath and self.split_kv)
+            else Int32(0)
+        )
 
         for mma_q in cutlass.range_constexpr(num_mma_q):
             for row_slot in cutlass.range_constexpr(2):
@@ -2881,7 +2899,7 @@ class PagedForwardKernel:
                             q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + packed_row_local)
                             q_row_idx_frag[mma_q, row_slot] = Int32(q_start)
                             causal_k_limit[mma_q, row_slot] = Int32(cache_len - qo_len)
-                        else:
+                        elif const_expr(not decode_row_metadata_fastpath):
                             packed_q_idx = packed_tile_start + packed_row_local
                             token_local = packed_q_idx // group_size
                             q_group_lane = packed_q_idx - token_local * group_size
@@ -2889,7 +2907,9 @@ class PagedForwardKernel:
                             q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
                             q_row_idx_frag[mma_q, row_slot] = Int32(q_start + token_local)
                             causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
-                    else:
+                        else:
+                            pass
+                    elif const_expr(not decode_row_metadata_fastpath):
                         q_token_local[mma_q, row_slot] = Int32(0)
                         q_head_idx_frag[mma_q, row_slot] = Int32(0)
                         q_row_idx_frag[mma_q, row_slot] = Int32(0)
@@ -3100,8 +3120,9 @@ class PagedForwardKernel:
                                 valid = row_valid[mma_q, row_slot] != 0
                                 if valid:
                                     valid = valid and key_local < tile_tokens
-                                if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                if const_expr(not decode_row_metadata_fastpath):
+                                    if valid:
+                                        valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
                                 if valid:
                                     frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
                                 else:
@@ -3149,8 +3170,9 @@ class PagedForwardKernel:
                                 valid = row_valid[mma_q, row_slot] != 0
                                 if valid:
                                     valid = valid and key_local < tile_tokens
-                                if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                if const_expr(not decode_row_metadata_fastpath):
+                                    if valid:
+                                        valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
                                 if not valid:
                                     frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
 
@@ -3697,7 +3719,11 @@ class PagedForwardKernel:
                                         out_high0, out_high1
                                     )
                                 elif const_expr(self.split_kv):
-                                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                    partial_row_idx = (
+                                        decode_partial_row_idx
+                                        if const_expr(decode_row_metadata_fastpath)
+                                        else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                    )
                                     mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
                                     mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
                                     mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
@@ -3714,7 +3740,11 @@ class PagedForwardKernel:
                                 else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
                             )
                             if const_expr(self.split_kv):
-                                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                partial_row_idx = (
+                                    decode_partial_row_idx
+                                    if const_expr(decode_row_metadata_fastpath)
+                                    else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                )
                                 mLSE[partial_row_idx, q_head_idx] = row_lse
                             else:
                                 mLSE[q_head_idx, q_row_idx] = row_lse
@@ -3722,10 +3752,14 @@ class PagedForwardKernel:
                     for mma_q in cutlass.range_constexpr(num_mma_q):
                         for row_slot in cutlass.range_constexpr(2):
                             packed_row_local = row_local_idx[mma_q, row_slot]
-                            q_head_idx = q_head_idx_frag[mma_q, row_slot]
-                            q_row_idx = q_row_idx_frag[mma_q, row_slot]
-                            token_local = q_token_local[mma_q, row_slot]
                             valid_row_store = row_valid[mma_q, row_slot] != 0
+                            if const_expr(decode_row_metadata_fastpath):
+                                q_head_idx = decode_q_head_base + packed_row_local
+                                q_row_idx = decode_q_row_idx
+                            else:
+                                q_head_idx = q_head_idx_frag[mma_q, row_slot]
+                                q_row_idx = q_row_idx_frag[mma_q, row_slot]
+                                token_local = q_token_local[mma_q, row_slot]
                             merged_m = Float32(-Float32.inf)
                             merged_d = Float32(1.0)
                             inv_d = Float32(0.0)
@@ -3800,7 +3834,11 @@ class PagedForwardKernel:
                                             out_high0, out_high1
                                         )
                                     elif const_expr(self.split_kv):
-                                        partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                        partial_row_idx = (
+                                            decode_partial_row_idx
+                                            if const_expr(decode_row_metadata_fastpath)
+                                            else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                        )
                                         mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
                                         mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
                                         mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
@@ -3811,24 +3849,32 @@ class PagedForwardKernel:
                                         mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
                                         mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
                             if valid_row_store and lane_pair_base == 0:
-                                row_lse = (
-                                    Float32(-Float32.inf)
-                                    if merged_m == -Float32.inf
-                                    else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                            row_lse = (
+                                Float32(-Float32.inf)
+                                if merged_m == -Float32.inf
+                                else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                            )
+                            if const_expr(self.split_kv):
+                                partial_row_idx = (
+                                    decode_partial_row_idx
+                                    if const_expr(decode_row_metadata_fastpath)
+                                    else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
                                 )
-                                if const_expr(self.split_kv):
-                                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                                    mLSE[partial_row_idx, q_head_idx] = row_lse
-                                else:
-                                    mLSE[q_head_idx, q_row_idx] = row_lse
+                                mLSE[partial_row_idx, q_head_idx] = row_lse
+                            else:
+                                mLSE[q_head_idx, q_row_idx] = row_lse
         else:
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 for row_slot in cutlass.range_constexpr(2):
                     packed_row_local = row_local_idx[mma_q, row_slot]
-                    q_head_idx = q_head_idx_frag[mma_q, row_slot]
-                    q_row_idx = q_row_idx_frag[mma_q, row_slot]
-                    token_local = q_token_local[mma_q, row_slot]
                     valid_row_store = row_valid[mma_q, row_slot] != 0
+                    if const_expr(decode_row_metadata_fastpath):
+                        q_head_idx = decode_q_head_base + packed_row_local
+                        q_row_idx = decode_q_row_idx
+                    else:
+                        q_head_idx = q_head_idx_frag[mma_q, row_slot]
+                        q_row_idx = q_row_idx_frag[mma_q, row_slot]
+                        token_local = q_token_local[mma_q, row_slot]
                     merged_m = Float32(-Float32.inf)
                     merged_d = Float32(1.0)
                     inv_d = Float32(0.0)
@@ -3864,7 +3910,11 @@ class PagedForwardKernel:
                                     out_high0, out_high1
                                 )
                             elif const_expr(self.split_kv):
-                                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                partial_row_idx = (
+                                    decode_partial_row_idx
+                                    if const_expr(decode_row_metadata_fastpath)
+                                    else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                )
                                 mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
                                 mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
                                 mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
@@ -3881,7 +3931,11 @@ class PagedForwardKernel:
                             else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
                         )
                         if const_expr(self.split_kv):
-                            partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                            partial_row_idx = (
+                                decode_partial_row_idx
+                                if const_expr(decode_row_metadata_fastpath)
+                                else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                            )
                             mLSE[partial_row_idx, q_head_idx] = row_lse
                         else:
                             mLSE[q_head_idx, q_row_idx] = row_lse
@@ -3894,14 +3948,22 @@ class PagedForwardKernel:
             while decode_chunk_linear_idx < decode_total_chunks:
                 packed_row_local = decode_chunk_linear_idx // decode_chunks_per_row
                 chunk_idx = decode_chunk_linear_idx - packed_row_local * decode_chunks_per_row
-                packed_q_idx = packed_tile_start + packed_row_local
-                token_local = packed_q_idx // group_size
-                q_group_lane = packed_q_idx - token_local * group_size
-                q_head_idx = kv_head_idx * group_size + q_group_lane
-                q_row_idx = q_start + token_local
+                if const_expr(decode_row_metadata_fastpath):
+                    q_head_idx = decode_q_head_base + packed_row_local
+                    q_row_idx = decode_q_row_idx
+                else:
+                    packed_q_idx = packed_tile_start + packed_row_local
+                    token_local = packed_q_idx // group_size
+                    q_group_lane = packed_q_idx - token_local * group_size
+                    q_head_idx = kv_head_idx * group_size + q_group_lane
+                    q_row_idx = q_start + token_local
                 u32_idx = chunk_idx * 4
                 if const_expr(self.split_kv):
-                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                    partial_row_idx = (
+                        decode_partial_row_idx
+                        if const_expr(decode_row_metadata_fastpath)
+                        else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                    )
                     gmem_elem_offset = (
                         ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
                         + chunk_idx * 8
@@ -3928,11 +3990,15 @@ class PagedForwardKernel:
             while split_chunk_linear_idx < split_total_chunks:
                 packed_row_local = split_chunk_linear_idx // split_chunks_per_row
                 chunk_idx = split_chunk_linear_idx - packed_row_local * split_chunks_per_row
-                packed_q_idx = packed_tile_start + packed_row_local
-                token_local = packed_q_idx // group_size
-                q_group_lane = packed_q_idx - token_local * group_size
-                q_head_idx = kv_head_idx * group_size + q_group_lane
-                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                if const_expr(decode_row_metadata_fastpath):
+                    q_head_idx = decode_q_head_base + packed_row_local
+                    partial_row_idx = decode_partial_row_idx
+                else:
+                    packed_q_idx = packed_tile_start + packed_row_local
+                    token_local = packed_q_idx // group_size
+                    q_group_lane = packed_q_idx - token_local * group_size
+                    q_head_idx = kv_head_idx * group_size + q_group_lane
+                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
                 u32_idx = chunk_idx * 4
                 gmem_elem_offset = (
                     ((partial_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
@@ -3955,11 +4021,15 @@ class PagedForwardKernel:
             while final_chunk_linear_idx < final_total_chunks:
                 packed_row_local = final_chunk_linear_idx // final_chunks_per_row
                 chunk_idx = final_chunk_linear_idx - packed_row_local * final_chunks_per_row
-                packed_q_idx = packed_tile_start + packed_row_local
-                token_local = packed_q_idx // group_size
-                q_group_lane = packed_q_idx - token_local * group_size
-                q_head_idx = kv_head_idx * group_size + q_group_lane
-                q_row_idx = q_start + token_local
+                if const_expr(decode_row_metadata_fastpath):
+                    q_head_idx = decode_q_head_base + packed_row_local
+                    q_row_idx = decode_q_row_idx
+                else:
+                    packed_q_idx = packed_tile_start + packed_row_local
+                    token_local = packed_q_idx // group_size
+                    q_group_lane = packed_q_idx - token_local * group_size
+                    q_head_idx = kv_head_idx * group_size + q_group_lane
+                    q_row_idx = q_start + token_local
                 u32_idx = chunk_idx * 4
                 gmem_elem_offset = (
                     ((q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
