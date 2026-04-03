@@ -3476,48 +3476,22 @@ class PagedForwardKernel:
                     scale1 = Float32(0.0)
                     scale2 = Float32(0.0)
                     scale3 = Float32(0.0)
-                    if part_m0 != -Float32.inf:
-                        merged_m = part_m0
-                        merged_d = part_d0
-                    if part_m1 != -Float32.inf:
-                        if merged_m == -Float32.inf:
-                            merged_m = part_m1
-                            merged_d = part_d1
-                        else:
-                            new_m = attention_utils.fmax(merged_m, part_m1)
-                            merged_d = Float32(
-                                merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
-                                + part_d1 * _exp2_approx_ftz_f32(part_m1 - new_m)
-                            )
-                            merged_m = new_m
-                    if part_m2 != -Float32.inf:
-                        if merged_m == -Float32.inf:
-                            merged_m = part_m2
-                            merged_d = part_d2
-                        else:
-                            new_m = attention_utils.fmax(merged_m, part_m2)
-                            merged_d = Float32(
-                                merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
-                                + part_d2 * _exp2_approx_ftz_f32(part_m2 - new_m)
-                            )
-                            merged_m = new_m
-                    if part_m3 != -Float32.inf:
-                        if merged_m == -Float32.inf:
-                            merged_m = part_m3
-                            merged_d = part_d3
-                        else:
-                            new_m = attention_utils.fmax(merged_m, part_m3)
-                            merged_d = Float32(
-                                merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
-                                + part_d3 * _exp2_approx_ftz_f32(part_m3 - new_m)
-                            )
-                            merged_m = new_m
+                    merged_m = attention_utils.fmax(
+                        attention_utils.fmax(part_m0, part_m1),
+                        attention_utils.fmax(part_m2, part_m3),
+                    )
                     if merged_m != -Float32.inf:
-                        inv_d = cute.arch.rcp_approx(merged_d)
                         scale0 = Float32(0.0) if part_m0 == -Float32.inf else _exp2_approx_ftz_f32(part_m0 - merged_m)
                         scale1 = Float32(0.0) if part_m1 == -Float32.inf else _exp2_approx_ftz_f32(part_m1 - merged_m)
                         scale2 = Float32(0.0) if part_m2 == -Float32.inf else _exp2_approx_ftz_f32(part_m2 - merged_m)
                         scale3 = Float32(0.0) if part_m3 == -Float32.inf else _exp2_approx_ftz_f32(part_m3 - merged_m)
+                        merged_d = Float32(
+                            part_d0 * scale0
+                            + part_d1 * scale1
+                            + part_d2 * scale2
+                            + part_d3 * scale3
+                        )
+                        inv_d = cute.arch.rcp_approx(merged_d)
 
                     for mma_d in cutlass.range_constexpr(num_mma_d_vo):
                         dim_low = mma_d * 16 + lane_pair_base
