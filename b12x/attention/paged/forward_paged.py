@@ -3406,13 +3406,14 @@ class PagedForwardKernel:
         if const_expr(self.traits.num_warps_kv > 1):
             if const_expr(decode_qwen_single_row_fastpath):
                 packed_row_local = Int32(lane_group)
-                if warp_kv_idx != 0:
-                    if lane_pair_base == 0:
-                        sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[0, 0]
-                        sSyncMD[warp_kv_idx, packed_row_local, 1] = d_frag[0, 0]
-                    for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-                        dim_low = mma_d * 16 + lane_pair_base
-                        dim_high = dim_low + 8
+                spill_qwen_partial = warp_kv_idx != 0
+                if lane_pair_base == 0 and spill_qwen_partial:
+                    sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[0, 0]
+                    sSyncMD[warp_kv_idx, packed_row_local, 1] = d_frag[0, 0]
+                for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                    dim_low = mma_d * 16 + lane_pair_base
+                    dim_high = dim_low + 8
+                    if spill_qwen_partial:
                         sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[0, mma_d, 0]
                         sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, 1]
                         sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, 4]
