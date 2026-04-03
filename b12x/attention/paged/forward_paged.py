@@ -4323,20 +4323,20 @@ class PagedForwardKernel:
                                         mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
                                         mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
                             if valid_row_store and lane_pair_base == 0:
-                            row_lse = (
-                                Float32(-Float32.inf)
-                                if merged_m == -Float32.inf
-                                else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
-                            )
-                            if const_expr(self.split_kv):
-                                partial_row_idx = (
-                                    decode_partial_row_idx
-                                    if const_expr(decode_row_metadata_fastpath)
-                                    else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                row_lse = (
+                                    Float32(-Float32.inf)
+                                    if merged_m == -Float32.inf
+                                    else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
                                 )
-                                mLSE[partial_row_idx, q_head_idx] = row_lse
-                            else:
-                                mLSE[q_head_idx, q_row_idx] = row_lse
+                                if const_expr(self.split_kv):
+                                    partial_row_idx = (
+                                        decode_partial_row_idx
+                                        if const_expr(decode_row_metadata_fastpath)
+                                        else request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                    )
+                                    mLSE[partial_row_idx, q_head_idx] = row_lse
+                                else:
+                                    mLSE[q_head_idx, q_row_idx] = row_lse
         else:
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 for row_slot in cutlass.range_constexpr(2):
