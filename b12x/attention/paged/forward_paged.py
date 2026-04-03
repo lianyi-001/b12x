@@ -3150,21 +3150,48 @@ class PagedForwardKernel:
                         )
                     for mma_q in cutlass.range_constexpr(num_mma_q):
                         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                            for reg_id in cutlass.range_constexpr(8):
-                                row_slot = (reg_id % 4) // 2
-                                key_local = (
-                                    warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
-                                )
-                                valid = row_valid[mma_q, row_slot] != 0
-                                if valid:
-                                    valid = valid and key_local < tile_tokens
-                                if const_expr(not decode_row_metadata_fastpath):
-                                    if valid:
-                                        valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
-                                if valid:
-                                    frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                            if const_expr(decode_row_metadata_fastpath and self.traits.num_warps_q == 1 and num_mma_q == 1):
+                                if group_size == Int32(8):
+                                    for reg_id in cutlass.range_constexpr(8):
+                                        if const_expr(((reg_id % 4) // 2) == 0):
+                                            key_local = (
+                                                warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                            )
+                                            if key_local < tile_tokens:
+                                                frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                            else:
+                                                frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                        else:
+                                            frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
                                 else:
-                                    frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                                    for reg_id in cutlass.range_constexpr(8):
+                                        row_slot = (reg_id % 4) // 2
+                                        key_local = (
+                                            warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                        )
+                                        valid = row_valid[mma_q, row_slot] != 0
+                                        if valid:
+                                            valid = valid and key_local < tile_tokens
+                                        if valid:
+                                            frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                        else:
+                                            frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                            else:
+                                for reg_id in cutlass.range_constexpr(8):
+                                    row_slot = (reg_id % 4) // 2
+                                    key_local = (
+                                        warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                    )
+                                    valid = row_valid[mma_q, row_slot] != 0
+                                    if valid:
+                                        valid = valid and key_local < tile_tokens
+                                    if const_expr(not decode_row_metadata_fastpath):
+                                        if valid:
+                                            valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                    if valid:
+                                        frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                    else:
+                                        frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
                 else:
                     literal_key_base = Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base
                     frag_S = cute.make_rmem_tensor(
