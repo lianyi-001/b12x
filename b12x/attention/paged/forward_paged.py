@@ -1757,6 +1757,7 @@ class PagedForwardKernel:
         *,
         traits: PagedForwardTraits,
         split_kv: bool,
+        single_request_decode_graph: bool = False,
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
     ):
@@ -1766,6 +1767,7 @@ class PagedForwardKernel:
         self.dtype_o = dtype_o
         self.traits = traits
         self.split_kv = split_kv
+        self.single_request_decode_graph = single_request_decode_graph
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2257,9 +2259,14 @@ class PagedForwardKernel:
         block_valid = mBlockValidMask[work_idx]
         if block_valid == Int32(0):
             _exit_thread()
-        request_idx = mRequestIndices[work_idx]
-        qo_tile_idx = mQoTileIndices[work_idx]
-        kv_tile_idx = mKvTileIndices[work_idx]
+        if const_expr(self.single_request_decode_graph):
+            request_idx = Int32(0)
+            qo_tile_idx = Int32(0)
+            kv_tile_idx = work_idx
+        else:
+            request_idx = mRequestIndices[work_idx]
+            qo_tile_idx = mQoTileIndices[work_idx]
+            kv_tile_idx = mKvTileIndices[work_idx]
         q_start = mCuSeqlensQ[request_idx]
         q_end = mCuSeqlensQ[request_idx + 1]
         qo_len = q_end - q_start
