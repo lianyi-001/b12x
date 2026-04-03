@@ -273,6 +273,7 @@ def _build_forward_kernel(
     regularized_decode_graph: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
+    decode_only: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -286,6 +287,7 @@ def _build_forward_kernel(
         regularized_decode_graph=regularized_decode_graph,
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
+        decode_only=decode_only,
     )
 
 
@@ -393,6 +395,7 @@ def paged_attention_forward(
             regularized_decode_graph,
             mxfp8_turbo,
             enable_mxfp8_pv,
+            plan.mode == "decode",
         )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse

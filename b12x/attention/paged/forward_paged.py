@@ -1762,6 +1762,7 @@ class PagedForwardKernel:
         regularized_decode_graph: bool = False,
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
+        decode_only: bool = False,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -1772,6 +1773,7 @@ class PagedForwardKernel:
         self.single_request_decode_graph = single_request_decode_graph
         self.single_qtile_decode_graph = single_qtile_decode_graph
         self.regularized_decode_graph = regularized_decode_graph
+        self.decode_only = decode_only
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2269,6 +2271,7 @@ class PagedForwardKernel:
     ):
         lane, warp_q_idx, warp_kv_idx = cute.arch.thread_idx()
         block_x, kv_head_idx, block_z = cute.arch.block_idx()
+        group_size = mQ.shape[1] // mKCache.shape[2]
         if const_expr(self.regularized_decode_graph):
             max_chunks_per_req = Int32(mO.shape[0] // mPageTable.shape[0])
             request_idx = Int32(block_z)
@@ -2308,6 +2311,13 @@ class PagedForwardKernel:
                 qo_len = Int32(1)
                 request_partial_start = mOIndptr[request_idx]
                 request_partial_end = mOIndptr[request_idx + 1]
+            elif const_expr(self.decode_only):
+                request_idx = mRequestIndices[work_idx]
+                kv_tile_idx = mKvTileIndices[work_idx]
+                q_start = request_idx
+                qo_len = Int32(1)
+                request_partial_start = mOIndptr[request_idx]
+                request_partial_end = mOIndptr[request_idx + 1]
             else:
                 request_idx = mRequestIndices[work_idx]
                 qo_tile_idx = mQoTileIndices[work_idx]
@@ -2318,11 +2328,18 @@ class PagedForwardKernel:
                 request_partial_start = mOIndptr[request_idx]
                 request_partial_end = mOIndptr[request_idx + 1]
             cache_len = mCacheSeqlens[request_idx]
-        group_size = mQ.shape[1] // mKCache.shape[2]
         packed_qo_len = qo_len * group_size
         if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
             packed_tile_start = Int32(0)
             packed_tile_end = packed_qo_len
+        elif const_expr(self.decode_only):
+            packed_tile_start = Int32(0)
+            packed_tile_limit = self.traits.cta_tile_q
+            packed_tile_end = cutlass.select_(
+                packed_tile_limit < packed_qo_len,
+                packed_tile_limit,
+                packed_qo_len,
+            )
         else:
             packed_tile_start = qo_tile_idx * self.traits.cta_tile_q
             packed_tile_limit = packed_tile_start + self.traits.cta_tile_q
