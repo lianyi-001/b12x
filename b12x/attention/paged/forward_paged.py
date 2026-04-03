@@ -1187,14 +1187,16 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, 16, upcast_stride_k)
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
+                # MXFP8 m16n8k32 expects the A operand interleaved by row pair, not
+                # in the original BF16 register order.
                 qa0 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 0]) & mask16) | (
                     (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 0]) & mask16) << shift16
                 )
-                qa1 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
-                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) << shift16
-                )
-                qa2 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) | (
+                qa1 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) | (
                     (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 2]) & mask16) << shift16
+                )
+                qa2 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) << shift16
                 )
                 qa3 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) | (
                     (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 3]) & mask16) << shift16
