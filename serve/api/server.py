@@ -21,12 +21,13 @@ from serve.runtime_warnings import import_torch_safely
 
 torch = import_torch_safely()
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from fastapi.responses import JSONResponse
 
+from serve.api.webui import build_chat_page
 from serve.engine.sampling import SamplingParams
 from serve.engine.serving import ServingEngine
 from serve.logging import configure_logging, get_logger
@@ -43,7 +44,12 @@ class CompletionRequest(BaseModel):
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = Field(default=-1, alias="top_k")
+    min_p: float = 0.0
     repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    seed: int | None = None
+    logprobs: int | None = None
     stream: bool = False
     stop: list[str] | None = None
     timeout: float | None = None  # Request timeout in seconds.
@@ -63,7 +69,12 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = Field(default=-1, alias="top_k")
+    min_p: float = 0.0
     repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    seed: int | None = None
+    logprobs: int | None = None
     stream: bool = False
     stop: list[str] | None = None
     timeout: float | None = None
@@ -79,6 +90,8 @@ class ServingApp:
     def __init__(
         self,
         engine: ServingEngine,
+        *,
+        enable_webui: bool = False,
     ):
         self.engine = engine
         self.model_name = engine.model_path.split("/")[-1]
@@ -87,6 +100,9 @@ class ServingApp:
         self.app.add_api_route("/v1/chat/completions", self._chat_completions, methods=["POST"])
         self.app.add_api_route("/v1/models", self._models, methods=["GET"])
         self.app.add_api_route("/health", self._health, methods=["GET"])
+        if enable_webui:
+            self.app.add_api_route("/", self._webui_root, methods=["GET"], response_class=RedirectResponse)
+            self.app.add_api_route("/ui", self._webui, methods=["GET"], response_class=HTMLResponse)
         self.app.add_exception_handler(Exception, self._handle_error)
 
     async def _handle_error(self, request, exc):
@@ -101,11 +117,12 @@ class ServingApp:
         import serve
         loop_health = self.engine.server_loop_health()
         return {
-            "status": "ok" if loop_health["healthy"] else "error",
+            "status": loop_health["status"],
             "version": serve.__version__,
             "model": self.model_name,
             "scheduler": self.engine.scheduler.stats,
             "server_loop": loop_health,
+            "runtime_policy": self.engine.runtime_policy(),
         }
 
     async def _models(self):
@@ -117,6 +134,12 @@ class ServingApp:
                 "owned_by": "b12x",
             }],
         }
+
+    async def _webui_root(self):
+        return RedirectResponse(url="/ui", status_code=307)
+
+    async def _webui(self):
+        return HTMLResponse(build_chat_page(model_name=self.model_name))
 
     # -- /v1/completions ---------------------------------------------------
 
@@ -132,6 +155,7 @@ class ServingApp:
         input_ids = self.engine.tokenizer(req.prompt, return_tensors="pt").input_ids[0].tolist()
         request = self.engine.submit(input_ids, params, timeout_s=req.timeout)
         await asyncio.to_thread(request._done_event.wait)
+        self._raise_for_failed_request(request)
 
         text = self.engine.tokenizer.decode(request.output_ids, skip_special_tokens=True)
         result = self.engine._to_result(request)
@@ -155,6 +179,7 @@ class ServingApp:
         input_ids = self.engine.tokenizer(formatted, return_tensors="pt").input_ids[0].tolist()
         request = self.engine.submit(input_ids, params, timeout_s=req.timeout)
         await asyncio.to_thread(request._done_event.wait)
+        self._raise_for_failed_request(request)
 
         text = self.engine.tokenizer.decode(request.output_ids, skip_special_tokens=True)
         result = self.engine._to_result(request)
@@ -244,6 +269,16 @@ class ServingApp:
     # -- helpers -----------------------------------------------------------
 
     def _to_sampling_params(self, req) -> SamplingParams:
+        unsupported = []
+        if getattr(req, "seed", None) is not None:
+            unsupported.append("seed")
+        if getattr(req, "logprobs", None) is not None:
+            unsupported.append("logprobs")
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported request fields: {', '.join(unsupported)}",
+            )
         stop_sequences = None
         if req.stop:
             stop_sequences = []
@@ -255,10 +290,29 @@ class ServingApp:
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=req.top_k,
+            min_p=req.min_p,
             repetition_penalty=req.repetition_penalty,
+            presence_penalty=req.presence_penalty,
+            frequency_penalty=req.frequency_penalty,
             max_new_tokens=req.max_tokens,
             stop_sequences=stop_sequences,
         )
+
+    def _raise_for_failed_request(self, request) -> None:
+        reason = request.finished_reason
+        if reason in {None, "length", "stop"}:
+            return
+        if reason == "context_too_long":
+            raise HTTPException(status_code=400, detail="prompt exceeds the configured KV-cache budget")
+        if reason == "timeout":
+            raise HTTPException(status_code=504, detail="request timed out before completion")
+        if reason == "oom":
+            raise HTTPException(status_code=503, detail="server ran out of cache capacity for this request")
+        if reason == "engine_error":
+            raise HTTPException(status_code=503, detail="generation failed because the engine became unhealthy")
+        if reason == "cancelled":
+            raise HTTPException(status_code=499, detail="request was cancelled")
+        raise HTTPException(status_code=500, detail=f"generation failed with reason={reason}")
 
     def _completion_response(self, text, result, obj_type):
         return {

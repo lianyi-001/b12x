@@ -70,9 +70,11 @@ class B12xPagedAttention(torch.nn.Module):
         page_size: int,
         num_cache_pages: int,
         max_total_q: int,
+        max_batch: int | None = None,
+        max_page_table_width: int | None = None,
         use_cuda_graph: bool = False,
     ) -> dict[str, PagedAttentionWorkspace]:
-        """Allocate exact-shape decode/extend workspaces for this attention module."""
+        """Allocate decode/extend workspaces for this attention module."""
         common = dict(
             device=device,
             dtype=self.qkv_weight.dtype,
@@ -86,9 +88,23 @@ class B12xPagedAttention(torch.nn.Module):
             num_cache_pages=num_cache_pages,
             use_cuda_graph=use_cuda_graph,
         )
+        if max_batch is None:
+            max_batch = max_total_q
+        if max_page_table_width is None:
+            max_page_table_width = num_cache_pages
+        extend_workspace = (
+            PagedAttentionWorkspace.for_contract(mode="extend", **common)
+            if use_cuda_graph
+            else PagedAttentionWorkspace.for_eager_extend_capacity(
+                mode="extend",
+                max_batch=max_batch,
+                max_page_table_width=max_page_table_width,
+                **common,
+            )
+        )
         return {
             "decode": PagedAttentionWorkspace.for_contract(mode="decode", **common),
-            "extend": PagedAttentionWorkspace.for_contract(mode="extend", **common),
+            "extend": extend_workspace,
         }
 
     def set_workspace(self, workspace: dict[str, PagedAttentionWorkspace]) -> None:

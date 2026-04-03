@@ -17,11 +17,10 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
-
 from serve.engine.step_state import StepState
 from serve.model.attention import B12xPagedAttention
 from serve.model.ops import rms_norm
+from serve.model.workspaces import get_b12x_moe_workspace_pool
 
 
 class CapturedGraph:
@@ -66,7 +65,7 @@ class CapturedGraph:
 
         # Per-graph workspaces.
         self._attn_workspaces = []
-        self._moe_workspace = allocate_tp_moe_workspace_pool()
+        self._moe_workspace = get_b12x_moe_workspace_pool(device)
 
         # Per-layer output buffers for b12x kernels.
         layer_types = getattr(cfg, 'layer_types', None)
@@ -86,9 +85,12 @@ class CapturedGraph:
                             page_size=pool.page_size,
                             num_cache_pages=pool.num_pages,
                             max_total_q=total_q,
+                            max_batch=bs,
+                            max_page_table_width=pool.num_pages,
                             use_cuda_graph=True,
                         )
                     )
+                    self._prime_attn_workspace(self._attn_workspaces[-1])
                 else:
                     self._attn_workspaces.append(None)
                 kv_layer_idx += 1
@@ -101,6 +103,23 @@ class CapturedGraph:
         ]
 
         self.graph: Optional[torch.cuda.CUDAGraph] = None
+
+    def _prime_attn_workspace(self, workspace_set) -> None:
+        """Prime graph workspaces with the same capacity APIs used by sglang."""
+        if workspace_set is None:
+            return
+        workspace_set["decode"].prepare_decode_graph_replay_state(
+            batch=self.bs,
+            total_q_capacity=self.bs,
+            max_page_table_width=self.pool.num_pages,
+            max_cache_page_count=self.pool.num_pages,
+        )
+        workspace_set["extend"].prepare_for_capacity(
+            batch=self.bs,
+            total_q_capacity=self.bs * self.tokens_per_req,
+            max_page_table_width=self.pool.num_pages,
+            max_cache_seqlen=self.pool.num_pages * self.pool.page_size,
+        )
 
     def capture(self) -> None:
         """Warmup and capture the graph."""
@@ -211,7 +230,6 @@ class CapturedGraph:
             layer.set_moe_output_buffer(self._moe_outputs[i])
 
     def _prepare_attn_workspaces(self) -> None:
-        post_write_seqlens = self.pre_write + (self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1])
         mode = "decode" if self.tokens_per_req == 1 else "extend"
         for workspace_set in self._attn_workspaces:
             if workspace_set is None:
@@ -219,7 +237,7 @@ class CapturedGraph:
             workspace = workspace_set[mode]
             workspace.prepare_for_cuda_graph_replay(
                 self.page_table,
-                post_write_seqlens,
+                self.cache_seqlens,
                 self.cu_seqlens_q,
             )
 

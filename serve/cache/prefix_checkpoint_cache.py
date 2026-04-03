@@ -177,7 +177,7 @@ class PrefixCheckpointCache:
         self.state_arena.restore_snapshot(checkpoint.state_snapshot_slot, live_slot)
         return True
 
-    def evict(self, num_pages: int) -> int:
+    def evict(self, num_pages: int, *, on_evict=None) -> int:
         """Evict unlocked leaf checkpoints until *num_pages* pages are freed."""
         freed = 0
         heap = [
@@ -201,6 +201,8 @@ class PrefixCheckpointCache:
                 self._total_cached_pages -= len(checkpoint.tail_page_ids)
             if checkpoint.state_snapshot_slot >= 0 and self.state_arena is not None:
                 self.state_arena.free_snapshot(checkpoint.state_snapshot_slot)
+            if on_evict is not None:
+                on_evict(checkpoint)
 
             del self.by_prefix[(checkpoint.prefix_len, checkpoint.prefix_digest)]
             checkpoint.tail_page_ids = ()

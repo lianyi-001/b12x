@@ -24,19 +24,37 @@ from serve.tp.launch import launch_tp
 
 LOGGER = get_logger(__name__)
 
+
+def _parse_graph_batch_sizes(spec: str | None, *, enabled: bool) -> list[int]:
+    if not enabled:
+        return []
+    if spec is None:
+        return [1, 2, 4, 8]
+    values = [int(value) for value in spec.split(",") if value.strip()]
+    if not values:
+        return []
+    return sorted(set(values))
+
+
 def _run(tp_group, model_path, max_tokens, chat, prompt_text, temperature, top_p, top_k, rep_penalty,
          serve_mode=False, port=8000, capture_prefill_graph=False, enable_thinking=True, no_graph=False,
-         compile_layers=False, load_backend="auto", log_level="info"):
+         compile_layers=False, load_backend="auto", log_level="info", graph_batch_sizes=None,
+         prefill_chunk_size=512, max_running=None, max_waiting=256, max_prefill_tokens=4096,
+         enable_webui=False):
     rank = tp_group.rank if tp_group else 0
     device = f"cuda:{tp_group.device.index}" if tp_group else "cuda"
     configure_logging(log_level, rank=rank)
 
-    graph_sizes = [1, 2, 4, 8] if not no_graph else []
+    graph_sizes = _parse_graph_batch_sizes(graph_batch_sizes, enabled=not no_graph)
     engine = ServingEngine(model_path, device=device, tp_group=tp_group,
                            load_backend=load_backend,
                            graph_batch_sizes=graph_sizes,
+                           prefill_chunk_size=prefill_chunk_size,
                            capture_prefill_graph=capture_prefill_graph,
-                           compile_layers=compile_layers)
+                           compile_layers=compile_layers,
+                           max_running=max_running,
+                           max_waiting=max_waiting,
+                           max_prefill_tokens=max_prefill_tokens)
 
     if rank != 0:
         engine.run_follower()
@@ -44,7 +62,7 @@ def _run(tp_group, model_path, max_tokens, chat, prompt_text, temperature, top_p
 
     if serve_mode:
         from serve.api.server import ServingApp
-        app = ServingApp(engine)
+        app = ServingApp(engine, enable_webui=enable_webui)
         LOGGER.info(f"Starting API server on port {port}")
         try:
             app.run(port=port)
@@ -160,9 +178,41 @@ def main():
     parser.add_argument("--top-k", type=int, default=-1, help="Top-K sampling (-1=disabled)")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty")
     parser.add_argument("--serve", action="store_true", help="Start HTTP API server")
+    parser.add_argument("--web-ui", action="store_true",
+                        help="Enable the built-in browser chat UI at /ui (server mode only)")
     parser.add_argument("--port", type=int, default=8000, help="API server port")
     parser.add_argument("--capture-prefill-graph", action="store_true",
                         help="Capture CUDA graphs for prefill chunks (needs more memory)")
+    parser.add_argument(
+        "--graph-batch-sizes",
+        type=str,
+        default=None,
+        help="Comma-separated CUDA graph batch sizes (default: 1,2,4,8)",
+    )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=512,
+        help="Chunk size for long-prompt prefill scheduling and graph capture",
+    )
+    parser.add_argument(
+        "--max-running",
+        type=int,
+        default=None,
+        help="Maximum concurrent running+prefilling requests",
+    )
+    parser.add_argument(
+        "--max-waiting",
+        type=int,
+        default=256,
+        help="Maximum queued requests before submit() rejects new work",
+    )
+    parser.add_argument(
+        "--max-prefill-tokens",
+        type=int,
+        default=4096,
+        help="Maximum batched prompt tokens admitted in one prefill step",
+    )
     parser.add_argument("--no-think", action="store_true",
                         help="Disable thinking/reasoning for reasoning models (Qwen3.5)")
     parser.add_argument("--no-graph", action="store_true",
@@ -194,7 +244,9 @@ def main():
         args=(args.model_path, args.max_tokens, args.chat, args.prompt,
               args.temperature, args.top_p, args.top_k, args.repetition_penalty,
               args.serve, args.port, args.capture_prefill_graph,
-              not args.no_think, args.no_graph, args.compile, args.load_backend, args.log_level),
+              not args.no_think, args.no_graph, args.compile, args.load_backend, args.log_level,
+              args.graph_batch_sizes, args.prefill_chunk_size, args.max_running,
+              args.max_waiting, args.max_prefill_tokens, args.web_ui),
         gpu_ids=gpu_ids,
     )
 

@@ -6,12 +6,13 @@ Parent process manages worker lifetimes and handles cleanup.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import datetime
 import os
 import signal
 import sys
+import tempfile
 from typing import Optional
-
-import datetime
 
 from serve.runtime_warnings import import_torch_safely
 
@@ -21,12 +22,71 @@ import torch.multiprocessing as mp
 
 from serve.tp.group import TPGroup
 
+_ACTIVE_TP_MONITOR = None
+
+
+@dataclass
+class TPFollowerMonitor:
+    world_size: int
+    gpu_ids: list[int]
+    followers: list[mp.Process]
+
+    def health(self) -> dict:
+        workers = []
+        fatal = False
+        details = []
+        for rank, proc in enumerate(self.followers, start=1):
+            exitcode = proc.exitcode
+            alive = proc.is_alive()
+            worker = {
+                "rank": rank,
+                "gpu_id": self.gpu_ids[rank],
+                "pid": proc.pid,
+                "alive": alive,
+                "exitcode": exitcode,
+                "log_path": _rank_log_path(rank),
+            }
+            if exitcode is not None:
+                worker["error"] = f"rank {rank} exited unexpectedly with code {exitcode}"
+                details.append(worker["error"])
+                fatal = True
+            workers.append(worker)
+        return {
+            "world_size": self.world_size,
+            "healthy": not fatal,
+            "fatal": fatal,
+            "summary": "; ".join(details) if details else None,
+            "workers": workers,
+        }
+
 
 def _find_free_port() -> int:
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def _rank_log_path(rank: int) -> str:
+    log_dir = os.environ.get("B12X_TP_LOG_DIR", tempfile.gettempdir())
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"b12x-tp-rank{rank}.log")
+
+
+def _set_active_tp_monitor(monitor) -> None:
+    global _ACTIVE_TP_MONITOR
+    _ACTIVE_TP_MONITOR = monitor
+
+
+def _clear_active_tp_monitor() -> None:
+    global _ACTIVE_TP_MONITOR
+    _ACTIVE_TP_MONITOR = None
+
+
+def get_active_tp_health() -> dict | None:
+    if _ACTIVE_TP_MONITOR is None:
+        return None
+    return _ACTIVE_TP_MONITOR.health()
 
 
 def launch_tp(
@@ -63,11 +123,13 @@ def launch_tp(
         )
         p.start()
         followers.append(p)
+    _set_active_tp_monitor(TPFollowerMonitor(world_size=world_size, gpu_ids=gpu_ids, followers=followers))
 
     # Run rank 0 in the current process (preserves stdin for interactive mode).
     try:
         _worker(0, world_size, gpu_ids, port, fn, args)
     finally:
+        _clear_active_tp_monitor()
         for p in followers:
             if p.is_alive():
                 p.kill()
@@ -81,15 +143,16 @@ def _worker(rank, world_size, gpu_ids, port, fn, args):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
 
-    # Silence non-rank-0 completely.
+    # Redirect follower logs to rank-specific files so failures are debuggable.
     if rank != 0:
         import warnings, logging
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull_fd, 1)  # Replace fd 1 (stdout).
-        os.dup2(devnull_fd, 2)  # Replace fd 2 (stderr) — catches C++ output too.
-        os.close(devnull_fd)
-        sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
+        log_path = _rank_log_path(rank)
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+        os.close(log_fd)
+        sys.stdout = open(log_path, "a")
+        sys.stderr = open(log_path, "a")
         warnings.filterwarnings("ignore")
         logging.disable(logging.CRITICAL)
 

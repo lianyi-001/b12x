@@ -35,6 +35,12 @@ class BatchStep:
 class BatchScheduler:
     """Continuous batching with chunked prefill and graph-aware decode."""
 
+    SSM_ALLOC_LIVE = 1
+    SSM_RESTORE_SNAPSHOT = 2
+    SSM_CAPTURE_SNAPSHOT = 3
+    SSM_FREE_LIVE = 4
+    SSM_FREE_SNAPSHOT = 5
+
     def __init__(
         self,
         cache: PrefixCheckpointCache,
@@ -73,6 +79,7 @@ class BatchScheduler:
         self.stats_preemptions = 0
         self.stats_evictions = 0
         self.stats_total_finished = 0
+        self._ssm_control_ops: list[tuple[int, int, int, int]] = []
 
     def add_request(self, req: Request) -> None:
         """Submit a new request to the waiting queue.
@@ -157,6 +164,12 @@ class BatchScheduler:
             if extend_len <= 0:
                 extend_len = 1
 
+            if self._request_exceeds_capacity(req):
+                self.waiting.popleft()
+                req._mark_finished("context_too_long")
+                self._record_finished([req])
+                continue
+
             # Long prompt — needs chunking. Can't batch with others.
             if extend_len > self.chunk_size:
                 if to_admit:
@@ -189,10 +202,15 @@ class BatchScheduler:
     def _try_alloc_pages(self, req: Request, match) -> bool:
         """Try to allocate pages and a live linear-state slot for a request."""
         pages_needed = self._pages_needed(req)
+        if pages_needed > self.pool.num_pages:
+            return False
         if pages_needed > self.pool.num_free:
             evictable = self.cache.num_evictable_pages
             if pages_needed <= self.pool.num_free + evictable:
-                self.cache.evict(pages_needed - self.pool.num_free)
+                self.cache.evict(
+                    pages_needed - self.pool.num_free,
+                    on_evict=self._on_evict_checkpoint,
+                )
 
             if self.pool.num_free < pages_needed and self.running:
                 self._preempt_oldest()
@@ -205,7 +223,14 @@ class BatchScheduler:
             if self.ssm_pool.num_free == 0:
                 return False
             req.ssm_slot = self.ssm_pool.alloc(1)[0].item()
+            self._queue_ssm_op(self.SSM_ALLOC_LIVE, req.ssm_slot)
             self.cache.restore_state_snapshot(match.checkpoint, req.ssm_slot)
+            if match.checkpoint is not self.cache.root and match.checkpoint.state_snapshot_slot >= 0:
+                self._queue_ssm_op(
+                    self.SSM_RESTORE_SNAPSHOT,
+                    match.checkpoint.state_snapshot_slot,
+                    req.ssm_slot,
+                )
 
         pages = self.pool.alloc(pages_needed) if pages_needed > 0 else []
         req.page_ids = list(match.page_indices) + pages
@@ -214,6 +239,11 @@ class BatchScheduler:
             self.cache.inc_ref(match.checkpoint)
 
         return True
+
+    def _request_exceeds_capacity(self, req: Request) -> bool:
+        """Return whether *req* can never fit in the configured page budget."""
+        total_pages = (len(req.prompt_ids) + _PAGE_SIZE - 1) // _PAGE_SIZE
+        return total_pages > self.pool.num_pages
 
     def _build_batched_prefill(self, reqs: list[Request]) -> BatchStep:
         """Build a prefill step for multiple short requests at once."""
@@ -406,8 +436,7 @@ class BatchScheduler:
 
         # Free the live linear-state slot.
         if self.ssm_pool is not None and req.ssm_slot >= 0:
-            self.ssm_pool.free(torch.tensor([req.ssm_slot], device=self.device, dtype=torch.int32))
-            req.ssm_slot = -1
+            self._free_live_ssm_slot(req)
 
     # -- helpers -----------------------------------------------------------
 
@@ -491,10 +520,9 @@ class BatchScheduler:
         if uncached_pages:
             self.pool.free(uncached_pages)
         if self.ssm_pool is not None and victim.ssm_slot >= 0:
-            self.ssm_pool.free(torch.tensor([victim.ssm_slot], device=self.device, dtype=torch.int32))
+            self._free_live_ssm_slot(victim)
 
         victim.page_ids = []
-        victim.ssm_slot = -1
         victim.checkpoint_len = 0
         victim.prefill_progress = 0
         victim.cache_len = 0
@@ -542,6 +570,12 @@ class BatchScheduler:
             return
         if not created:
             self.pool.free(list(tail_page_ids))
+        elif self.ssm_pool is not None and checkpoint.state_snapshot_slot >= 0:
+            self._queue_ssm_op(
+                self.SSM_CAPTURE_SNAPSHOT,
+                req.ssm_slot,
+                checkpoint.state_snapshot_slot,
+            )
 
         req.checkpoint = checkpoint
         req.checkpoint_len = checkpoint.prefix_len
@@ -562,11 +596,33 @@ class BatchScheduler:
         except RuntimeError:
             pass
 
-        self.cache.evict(1)
+        self.cache.evict(1, on_evict=self._on_evict_checkpoint)
         try:
             req.page_ids.extend(self.pool.alloc(1))
         except RuntimeError:
             req._mark_finished("oom")
+
+    def _queue_ssm_op(self, op: int, a: int = 0, b: int = 0, c: int = 0) -> None:
+        if self.ssm_pool is None:
+            return
+        self._ssm_control_ops.append((op, a, b, c))
+
+    def _free_live_ssm_slot(self, req: Request) -> None:
+        if self.ssm_pool is None or req.ssm_slot < 0:
+            return
+        slot = req.ssm_slot
+        self.ssm_pool.free(torch.tensor([slot], device=self.device, dtype=torch.int32))
+        self._queue_ssm_op(self.SSM_FREE_LIVE, slot)
+        req.ssm_slot = -1
+
+    def _on_evict_checkpoint(self, checkpoint: PrefixCheckpoint) -> None:
+        if checkpoint.state_snapshot_slot >= 0:
+            self._queue_ssm_op(self.SSM_FREE_SNAPSHOT, checkpoint.state_snapshot_slot)
+
+    def drain_ssm_control_ops(self) -> list[tuple[int, int, int, int]]:
+        ops = self._ssm_control_ops
+        self._ssm_control_ops = []
+        return ops
 
     def _pick_graph_bs(self, bs: int) -> Optional[int]:
         """Pick smallest captured graph size >= bs."""

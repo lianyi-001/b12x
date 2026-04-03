@@ -12,6 +12,10 @@ dependencies = [
   "nvidia-cutlass-dsl[cu13]==4.4.1",
   "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
   "rich>=13",
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "transformers>=4.51",
+  "safetensors>=0.6",
 ]
 
 [project.optional-dependencies]
@@ -23,9 +27,12 @@ dev = [
 requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "setuptools.build_meta"
 
+[project.scripts]
+b12x-serve = "serve.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["b12x*"]
+include = ["b12x*", "serve*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]

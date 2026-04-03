@@ -188,6 +188,55 @@ def test_long_prompt_chunked():
     assert sched.num_running == 1
 
 
+def test_oversize_request_is_rejected_without_blocking_next_request():
+    sched = _make_scheduler(num_pages=2, chunk_size=64)
+
+    oversized = _make_request(1, prompt_len=192, max_new_tokens=2)
+    follower = _make_request(2, prompt_len=32, max_new_tokens=2)
+    sched.add_request(oversized)
+    sched.add_request(follower)
+
+    batch = sched.step()
+    assert batch is not None
+    assert batch.mode == "prefill"
+    assert batch.requests == [follower]
+    assert oversized.is_finished
+    assert oversized.finished_reason == "context_too_long"
+
+
+def test_cached_prefix_request_still_rejected_when_total_page_table_cannot_fit():
+    sched = _make_scheduler(num_pages=2, chunk_size=64)
+
+    shared_prefix = list(range(64))
+    first = Request(
+        rid=1,
+        prompt_ids=list(shared_prefix),
+        sampling_params=SamplingParams(max_new_tokens=1),
+    )
+    sched.add_request(first)
+    batch = sched.step()
+    assert batch is not None
+    sched.process_prefill_chunk([7], batch.requests)
+    assert sched.cache.total_cached_pages == 1
+
+    oversized = Request(
+        rid=2,
+        prompt_ids=list(shared_prefix) + list(range(1000, 1128)),
+        sampling_params=SamplingParams(max_new_tokens=1),
+    )
+    follower = _make_request(3, prompt_len=32, max_new_tokens=1)
+    sched.add_request(oversized)
+    sched.add_request(follower)
+
+    batch = sched.step()
+    assert batch is not None
+    assert batch.mode == "prefill"
+    assert batch.requests == [follower]
+    assert oversized.checkpoint_len == 64
+    assert oversized.is_finished
+    assert oversized.finished_reason == "context_too_long"
+
+
 def test_chunked_prefill_interleaves_with_decode():
     """Decode steps happen between prefill chunks when requests are running."""
     sched = _make_scheduler(chunk_size=64)

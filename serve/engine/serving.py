@@ -26,6 +26,7 @@ from serve.engine.sampling import SamplingParams, sample_batch
 from serve.engine.scheduler import BatchScheduler
 from serve.logging import get_logger, start_startup_session
 from serve.model.loader import load_model, LoadedModel
+from serve.tp.launch import get_active_tp_health
 from serve.tp.group import TPGroup
 
 LOGGER = get_logger(__name__)
@@ -45,14 +46,11 @@ class GenerationResult:
 def _should_enable_prefix_cache(
     *,
     is_hybrid: bool,
-    world_size: int,
     has_state_snapshot_slots: bool,
 ) -> bool:
     """Decide whether prefix-cache reuse is safe for the current engine mode."""
     if not is_hybrid:
         return True
-    if world_size > 1:
-        return False
     return has_state_snapshot_slots
 
 
@@ -141,6 +139,9 @@ class ServingEngine:
         prefill_chunk_size: int = 512,
         capture_prefill_graph: bool = False,
         compile_layers: bool = False,
+        max_running: int | None = None,
+        max_waiting: int = 256,
+        max_prefill_tokens: int = 4096,
     ):
         torch.set_grad_enabled(False)
         self.tp_group = tp_group
@@ -212,12 +213,14 @@ class ServingEngine:
         # terminal checkpoints.
         linear_state_arena = None
         live_ssm_slots = 0
+        graph_sizes = [1, 2, 4, 8] if graph_batch_sizes is None else graph_batch_sizes
+        max_running = max_running or (max(graph_sizes) if graph_sizes else 8)
         if layer_types and any(t == "linear_attention" for t in layer_types):
             from serve.cache.linear_state_arena import LinearStateArena
             from serve.cache.tensor_arena import TensorArena
 
             num_linear_layers = sum(1 for t in layer_types if t == "linear_attention")
-            live_ssm_slots = max(graph_batch_sizes or [8])
+            live_ssm_slots = max_running
             num_heads = self.cfg.linear_num_v_heads
             head_v_dim = self.cfg.linear_head_v_dim
             head_k_dim = self.cfg.linear_head_k_dim
@@ -343,15 +346,22 @@ class ServingEngine:
         from serve.engine.runner import ModelRunner
         from serve.cache.kv_cache import KVCacheManager
         warmup_kv_mgr = KVCacheManager(self.pool)
-        self.runner = ModelRunner(self.model, warmup_kv_mgr, device=device,
-                                 pool=self.pool, ssm_pool=linear_state_arena)
+        runner_max_total_tokens = max(max_prefill_tokens, prefill_chunk_size)
+        self.runner = ModelRunner(
+            self.model,
+            warmup_kv_mgr,
+            device=device,
+            max_batch_size=max_running,
+            max_total_tokens=runner_max_total_tokens,
+            pool=self.pool,
+            ssm_pool=linear_state_arena,
+        )
 
         if self.rank == 0:
             LOGGER.info(f"KV cache: {self.pool.num_pages} pages ({self.pool.num_pages * 64} tokens)")
 
         is_hybrid = layer_types is not None and any(t == "linear_attention" for t in layer_types)
 
-        graph_sizes = [1, 2, 4, 8] if graph_batch_sizes is None else graph_batch_sizes
         enable_layer_compile = _should_enable_layer_compile(
             is_hybrid=is_hybrid,
             compile_layers=compile_layers,
@@ -395,14 +405,11 @@ class ServingEngine:
         # Scheduler.
         hybrid_prefix_cache = _should_enable_prefix_cache(
             is_hybrid=is_hybrid,
-            world_size=self.world_size,
             has_state_snapshot_slots=(
                 linear_state_arena is not None
                 and linear_state_arena.num_snapshot_slots > 0
             ),
         )
-        if self.rank == 0 and is_hybrid and self.world_size > 1:
-            LOGGER.warning("Hybrid prefix cache disabled under TP until SSM snapshots are mirrored across ranks.")
 
         self.scheduler = BatchScheduler(
             cache=self.cache,
@@ -410,10 +417,23 @@ class ServingEngine:
             ssm_pool=linear_state_arena,
             enable_prefix_cache=hybrid_prefix_cache,
             captured_bs=graph_sizes,
-            max_running=max(graph_sizes) if graph_sizes else 8,
+            max_running=max_running,
+            max_waiting=max_waiting,
+            max_prefill_tokens=max_prefill_tokens,
             chunk_size=prefill_chunk_size,
             device=device,
         )
+        self._runtime_policy = {
+            "graph_batch_sizes": list(graph_sizes),
+            "prefill_chunk_size": prefill_chunk_size,
+            "capture_prefill_graph": capture_prefill_graph,
+            "compile_layers": enable_layer_compile,
+            "max_running": max_running,
+            "max_waiting": max_waiting,
+            "max_prefill_tokens": max_prefill_tokens,
+            "prefix_cache_enabled": hybrid_prefix_cache,
+        }
+        self._tp_health: dict | None = None
 
         if self.world_size > 1:
             dist.barrier()
@@ -580,6 +600,7 @@ class ServingEngine:
         torch.set_grad_enabled(False)
         try:
             while self._loop_running:
+                self._raise_if_loop_unhealthy()
                 with self._lock:
                     has_work = self.scheduler.has_work
                 if has_work:
@@ -605,13 +626,16 @@ class ServingEngine:
         """
         with self._lock:
             batch = self.scheduler.step()
+            ssm_control_ops = self.scheduler.drain_ssm_control_ops()
         if batch is None:
             if self.world_size > 1:
+                self._broadcast_ssm_control_ops(ssm_control_ops)
                 self._broadcast_step_idle()
             return
 
         # Broadcast batch to followers.
         if self.world_size > 1:
+            self._broadcast_ssm_control_ops(ssm_control_ops)
             self._broadcast_step(batch)
 
         # Build SSM cache indices if model has SSM layers.
@@ -690,16 +714,37 @@ class ServingEngine:
     def _raise_if_loop_unhealthy(self) -> None:
         if self._loop_error is not None:
             raise RuntimeError(f"server loop unhealthy: {self._loop_error}")
+        tp_health = self._refresh_tp_worker_health()
+        if tp_health is not None and tp_health["fatal"]:
+            summary = tp_health["summary"] or "unknown follower failure"
+            raise RuntimeError(f"tp workers unhealthy: {summary}")
 
     def server_loop_health(self) -> dict:
+        tp_health = self._refresh_tp_worker_health()
         loop_alive = hasattr(self, '_loop_thread') and self._loop_thread.is_alive()
-        healthy = self._loop_error is None
+        fatal = self._loop_error is not None or (tp_health is not None and tp_health["fatal"])
+        degraded = not fatal and self._loop_running and not loop_alive
         return {
+            "status": "fatal" if fatal else ("degraded" if degraded else "ok"),
             "running": self._loop_running,
             "alive": loop_alive,
-            "healthy": healthy,
+            "ready": not fatal and (not self._loop_running or loop_alive),
+            "healthy": not fatal,
+            "degraded": degraded,
+            "fatal": fatal,
             "last_error": self._loop_error,
+            "tp_workers": tp_health,
         }
+
+    def runtime_policy(self) -> dict:
+        return dict(self._runtime_policy)
+
+    def _refresh_tp_worker_health(self) -> dict | None:
+        if self.world_size <= 1:
+            self._tp_health = None
+            return None
+        self._tp_health = get_active_tp_health()
+        return self._tp_health
 
     def _to_result(self, req: Request) -> GenerationResult:
         return GenerationResult(
@@ -718,6 +763,7 @@ class ServingEngine:
         """Mirror rank 0's forward passes. No scheduler or sampling needed."""
         assert self.rank != 0
         while True:
+            self._apply_ssm_control_ops(self._receive_ssm_control_ops())
             result = self._receive_step()
             if result == "shutdown":
                 break
@@ -733,8 +779,9 @@ class ServingEngine:
     def shutdown(self) -> None:
         self.stop_server_loop()
         if self.rank == 0 and self.world_size > 1:
+            self._broadcast_ssm_control_ops([])
             # Send shutdown signal.
-            header = torch.tensor([255, 0, 0, 0], dtype=torch.long, device=self.device)
+            header = torch.tensor([255, 0, 0, 0, 0], dtype=torch.long, device=self.device)
             dist.broadcast(header, src=0)
 
     # -- TP step-level broadcast -------------------------------------------
@@ -746,6 +793,48 @@ class ServingEngine:
     _MODE_PREFILL = 1
     _MODE_DECODE = 2
     _MODE_SHUTDOWN = 255
+
+    def _broadcast_ssm_control_ops(self, ops: list[tuple[int, int, int, int]]) -> None:
+        header = torch.tensor([len(ops)], dtype=torch.long, device=self.device)
+        dist.broadcast(header, src=0)
+        if not ops:
+            return
+        payload = torch.tensor(ops, dtype=torch.long, device=self.device)
+        dist.broadcast(payload, src=0)
+
+    def _receive_ssm_control_ops(self) -> list[tuple[int, int, int, int]]:
+        header = torch.empty(1, dtype=torch.long, device=self.device)
+        dist.broadcast(header, src=0)
+        count = header[0].item()
+        if count == 0:
+            return []
+        payload = torch.empty(count, 4, dtype=torch.long, device=self.device)
+        dist.broadcast(payload, src=0)
+        return [tuple(int(v) for v in row.tolist()) for row in payload]
+
+    def _apply_ssm_control_ops(self, ops: list[tuple[int, int, int, int]]) -> None:
+        if not ops or self.runner.ssm_pool is None:
+            return
+        arena = self.runner.ssm_pool
+        for op, a, b, _c in ops:
+            if op == BatchScheduler.SSM_ALLOC_LIVE:
+                slot = arena.alloc(1)[0].item()
+                if slot != a:
+                    raise RuntimeError(f"live SSM slot mismatch on follower: expected {a}, got {slot}")
+            elif op == BatchScheduler.SSM_RESTORE_SNAPSHOT:
+                arena.restore_snapshot(a, b)
+            elif op == BatchScheduler.SSM_CAPTURE_SNAPSHOT:
+                snapshot_slot = arena.capture_snapshot(a)
+                if snapshot_slot != b:
+                    raise RuntimeError(
+                        f"snapshot slot mismatch on follower: expected {b}, got {snapshot_slot}"
+                    )
+            elif op == BatchScheduler.SSM_FREE_LIVE:
+                arena.free_slot(a)
+            elif op == BatchScheduler.SSM_FREE_SNAPSHOT:
+                arena.free_snapshot(a)
+            else:
+                raise RuntimeError(f"unknown SSM control op {op}")
 
     def _broadcast_step_idle(self) -> None:
         """Tell followers there's no work this step."""

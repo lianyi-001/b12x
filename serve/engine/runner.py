@@ -18,6 +18,7 @@ from serve.logging import StartupSession, get_logger
 from serve.model.attention import B12xPagedAttention
 from serve.model.loader import LoadedModel
 from serve.model.ops import rms_norm
+from serve.model.workspaces import get_b12x_moe_workspace_pool
 
 LOGGER = get_logger(__name__)
 
@@ -44,8 +45,7 @@ class ModelRunner:
         self.max_total_tokens = max_total_tokens
 
         # Inject per-layer workspaces and bind per-layer cache refs.
-        from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
-        moe_workspace = allocate_tp_moe_workspace_pool()
+        moe_workspace = get_b12x_moe_workspace_pool(self.device)
 
         kv_layer_idx = 0
         ssm_layer_idx = 0
@@ -62,6 +62,8 @@ class ModelRunner:
                         page_size=self.pool.page_size,
                         num_cache_pages=self.pool.num_pages,
                         max_total_q=self.max_total_tokens,
+                        max_batch=self.max_batch_size,
+                        max_page_table_width=self.pool.num_pages,
                         use_cuda_graph=False,
                     )
                 )
@@ -144,6 +146,8 @@ class ModelRunner:
                     page_size=self.pool.page_size,
                     num_cache_pages=self.pool.num_pages,
                     max_total_q=self.max_total_tokens,
+                    max_batch=self.max_batch_size,
+                    max_page_table_width=self.pool.num_pages,
                     use_cuda_graph=False,
                 )
             )
