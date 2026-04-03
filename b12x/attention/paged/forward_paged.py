@@ -1191,10 +1191,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            b0_k0, b1_k0 = ldmatrix_m8n8x4_left_half_b16(
-                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
-            )
-            b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
+            b0_k0, b0_k1, b1_k0, b1_k1 = ldmatrix_m8n8x4_b16(
                 _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
             )
             b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
