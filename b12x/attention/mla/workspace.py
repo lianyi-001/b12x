@@ -1,0 +1,276 @@
+"""Workspace state for sparse MLA execution."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+import torch
+
+
+def _canonical_device(device: torch.device | str) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+@dataclass(kw_only=True)
+class MLAWorkspace:
+    mode: Literal["decode", "extend", "verify"]
+    device: torch.device
+    dtype: torch.dtype
+    kv_dtype: torch.dtype
+    num_q_heads: int
+    head_dim: int
+    v_head_dim: int
+    topk: int
+    max_total_q: int
+    max_batch: int
+    page_size: int = 64
+    padded_heads: int = 128
+    use_cuda_graph: bool = False
+    fixed_capacity: bool = False
+    page_table_1: torch.Tensor | None = None
+    cache_seqlens_int32: torch.Tensor | None = None
+    nsa_cache_seqlens_int32: torch.Tensor | None = None
+    page_table_1_runtime: torch.Tensor | None = None
+    cache_seqlens_int32_runtime: torch.Tensor | None = None
+    nsa_cache_seqlens_int32_runtime: torch.Tensor | None = None
+    q_pad: torch.Tensor | None = None
+    sm_scale_tensor: torch.Tensor | None = None
+    sm_scale_value: float | None = None
+
+    @classmethod
+    def for_contract(
+        cls,
+        *,
+        mode: Literal["decode", "extend", "verify"],
+        device: torch.device | str,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        num_q_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        topk: int,
+        max_total_q: int,
+        max_batch: int,
+        page_size: int = 64,
+        use_cuda_graph: bool = False,
+        padded_heads: int = 128,
+    ) -> MLAWorkspace:
+        device = _canonical_device(device)
+        workspace = cls(
+            mode=mode,
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            topk=topk,
+            max_total_q=int(max_total_q),
+            max_batch=int(max_batch),
+            page_size=page_size,
+            padded_heads=padded_heads,
+            use_cuda_graph=use_cuda_graph,
+        )
+        workspace._allocate_padded_query()
+        if use_cuda_graph:
+            workspace._allocate_runtime_metadata()
+        return workspace
+
+    @classmethod
+    def for_fixed_capacity(
+        cls,
+        *,
+        mode: Literal["decode", "extend", "verify"],
+        device: torch.device | str,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        num_q_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        topk: int,
+        max_total_q: int,
+        max_batch: int,
+        page_size: int = 64,
+        use_cuda_graph: bool = False,
+        padded_heads: int = 128,
+    ) -> MLAWorkspace:
+        workspace = cls.for_contract(
+            mode=mode,
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            topk=topk,
+            max_total_q=max_total_q,
+            max_batch=max_batch,
+            page_size=page_size,
+            use_cuda_graph=use_cuda_graph,
+            padded_heads=padded_heads,
+        )
+        workspace.fixed_capacity = True
+        workspace._allocate_runtime_metadata()
+        return workspace
+
+    def _allocate_padded_query(self) -> None:
+        if self.num_q_heads >= self.padded_heads:
+            return
+        self.q_pad = torch.empty(
+            (self.max_total_q, self.padded_heads, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _allocate_runtime_metadata(self) -> None:
+        if self.page_table_1_runtime is None:
+            self.page_table_1_runtime = torch.empty(
+                (self.max_total_q, self.topk),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self.cache_seqlens_int32_runtime is None:
+            self.cache_seqlens_int32_runtime = torch.empty(
+                (self.max_batch,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self.nsa_cache_seqlens_int32_runtime is None:
+            self.nsa_cache_seqlens_int32_runtime = torch.empty(
+                (self.max_total_q,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+    def prepare_decode(
+        self,
+        page_table_1: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        nsa_cache_seqlens_int32: torch.Tensor,
+    ) -> None:
+        self._prepare_sparse(
+            page_table_1=page_table_1,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        )
+
+    def prepare_extend(
+        self,
+        page_table_1: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        nsa_cache_seqlens_int32: torch.Tensor,
+    ) -> None:
+        self._prepare_sparse(
+            page_table_1=page_table_1,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        )
+
+    def bind_cuda_graph_runtime_metadata(
+        self,
+        *,
+        page_table_1: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        nsa_cache_seqlens_int32: torch.Tensor,
+    ) -> None:
+        self._prepare_sparse(
+            page_table_1=page_table_1,
+            cache_seqlens_int32=cache_seqlens_int32,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        )
+
+    def _prepare_sparse(
+        self,
+        *,
+        page_table_1: torch.Tensor,
+        cache_seqlens_int32: torch.Tensor,
+        nsa_cache_seqlens_int32: torch.Tensor,
+    ) -> None:
+        if page_table_1.ndim != 2:
+            raise ValueError(f"page_table_1 must be rank-2, got {tuple(page_table_1.shape)}")
+        if cache_seqlens_int32.ndim != 1:
+            raise ValueError(
+                f"cache_seqlens_int32 must be rank-1, got {tuple(cache_seqlens_int32.shape)}"
+            )
+        if nsa_cache_seqlens_int32.ndim != 1:
+            raise ValueError(
+                "nsa_cache_seqlens_int32 must be rank-1, "
+                f"got {tuple(nsa_cache_seqlens_int32.shape)}"
+            )
+        if page_table_1.device != self.device:
+            raise ValueError(
+                f"page_table_1 device {page_table_1.device} does not match workspace device {self.device}"
+            )
+        if cache_seqlens_int32.device != self.device:
+            raise ValueError(
+                "cache_seqlens_int32 device "
+                f"{cache_seqlens_int32.device} does not match workspace device {self.device}"
+            )
+        if nsa_cache_seqlens_int32.device != self.device:
+            raise ValueError(
+                "nsa_cache_seqlens_int32 device "
+                f"{nsa_cache_seqlens_int32.device} does not match workspace device {self.device}"
+            )
+        if page_table_1.dtype != torch.int32:
+            raise ValueError(f"page_table_1 must have dtype torch.int32, got {page_table_1.dtype}")
+        if cache_seqlens_int32.dtype != torch.int32:
+            raise ValueError(
+                "cache_seqlens_int32 must have dtype torch.int32, "
+                f"got {cache_seqlens_int32.dtype}"
+            )
+        if nsa_cache_seqlens_int32.dtype != torch.int32:
+            raise ValueError(
+                "nsa_cache_seqlens_int32 must have dtype torch.int32, "
+                f"got {nsa_cache_seqlens_int32.dtype}"
+            )
+        if page_table_1.shape[0] > self.max_total_q:
+            raise ValueError(
+                f"page_table_1 rows {page_table_1.shape[0]} exceed workspace capacity {self.max_total_q}"
+            )
+        if cache_seqlens_int32.shape[0] > self.max_batch:
+            raise ValueError(
+                "cache_seqlens_int32 batch "
+                f"{cache_seqlens_int32.shape[0]} exceeds workspace capacity {self.max_batch}"
+            )
+        if page_table_1.shape[1] > self.topk:
+            raise ValueError(
+                f"page_table_1 width {page_table_1.shape[1]} exceeds topk capacity {self.topk}"
+            )
+        if page_table_1.shape[0] != nsa_cache_seqlens_int32.shape[0]:
+            raise ValueError(
+                "page_table_1 rows "
+                f"{page_table_1.shape[0]} do not match nsa_cache_seqlens_int32 rows "
+                f"{nsa_cache_seqlens_int32.shape[0]}"
+            )
+        use_runtime_buffers = self.fixed_capacity or self.use_cuda_graph
+        if not use_runtime_buffers:
+            self.page_table_1 = page_table_1
+            self.cache_seqlens_int32 = cache_seqlens_int32
+            self.nsa_cache_seqlens_int32 = nsa_cache_seqlens_int32
+            return
+
+        self._allocate_runtime_metadata()
+        assert self.page_table_1_runtime is not None
+        assert self.cache_seqlens_int32_runtime is not None
+        assert self.nsa_cache_seqlens_int32_runtime is not None
+        rows, width = page_table_1.shape
+        batch = cache_seqlens_int32.shape[0]
+        self.page_table_1_runtime[:rows, :width].copy_(page_table_1)
+        self.cache_seqlens_int32_runtime[:batch].copy_(cache_seqlens_int32)
+        self.nsa_cache_seqlens_int32_runtime[:rows].copy_(nsa_cache_seqlens_int32)
+        self.page_table_1 = self.page_table_1_runtime[:rows, :width]
+        self.cache_seqlens_int32 = self.cache_seqlens_int32_runtime[:batch]
+        self.nsa_cache_seqlens_int32 = self.nsa_cache_seqlens_int32_runtime[:rows]
+
+    def padded_query_view(self, total_q: int) -> torch.Tensor | None:
+        if self.q_pad is None:
+            return None
+        if total_q > self.max_total_q:
+            raise ValueError(
+                f"query rows {total_q} exceed workspace capacity {self.max_total_q}"
+            )
+        return self.q_pad[:total_q]
