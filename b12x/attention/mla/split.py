@@ -36,8 +36,8 @@ from .kernel import (
 from .traits import SparseMLATraits, select_sparse_mla_traits
 
 
-_SPLIT_CHUNK_LADDER = (128, 256, 512)
-_SPLIT_MAX_CHUNKS = 8
+_SPLIT_CHUNK_LADDER = (32, 64, 128, 256, 512)
+_SPLIT_MAX_CHUNKS = 64
 _SPLIT_MAX_WIDTH = 2048
 
 
@@ -186,7 +186,9 @@ class SparseMLASplitDecodeForwardKernel:
             SharedStorage = get_sparse_mla_shared_storage_cls()
             storage = smem.allocate(SharedStorage)
             sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-            sScale = storage.token_scale.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
+            sScale = storage.token_scale.get_tensor(
+                cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
+            )
             q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
             kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
 
@@ -230,7 +232,7 @@ class SparseMLASplitDecodeMergeKernel:
             num_chunks_ptr,
             output,
         ).launch(
-            grid=(output.shape[0], output.shape[1], 1),
+            grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
             block=[_MLA_WARP_THREADS, 1, 1],
             stream=stream,
         )
@@ -244,12 +246,13 @@ class SparseMLASplitDecodeMergeKernel:
         output: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
-        q_idx, head_idx, _ = cute.arch.block_idx()
+        q_idx, head_idx, group_idx = cute.arch.block_idx()
         q_idx = Int32(q_idx)
         head_idx = Int32(head_idx)
+        group_idx = Int32(group_idx)
 
-        acc = cute.make_rmem_tensor((_MLA_OUTPUT_FRAGMENTS_PER_LANE,), Float32)
-        for frag_idx in cutlass.range_constexpr(_MLA_OUTPUT_FRAGMENTS_PER_LANE):
+        acc = cute.make_rmem_tensor((4,), Float32)
+        for frag_idx in cutlass.range_constexpr(4):
             acc[frag_idx] = Float32(0.0)
 
         merged_m = Float32(-Float32.inf)
@@ -264,14 +267,12 @@ class SparseMLASplitDecodeMergeKernel:
             partial_idx = partial_base + chunk_idx
             part_lse = Float32(tmp_lse[partial_idx, head_idx])
             if part_lse != Float32(-Float32.inf):
+                out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
                 if merged_m == Float32(-Float32.inf):
-                    for group_idx in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-                        out_base = Int32(group_idx * _MLA_GROUP_SIZE) + lane * Int32(4)
-                        frag_base = group_idx * 4
-                        acc[frag_base + 0] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(0)])
-                        acc[frag_base + 1] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(1)])
-                        acc[frag_base + 2] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(2)])
-                        acc[frag_base + 3] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(3)])
+                    acc[0] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(0)])
+                    acc[1] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(1)])
+                    acc[2] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(2)])
+                    acc[3] = Float32(tmp_output[partial_idx, head_idx, out_base + Int32(3)])
                     merged_m = Float32(part_lse)
                     merged_d = Float32(1.0)
                 else:
@@ -279,52 +280,37 @@ class SparseMLASplitDecodeMergeKernel:
                     prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
                     part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
                     merged_d = Float32(merged_d * prev_scale + part_scale)
-                    for group_idx in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-                        out_base = Int32(group_idx * _MLA_GROUP_SIZE) + lane * Int32(4)
-                        frag_base = group_idx * 4
-                        acc[frag_base + 0] = Float32(
-                            acc[frag_base + 0] * prev_scale
-                            + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(0)]) * part_scale
-                        )
-                        acc[frag_base + 1] = Float32(
-                            acc[frag_base + 1] * prev_scale
-                            + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(1)]) * part_scale
-                        )
-                        acc[frag_base + 2] = Float32(
-                            acc[frag_base + 2] * prev_scale
-                            + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(2)]) * part_scale
-                        )
-                        acc[frag_base + 3] = Float32(
-                            acc[frag_base + 3] * prev_scale
-                            + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(3)]) * part_scale
-                        )
+                    acc[0] = Float32(
+                        acc[0] * prev_scale
+                        + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(0)]) * part_scale
+                    )
+                    acc[1] = Float32(
+                        acc[1] * prev_scale
+                        + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(1)]) * part_scale
+                    )
+                    acc[2] = Float32(
+                        acc[2] * prev_scale
+                        + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(2)]) * part_scale
+                    )
+                    acc[3] = Float32(
+                        acc[3] * prev_scale
+                        + Float32(tmp_output[partial_idx, head_idx, out_base + Int32(3)]) * part_scale
+                    )
                     merged_m = Float32(new_m)
             chunk_idx += Int32(1)
 
+        out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
         if merged_m == Float32(-Float32.inf):
-            for group_idx in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-                out_base = Int32(group_idx * _MLA_GROUP_SIZE) + lane * Int32(4)
-                output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(output.element_type)
-                output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(output.element_type)
-                output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(output.element_type)
-                output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(output.element_type)
         else:
             inv_d = cute.arch.rcp_approx(merged_d)
-            for group_idx in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-                out_base = Int32(group_idx * _MLA_GROUP_SIZE) + lane * Int32(4)
-                frag_base = group_idx * 4
-                output[q_idx, head_idx, out_base + Int32(0)] = Float32(
-                    acc[frag_base + 0] * inv_d
-                ).to(output.element_type)
-                output[q_idx, head_idx, out_base + Int32(1)] = Float32(
-                    acc[frag_base + 1] * inv_d
-                ).to(output.element_type)
-                output[q_idx, head_idx, out_base + Int32(2)] = Float32(
-                    acc[frag_base + 2] * inv_d
-                ).to(output.element_type)
-                output[q_idx, head_idx, out_base + Int32(3)] = Float32(
-                    acc[frag_base + 3] * inv_d
-                ).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(0)] = Float32(acc[0] * inv_d).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(1)] = Float32(acc[1] * inv_d).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(2)] = Float32(acc[2] * inv_d).to(output.element_type)
+            output[q_idx, head_idx, out_base + Int32(3)] = Float32(acc[3] * inv_d).to(output.element_type)
 
 
 @lru_cache(maxsize=16)

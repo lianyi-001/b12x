@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
@@ -30,6 +30,7 @@ from b12x.cute.fp4 import (
     fp8x4_e4m3_to_bfloat2x2,
     frag_layout_swizzle_16b_to_8b,
     frag_layout_swizzle_16b_to_8b_trans,
+    get_ptr_as_int64,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
@@ -64,10 +65,16 @@ _MLA_NOPE_QK_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
 _MLA_ROPE_Q_U32 = _MLA_ROPE_DIM // 2
 _MLA_ROPE_VECS = (_MLA_ROPE_DIM * 2) // 16
 _MLA_Q_NOPE_STAGE_BYTES = _MLA_HEADS_PER_TILE * _MLA_NOPE_GROUP_ELEMS * 2
+_MLA_Q_ROPE_STAGE_BYTES = _MLA_HEADS_PER_TILE * _MLA_ROPE_DIM * 2
 _MLA_KV_NOPE_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_NOPE_GROUP_ELEMS
 _MLA_KV_NOPE_QK_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_NOPE_GROUP_ELEMS * 2
-_MLA_Q_STAGE_BYTES = _MLA_Q_NOPE_STAGE_BYTES
-_MLA_KV_STAGE_BYTES = max(_MLA_KV_NOPE_STAGE_BYTES, _MLA_KV_NOPE_QK_STAGE_BYTES)
+_MLA_KV_ROPE_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_ROPE_DIM * 2
+_MLA_Q_STAGE_BYTES = _MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES + _MLA_Q_ROPE_STAGE_BYTES
+_MLA_KV_STAGE_BYTES = max(
+    _MLA_KV_NOPE_QK_STAGE_BYTES,
+    _MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES + _MLA_KV_ROPE_STAGE_BYTES,
+)
+_MLA_SCALE_STAGE_ELEMS = _MLA_TOKEN_TILE * _MLA_SCALE_GROUPS
 _MLA_NUM_MMA_KV = 2
 _MLA_QK_NUM_MMA_D = 4
 _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
@@ -166,6 +173,34 @@ def _warp_allreduce_max(value: Float32) -> Float32:
 
 
 @dsl_user_op
+def _cp_async_load_128b_pred(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    predicate: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(predicate).ir_value(loc=loc, ip=ip),
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        " .reg .pred p;\n"
+        " setp.ne.b32 p, $0, 0;\n"
+        " @p cp.async.cg.shared.global.L2::128B [$1], [$2], 16;\n"
+        "}",
+        "r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
     return Float32(
         llvm.inline_asm(
@@ -256,6 +291,28 @@ def _stage_token_scales(
 
 
 @cute.jit
+def _stage_all_token_scales(
+    kv_scales: cute.Tensor,
+    sTokenIdx: cute.Tensor,
+    sScale: cute.Tensor,
+    num_kv: Int32,
+    lane: Int32,
+):
+    linear = lane
+    total = Int32(_MLA_SCALE_STAGE_ELEMS)
+    while linear < total:
+        group_idx = linear // Int32(_MLA_TOKEN_TILE)
+        token_local = linear - group_idx * Int32(_MLA_TOKEN_TILE)
+        token_idx = Int32(sTokenIdx[token_local])
+        sScale[linear] = (
+            Float32(kv_scales[token_idx, group_idx])
+            if token_idx >= Int32(0) and token_idx < num_kv
+            else Float32(0.0)
+        )
+        linear += Int32(_MLA_WARP_THREADS)
+
+
+@cute.jit
 def _stage_q_u32_block(
     q_u32: cute.Tensor,
     q_idx: Int32,
@@ -292,6 +349,47 @@ def _stage_q_u32_block(
 
 
 @cute.jit
+def _stage_q_u32_block_async(
+    q_u32: cute.Tensor,
+    q_idx: Int32,
+    head_tile_start: Int32,
+    base_u32: Int32,
+    vecs_per_row: Int32,
+    row_stride_128b: Int32,
+    q_base_addr: Int32,
+    lane: Int32,
+):
+    linear = lane
+    total = Int32(_MLA_HEADS_PER_TILE) * vecs_per_row
+    num_heads = Int32(q_u32.shape[1])
+    row_stride_u32 = Int32(q_u32.shape[2])
+    q_row_stride_u32 = Int32(q_u32.shape[1]) * row_stride_u32
+    while linear < total:
+        row = linear // vecs_per_row
+        vec_idx = linear - row * vecs_per_row
+        head_idx = head_tile_start + row
+        dst_addr = _smem_addr_from_b128_offset(
+            q_base_addr,
+            _permuted_offset_128b(row, vec_idx, row_stride_128b),
+        )
+        valid = Int32(0)
+        safe_head_idx = Int32(0)
+        if head_idx < num_heads:
+            valid = Int32(1)
+            safe_head_idx = head_idx
+        src_u32 = base_u32 + vec_idx * Int32(4)
+        _cp_async_load_128b_pred(
+            dst_addr,
+            get_ptr_as_int64(
+                q_u32,
+                q_idx * q_row_stride_u32 + safe_head_idx * row_stride_u32 + src_u32,
+            ),
+            valid,
+        )
+        linear += Int32(_MLA_WARP_THREADS)
+
+
+@cute.jit
 def _stage_kv_u32_block(
     kv_u32: cute.Tensor,
     sTokenIdx: cute.Tensor,
@@ -323,6 +421,43 @@ def _stage_kv_u32_block(
             v2 = Uint32(kv_u32[token_idx, src_u32 + Int32(2)])
             v3 = Uint32(kv_u32[token_idx, src_u32 + Int32(3)])
         st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
+        linear += Int32(_MLA_WARP_THREADS)
+
+
+@cute.jit
+def _stage_kv_u32_block_async(
+    kv_u32: cute.Tensor,
+    sTokenIdx: cute.Tensor,
+    base_u32: Int32,
+    vecs_per_row: Int32,
+    row_stride_128b: Int32,
+    kv_base_addr: Int32,
+    num_kv: Int32,
+    lane: Int32,
+):
+    linear = lane
+    total = Int32(_MLA_TOKEN_TILE) * vecs_per_row
+    row_stride_u32 = Int32(kv_u32.shape[1])
+    while linear < total:
+        row = linear // vecs_per_row
+        vec_idx = linear - row * vecs_per_row
+        token_idx = Int32(sTokenIdx[row])
+        dst_addr = _smem_addr_from_b128_offset(
+            kv_base_addr,
+            _permuted_offset_128b(row, vec_idx, row_stride_128b),
+        )
+        valid = Int32(0)
+        safe_token_idx = Int32(0)
+        if token_idx >= Int32(0):
+            if token_idx < num_kv:
+                valid = Int32(1)
+                safe_token_idx = token_idx
+        src_u32 = base_u32 + vec_idx * Int32(4)
+        _cp_async_load_128b_pred(
+            dst_addr,
+            get_ptr_as_int64(kv_u32, safe_token_idx * row_stride_u32 + src_u32),
+            valid,
+        )
         linear += Int32(_MLA_WARP_THREADS)
 
 
@@ -575,6 +710,7 @@ def _accumulate_scaled_score_frag(
     dst_frag: cute.Tensor,
     src_frag: cute.Tensor,
     sScale: cute.Tensor,
+    scale_base: Int32,
     lane: Int32,
 ):
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -587,7 +723,8 @@ def _accumulate_scaled_score_frag(
                 + Int32(reg_id % 2)
             )
             dst_frag[0, mma_kv, reg_id] = Float32(
-                dst_frag[0, mma_kv, reg_id] + src_frag[0, mma_kv, reg_id] * Float32(sScale[token_local])
+                dst_frag[0, mma_kv, reg_id]
+                + src_frag[0, mma_kv, reg_id] * Float32(sScale[scale_base + token_local])
             )
 
 
@@ -691,7 +828,7 @@ def _compute_score_tile_scaled(
                 Int32(_MLA_NOPE_GROUP_Q_VECS),
                 Int32(_MLA_NOPE_GROUP_KV_VECS),
             )
-            _accumulate_scaled_score_frag(score_frag, frag_tmp, sScale, lane)
+            _accumulate_scaled_score_frag(score_frag, frag_tmp, sScale, Int32(0), lane)
         cute.arch.sync_threads()
 
     _stage_q_u32_block(
@@ -862,6 +999,7 @@ def _literal_pv_mma_into_ofrag_mxfp8_scaled(
     p_frag: cute.Tensor,
     v_base_addr: Int32,
     sScale: cute.Tensor,
+    scale_base: Int32,
     pv_scale: Float32,
     lane: Int32,
 ):
@@ -870,10 +1008,22 @@ def _literal_pv_mma_into_ofrag_mxfp8_scaled(
     lane_pair_base = Int32(2) * (lane % Int32(4))
     del pv_scale
 
-    scale01_k0 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(0)]), Float32(sScale[lane_pair_base + Int32(1)]))
-    scale89_k0 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(8)]), Float32(sScale[lane_pair_base + Int32(9)]))
-    scale01_k1 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(16)]), Float32(sScale[lane_pair_base + Int32(17)]))
-    scale89_k1 = pack_f32x2_to_bfloat2(Float32(sScale[lane_pair_base + Int32(24)]), Float32(sScale[lane_pair_base + Int32(25)]))
+    scale01_k0 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
+    )
+    scale89_k0 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(8)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
+    )
+    scale01_k1 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(16)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(17)]),
+    )
+    scale89_k1 = pack_f32x2_to_bfloat2(
+        Float32(sScale[scale_base + lane_pair_base + Int32(24)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(25)]),
+    )
 
     a00 = bfloat2_mul(p_frag[0, 0, 0], scale01_k0)
     a10 = bfloat2_mul(p_frag[0, 0, 1], scale01_k0)
@@ -1013,25 +1163,26 @@ def _literal_pv_mma_into_ofrag_fp8_raw_scaled(
     p_frag: cute.Tensor,
     v_base_addr: Int32,
     sScale: cute.Tensor,
+    scale_base: Int32,
     lane: Int32,
 ):
     lane_pair_base = Int32(2) * (lane % Int32(4))
 
     scale01_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(0)]),
-        Float32(sScale[lane_pair_base + Int32(1)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(0)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(1)]),
     )
     scale89_k0 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(8)]),
-        Float32(sScale[lane_pair_base + Int32(9)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(8)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(9)]),
     )
     scale01_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(16)]),
-        Float32(sScale[lane_pair_base + Int32(17)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(16)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(17)]),
     )
     scale89_k1 = pack_f32x2_to_bfloat2(
-        Float32(sScale[lane_pair_base + Int32(24)]),
-        Float32(sScale[lane_pair_base + Int32(25)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(24)]),
+        Float32(sScale[scale_base + lane_pair_base + Int32(25)]),
     )
 
     v_offset = _permuted_offset_128b(
@@ -1173,6 +1324,345 @@ def _accumulate_scaled_output_frag(
 
 
 @cute.jit
+def _accumulate_pv_groups_from_p_frag(
+    o_frag0: cute.Tensor,
+    o_frag1: cute.Tensor,
+    o_frag2: cute.Tensor,
+    o_frag3: cute.Tensor,
+    p_frag: cute.Tensor,
+    kv_nope_u32: cute.Tensor,
+    kv_scales: cute.Tensor,
+    sTokenIdx: cute.Tensor,
+    sScale: cute.Tensor,
+    kv_base_addr: Int32,
+    lane: Int32,
+):
+    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
+        group_idx = Int32(block_offset)
+        _stage_token_scales(
+            kv_scales,
+            sTokenIdx,
+            sScale,
+            group_idx,
+            Int32(kv_nope_u32.shape[0]),
+            lane,
+        )
+        tile_output_scale = _warp_allreduce_max(Float32(sScale[lane]))
+        tile_pv_scale = (
+            Float32(0.0)
+            if tile_output_scale == Float32(0.0)
+            else cute.arch.rcp_approx(tile_output_scale)
+        )
+        _stage_kv_u32_block(
+            kv_nope_u32,
+            sTokenIdx,
+            group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+            kv_base_addr,
+            Int32(kv_nope_u32.shape[0]),
+            lane,
+        )
+        cute.arch.sync_threads()
+        tile_o_frag = cute.make_rmem_tensor(
+            cute.make_layout((1, _MLA_VO_NUM_MMA_D, 8), stride=(_MLA_VO_NUM_MMA_D * 8, 8, 1)),
+            Float32,
+        )
+        _zero_output_frag(tile_o_frag)
+        if cutlass.const_expr(
+            os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
+            or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
+        ):
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled(
+                tile_o_frag,
+                p_frag,
+                kv_base_addr,
+                sScale,
+                Int32(0),
+                lane,
+            )
+            accum_scale = Float32(1.0)
+        else:
+            _literal_pv_mma_into_ofrag_mxfp8_scaled(
+                tile_o_frag,
+                p_frag,
+                kv_base_addr,
+                sScale,
+                Int32(0),
+                tile_pv_scale,
+                lane,
+            )
+            accum_scale = Float32(1.0)
+        if cutlass.const_expr(block_offset == 0):
+            _accumulate_scaled_output_frag(o_frag0, tile_o_frag, accum_scale)
+        elif cutlass.const_expr(block_offset == 1):
+            _accumulate_scaled_output_frag(o_frag1, tile_o_frag, accum_scale)
+        elif cutlass.const_expr(block_offset == 2):
+            _accumulate_scaled_output_frag(o_frag2, tile_o_frag, accum_scale)
+        else:
+            _accumulate_scaled_output_frag(o_frag3, tile_o_frag, accum_scale)
+        cute.arch.sync_threads()
+
+
+@cute.jit
+def _compute_score_tile_scaled_from_staged_nope(
+    score_frag: cute.Tensor,
+    q_u32: cute.Tensor,
+    kv_nope_u32: cute.Tensor,
+    kv_scales: cute.Tensor,
+    kv_rope_u32: cute.Tensor,
+    page_table_1: cute.Tensor,
+    sTokenIdx: cute.Tensor,
+    sScale: cute.Tensor,
+    q_base_addr: Int32,
+    kv_nope_base_addr: Int32,
+    kv_rope_base_addr: Int32,
+    q_idx: Int32,
+    head_tile_start: Int32,
+    token_base: Int32,
+    token_end: Int32,
+    sm_scale_log2: Float32,
+    lane: Int32,
+):
+    lane_group = lane // Int32(4)
+    lane_pair_base = Int32(2) * (lane % Int32(4))
+    num_heads = Int32(q_u32.shape[1])
+    num_kv = Int32(kv_nope_u32.shape[0])
+    tile_tokens = token_end - token_base
+
+    _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
+    cute.arch.sync_threads()
+    _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
+    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
+        group_idx = Int32(block_offset)
+        _stage_q_u32_block_async(
+            q_u32,
+            q_idx,
+            head_tile_start,
+            group_idx * Int32(_MLA_NOPE_GROUP_Q_U32),
+            Int32(_MLA_NOPE_GROUP_Q_VECS),
+            Int32(_MLA_NOPE_GROUP_Q_VECS),
+            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
+            lane,
+        )
+    _stage_q_u32_block_async(
+        q_u32,
+        q_idx,
+        head_tile_start,
+        Int32(_MLA_NOPE_DIM // 2),
+        Int32(_MLA_ROPE_VECS),
+        Int32(_MLA_ROPE_VECS),
+        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
+        lane,
+    )
+    cute.arch.cp_async_commit_group()
+    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
+        group_idx = Int32(block_offset)
+        _stage_kv_u32_block_async(
+            kv_nope_u32,
+            sTokenIdx,
+            group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
+            num_kv,
+            lane,
+        )
+        cute.arch.cp_async_commit_group()
+    _stage_kv_u32_block_async(
+        kv_rope_u32,
+        sTokenIdx,
+        Int32(0),
+        Int32(_MLA_ROPE_VECS),
+        Int32(_MLA_ROPE_VECS),
+        kv_rope_base_addr,
+        num_kv,
+        lane,
+    )
+    cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_wait_group(0)
+    cute.arch.sync_threads()
+
+    _zero_score_frag(score_frag)
+    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
+    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
+        group_idx = Int32(block_offset)
+        frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
+        _zero_score_frag(frag_tmp)
+        _literal_qk_mma_into_sfrag_mxfp8_raw(
+            frag_tmp,
+            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
+            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
+            lane,
+            Int32(0),
+            Int32(1),
+            Int32(_MLA_NUM_MMA_KV),
+            Int32(_MLA_NOPE_QK_NUM_MMA_D),
+            Int32(_MLA_NOPE_GROUP_Q_VECS),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+        )
+        _accumulate_scaled_score_frag(
+            score_frag,
+            frag_tmp,
+            sScale,
+            group_idx * Int32(_MLA_TOKEN_TILE),
+            lane,
+        )
+
+    frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
+    _zero_score_frag(frag_rope)
+    _literal_qk_mma_into_sfrag_bf16(
+        frag_rope,
+        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
+        kv_rope_base_addr,
+        lane,
+        Int32(0),
+        Int32(1),
+        Int32(_MLA_NUM_MMA_KV),
+        Int32(_MLA_QK_NUM_MMA_D),
+        Int32(_MLA_ROPE_VECS),
+        Int32(_MLA_ROPE_VECS),
+    )
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        for reg_id in cutlass.range_constexpr(8):
+            score_frag[0, mma_kv, reg_id] = Float32(score_frag[0, mma_kv, reg_id] + frag_rope[0, mma_kv, reg_id])
+
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        for reg_id in cutlass.range_constexpr(8):
+            row_slot = (reg_id % 4) // 2
+            head_local = lane_group + Int32(8) * row_slot
+            head_idx = head_tile_start + head_local
+            token_local = (
+                mma_kv * 16
+                + lane_pair_base
+                + Int32(8) * (reg_id // 4)
+                + Int32(reg_id % 2)
+            )
+            token_idx = Int32(sTokenIdx[token_local])
+            valid = token_local < tile_tokens
+            if valid:
+                valid = valid and token_idx >= Int32(0)
+            if valid:
+                valid = valid and token_idx < num_kv
+            if valid:
+                valid = valid and head_idx < num_heads
+            score_frag[0, mma_kv, reg_id] = (
+                Float32(score_frag[0, mma_kv, reg_id] * sm_scale_log2)
+                if valid
+                else Float32(-Float32.inf)
+            )
+    cute.arch.sync_threads()
+
+
+@cute.jit
+def _accumulate_pv_groups_from_p_frag_staged(
+    o_frag0: cute.Tensor,
+    o_frag1: cute.Tensor,
+    o_frag2: cute.Tensor,
+    o_frag3: cute.Tensor,
+    p_frag: cute.Tensor,
+    sScale: cute.Tensor,
+    kv_nope_base_addr: Int32,
+    lane: Int32,
+):
+    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
+        group_idx = Int32(block_offset)
+        scale_base = group_idx * Int32(_MLA_TOKEN_TILE)
+        tile_output_scale = _warp_allreduce_max(Float32(sScale[scale_base + lane]))
+        tile_pv_scale = (
+            Float32(0.0)
+            if tile_output_scale == Float32(0.0)
+            else cute.arch.rcp_approx(tile_output_scale)
+        )
+        tile_o_frag = cute.make_rmem_tensor(
+            cute.make_layout((1, _MLA_VO_NUM_MMA_D, 8), stride=(_MLA_VO_NUM_MMA_D * 8, 8, 1)),
+            Float32,
+        )
+        _zero_output_frag(tile_o_frag)
+        group_base_addr = kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES)
+        if cutlass.const_expr(
+            os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
+            or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
+        ):
+            _literal_pv_mma_into_ofrag_fp8_raw_scaled(
+                tile_o_frag,
+                p_frag,
+                group_base_addr,
+                sScale,
+                scale_base,
+                lane,
+            )
+        else:
+            _literal_pv_mma_into_ofrag_mxfp8_scaled(
+                tile_o_frag,
+                p_frag,
+                group_base_addr,
+                sScale,
+                scale_base,
+                tile_pv_scale,
+                lane,
+            )
+        if cutlass.const_expr(block_offset == 0):
+            _accumulate_scaled_output_frag(o_frag0, tile_o_frag, Float32(1.0))
+        elif cutlass.const_expr(block_offset == 1):
+            _accumulate_scaled_output_frag(o_frag1, tile_o_frag, Float32(1.0))
+        elif cutlass.const_expr(block_offset == 2):
+            _accumulate_scaled_output_frag(o_frag2, tile_o_frag, Float32(1.0))
+        else:
+            _accumulate_scaled_output_frag(o_frag3, tile_o_frag, Float32(1.0))
+
+
+@cute.jit
+def _store_output_groups(
+    out_tensor: cute.Tensor,
+    o_frag0: cute.Tensor,
+    o_frag1: cute.Tensor,
+    o_frag2: cute.Tensor,
+    o_frag3: cute.Tensor,
+    d_frag: cute.Tensor,
+    out_row_idx: Int32,
+    head_tile_start: Int32,
+    lane: Int32,
+):
+    _store_output_group(
+        out_tensor,
+        o_frag0,
+        d_frag,
+        out_row_idx,
+        head_tile_start,
+        Int32(0),
+        lane,
+    )
+    _store_output_group(
+        out_tensor,
+        o_frag1,
+        d_frag,
+        out_row_idx,
+        head_tile_start,
+        Int32(1),
+        lane,
+    )
+    _store_output_group(
+        out_tensor,
+        o_frag2,
+        d_frag,
+        out_row_idx,
+        head_tile_start,
+        Int32(2),
+        lane,
+    )
+    _store_output_group(
+        out_tensor,
+        o_frag3,
+        d_frag,
+        out_row_idx,
+        head_tile_start,
+        Int32(3),
+        lane,
+    )
+
+
+@cute.jit
 def _run_two_pass_sparse_mla_tile(
     q_u32: cute.Tensor,
     kv_nope_u32: cute.Tensor,
@@ -1204,38 +1694,113 @@ def _run_two_pass_sparse_mla_tile(
         m_frag[0, row_slot] = Float32(-Float32.inf)
         d_frag[0, row_slot] = Float32(0.0)
 
-    token_base = token_start
-    while token_base < token_end:
-        tile_end = cutlass.select_(
-            token_base + Int32(_MLA_TOKEN_TILE) < token_end,
-            token_base + Int32(_MLA_TOKEN_TILE),
-            token_end,
-        )
+    o_frag0 = cute.make_rmem_tensor(o_layout, Float32)
+    o_frag1 = cute.make_rmem_tensor(o_layout, Float32)
+    o_frag2 = cute.make_rmem_tensor(o_layout, Float32)
+    o_frag3 = cute.make_rmem_tensor(o_layout, Float32)
+    _zero_output_frag(o_frag0)
+    _zero_output_frag(o_frag1)
+    _zero_output_frag(o_frag2)
+    _zero_output_frag(o_frag3)
+    if token_end - token_start <= Int32(_MLA_TOKEN_TILE):
         score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-        _compute_score_tile_scaled(
-            score_frag,
-            q_u32,
-            kv_nope_u32,
-            kv_scales,
-            kv_rope_u32,
-            page_table_1,
-            sTokenIdx,
-            sScale,
-            q_base_addr,
-            kv_base_addr,
-            q_idx,
-            head_tile_start,
-            token_base,
-            tile_end,
-            sm_scale_log2,
-            lane,
-        )
+        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
+            _compute_score_tile_scaled(
+                score_frag,
+                q_u32,
+                kv_nope_u32,
+                kv_scales,
+                kv_rope_u32,
+                page_table_1,
+                sTokenIdx,
+                sScale,
+                q_base_addr,
+                kv_base_addr,
+                q_idx,
+                head_tile_start,
+                token_start,
+                token_end,
+                sm_scale_log2,
+                lane,
+            )
+        else:
+            _compute_score_tile_scaled_from_staged_nope(
+                score_frag,
+                q_u32,
+                kv_nope_u32,
+                kv_scales,
+                kv_rope_u32,
+                page_table_1,
+                sTokenIdx,
+                sScale,
+                q_base_addr,
+                kv_base_addr,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
+                q_idx,
+                head_tile_start,
+                token_start,
+                token_end,
+                sm_scale_log2,
+                lane,
+            )
         _update_softmax_stats_b2(score_frag, m_frag, d_frag)
-        token_base = tile_end
+        p_frag = cute.make_rmem_tensor(p_layout, Uint32)
+        _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
+        if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
+            _accumulate_pv_groups_from_p_frag(
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                p_frag,
+                kv_nope_u32,
+                kv_scales,
+                sTokenIdx,
+                sScale,
+                kv_base_addr,
+                lane,
+            )
+        else:
+            _accumulate_pv_groups_from_p_frag_staged(
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                p_frag,
+                sScale,
+                kv_base_addr,
+                lane,
+            )
+    else:
+        token_base = token_start
+        while token_base < token_end:
+            tile_end = cutlass.select_(
+                token_base + Int32(_MLA_TOKEN_TILE) < token_end,
+                token_base + Int32(_MLA_TOKEN_TILE),
+                token_end,
+            )
+            score_frag = cute.make_rmem_tensor(frag_layout, Float32)
+            _compute_score_tile_scaled(
+                score_frag,
+                q_u32,
+                kv_nope_u32,
+                kv_scales,
+                kv_rope_u32,
+                page_table_1,
+                sTokenIdx,
+                sScale,
+                q_base_addr,
+                kv_base_addr,
+                q_idx,
+                head_tile_start,
+                token_base,
+                tile_end,
+                sm_scale_log2,
+                lane,
+            )
+            _update_softmax_stats_b2(score_frag, m_frag, d_frag)
+            token_base = tile_end
 
-    for group_idx in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        o_frag = cute.make_rmem_tensor(o_layout, Float32)
-        _zero_output_frag(o_frag)
         token_base = token_start
         while token_base < token_end:
             tile_end = cutlass.select_(
@@ -1264,62 +1829,32 @@ def _run_two_pass_sparse_mla_tile(
             )
             p_frag = cute.make_rmem_tensor(p_layout, Uint32)
             _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
-
-            _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(group_idx), Int32(kv_nope_u32.shape[0]), lane)
-            tile_output_scale = _warp_allreduce_max(Float32(sScale[lane]))
-            tile_pv_scale = (
-                Float32(0.0)
-                if tile_output_scale == Float32(0.0)
-                else cute.arch.rcp_approx(tile_output_scale)
-            )
-            _stage_kv_u32_block(
+            _accumulate_pv_groups_from_p_frag(
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                p_frag,
                 kv_nope_u32,
+                kv_scales,
                 sTokenIdx,
-                Int32(group_idx * _MLA_NOPE_GROUP_KV_U32),
-                Int32(_MLA_NOPE_GROUP_KV_VECS),
-                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                sScale,
                 kv_base_addr,
-                Int32(kv_nope_u32.shape[0]),
                 lane,
             )
-            cute.arch.sync_threads()
-            tile_o_frag = cute.make_rmem_tensor(o_layout, Float32)
-            _zero_output_frag(tile_o_frag)
-            if cutlass.const_expr(
-                os.environ.get("B12X_MLA_ENABLE_MXFP8_PV", "0") != "1"
-                or os.environ.get("B12X_MLA_DEBUG_PV_BF16", "0") == "1"
-            ):
-                _literal_pv_mma_into_ofrag_fp8_raw_scaled(
-                    tile_o_frag,
-                    p_frag,
-                    kv_base_addr,
-                    sScale,
-                    lane,
-                )
-                accum_scale = Float32(1.0)
-            else:
-                _literal_pv_mma_into_ofrag_mxfp8_scaled(
-                    tile_o_frag,
-                    p_frag,
-                    kv_base_addr,
-                    sScale,
-                    tile_pv_scale,
-                    lane,
-                )
-                accum_scale = Float32(1.0)
-            _accumulate_scaled_output_frag(o_frag, tile_o_frag, accum_scale)
-            cute.arch.sync_threads()
             token_base = tile_end
 
-        _store_output_group(
-            out_tensor,
-            o_frag,
-            d_frag,
-            out_row_idx,
-            head_tile_start,
-            Int32(group_idx),
-            lane,
-        )
+    _store_output_groups(
+        out_tensor,
+        o_frag0,
+        o_frag1,
+        o_frag2,
+        o_frag3,
+        d_frag,
+        out_row_idx,
+        head_tile_start,
+        lane,
+    )
 
     if cutlass.const_expr(lse_tensor is not None):
         _store_partial_lse(lse_tensor, out_row_idx, head_tile_start, m_frag, d_frag, lane)
@@ -1343,7 +1878,7 @@ def get_sparse_mla_shared_storage_cls():
             16,
         ],
         "token_scale": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, _MLA_TOKEN_TILE],
+            cute.struct.MemRange[cutlass.Float32, _MLA_SCALE_STAGE_ELEMS],
             16,
         ],
     }
@@ -1402,7 +1937,9 @@ class SparseMLAKernel:
         SharedStorage = get_sparse_mla_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
+        sScale = storage.token_scale.get_tensor(
+            cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,))
+        )
         q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
         kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
 

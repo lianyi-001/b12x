@@ -31,7 +31,7 @@ class MLAWorkspace:
     padded_heads: int = 128
     use_cuda_graph: bool = False
     fixed_capacity: bool = False
-    max_chunks_per_row: int = 8
+    max_chunks_per_row: int = 64
     page_table_1: torch.Tensor | None = None
     cache_seqlens_int32: torch.Tensor | None = None
     nsa_cache_seqlens_int32: torch.Tensor | None = None
@@ -122,7 +122,8 @@ class MLAWorkspace:
             padded_heads=padded_heads,
         )
         workspace.fixed_capacity = True
-        workspace._allocate_runtime_metadata()
+        if use_cuda_graph:
+            workspace._allocate_runtime_metadata()
         return workspace
 
     def _allocate_padded_query(self) -> None:
@@ -227,6 +228,8 @@ class MLAWorkspace:
         cache_seqlens_int32: torch.Tensor,
         nsa_cache_seqlens_int32: torch.Tensor,
     ) -> None:
+        if not self.use_cuda_graph:
+            raise RuntimeError("bind_cuda_graph_runtime_metadata is only valid for graph-mode workspaces")
         self._prepare_sparse(
             page_table_1=page_table_1,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -296,11 +299,16 @@ class MLAWorkspace:
                 f"{page_table_1.shape[0]} do not match nsa_cache_seqlens_int32 rows "
                 f"{nsa_cache_seqlens_int32.shape[0]}"
             )
-        use_runtime_buffers = self.fixed_capacity or self.use_cuda_graph
+        use_runtime_buffers = self.use_cuda_graph
         if not use_runtime_buffers:
-            self.page_table_1 = page_table_1
-            self.cache_seqlens_int32 = cache_seqlens_int32
-            self.nsa_cache_seqlens_int32 = nsa_cache_seqlens_int32
+            if self.device.type == "cuda":
+                self.page_table_1 = page_table_1
+                self.cache_seqlens_int32 = cache_seqlens_int32
+                self.nsa_cache_seqlens_int32 = nsa_cache_seqlens_int32
+            else:
+                self.page_table_1 = page_table_1.clone()
+                self.cache_seqlens_int32 = cache_seqlens_int32.clone()
+                self.nsa_cache_seqlens_int32 = nsa_cache_seqlens_int32.clone()
             return
 
         self._allocate_runtime_metadata()
