@@ -27,15 +27,37 @@ def make_sparse_pool_locs(
     pool_tokens: int,
     seed: int,
     device: torch.device,
+    page_size: int = 64,
 ) -> torch.Tensor:
     if pool_tokens < active_tokens:
         raise ValueError(
             f"pool_tokens {pool_tokens} must be at least active_tokens {active_tokens}"
         )
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if pool_tokens % page_size != 0:
+        raise ValueError(
+            f"pool_tokens {pool_tokens} must be divisible by page_size {page_size} "
+            "for the paged benchmark contract"
+        )
+    if active_tokens == 0:
+        return torch.empty((0,), dtype=torch.int32, device=device)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
-    locs = torch.randperm(pool_tokens, generator=gen)[:active_tokens]
-    return locs.to(device=device, dtype=torch.int32)
+    active_pages = (active_tokens + page_size - 1) // page_size
+    pool_pages = pool_tokens // page_size
+    if pool_pages < active_pages:
+        raise ValueError(
+            f"pool page capacity {pool_pages} is smaller than active page count {active_pages}"
+        )
+    page_ids = torch.randperm(pool_pages, generator=gen, dtype=torch.int64)[:active_pages]
+    locs = []
+    remaining = active_tokens
+    for page_id in page_ids.tolist():
+        take = min(page_size, remaining)
+        locs.append(page_id * page_size + torch.arange(take, dtype=torch.int64))
+        remaining -= take
+    return torch.cat(locs).to(device=device, dtype=torch.int32)
 
 
 def scatter_rows_into_pool(
@@ -74,6 +96,36 @@ def make_dense_candidate_page_table(
     if token_locs.numel():
         page_table[:, : token_locs.shape[0]] = token_locs.unsqueeze(0).expand(batch_size, -1)
     return page_table
+
+
+def make_dense_real_page_table(
+    *,
+    batch_size: int,
+    token_locs: torch.Tensor,
+    width_blocks: int,
+    page_size: int = 64,
+    fill_value: int = -1,
+) -> torch.Tensor:
+    if token_locs.ndim != 1:
+        raise ValueError(f"token_locs must be rank-1, got {tuple(token_locs.shape)}")
+    if width_blocks <= 0:
+        raise ValueError(f"width_blocks must be positive, got {width_blocks}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    page_ids = token_locs[::page_size] // page_size
+    if page_ids.shape[0] > width_blocks:
+        raise ValueError(
+            f"width_blocks {width_blocks} must be at least active page count {page_ids.shape[0]}"
+        )
+    real_page_table = torch.full(
+        (batch_size, width_blocks),
+        int(fill_value),
+        dtype=torch.int32,
+        device=token_locs.device,
+    )
+    if page_ids.numel():
+        real_page_table[:, : page_ids.shape[0]] = page_ids.unsqueeze(0).expand(batch_size, -1)
+    return real_page_table
 
 
 def capture_cuda_graph(

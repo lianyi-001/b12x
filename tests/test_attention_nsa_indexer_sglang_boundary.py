@@ -8,12 +8,12 @@ import pytest
 import torch
 
 from b12x.integration.nsa_indexer import (
-    NSAIndexerDecodeMetadata,
-    NSAIndexerExtendMetadata,
+    NSAIndexerExtendLogitsMetadata,
+    NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
     pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_decode_topk,
-    sparse_nsa_index_extend_topk,
+    sparse_nsa_index_decode_logits_paged,
+    sparse_nsa_index_extend_logits,
 )
 
 
@@ -42,6 +42,38 @@ class _FakePool:
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         del layer_id
         return self._index_k_cache
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del layer_id, max_seq_len
+        page_size = self.page_size
+        data_bytes = page_size * 128
+        k_bytes = torch.empty((seq_len_sum, 128), dtype=torch.uint8, device=self._index_k_cache.device)
+        scale_bytes = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=self._index_k_cache.device)
+        write_row = 0
+        for batch_row in range(page_indices.shape[0]):
+            seq_len = int(seq_len_tensor[batch_row].item())
+            for token_pos in range(seq_len):
+                page_col = token_pos // page_size
+                slot = token_pos % page_size
+                page_id = int(page_indices[batch_row, page_col].item())
+                k_bytes[write_row] = self._index_k_cache[
+                    page_id,
+                    slot * 128 : (slot + 1) * 128,
+                ]
+                scale_bytes[write_row] = self._index_k_cache[
+                    page_id,
+                    data_bytes + slot * 4 : data_bytes + (slot + 1) * 4,
+                ]
+                write_row += 1
+        assert write_row == seq_len_sum
+        return k_bytes, scale_bytes
 
 
 class _FakeDecodeMode:
@@ -101,18 +133,21 @@ class _FakePagedMetadata:
     def get_nsa_extend_len_cpu(self) -> list[int]:
         return self._extend_lens
 
-    def topk_transform(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
+    def topk_transform(self, logits: torch.Tensor, topk: int, **kwargs) -> torch.Tensor:
+        del kwargs
         rows = logits.shape[0]
         output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
-        lengths = self._seqlens_expanded[:rows]
-        page_table_1 = self._page_table_1[:rows]
-        for row_idx in range(rows):
-            seq_len = min(int(lengths[row_idx].item()), page_table_1.shape[1])
-            if seq_len <= 0:
-                continue
-            row_logits = logits[row_idx, :seq_len]
-            topk_pos = torch.argsort(row_logits, descending=True, stable=True)[: min(topk, seq_len)]
-            output[row_idx, : topk_pos.numel()] = page_table_1[row_idx, topk_pos.to(torch.long)]
+        gather_k = min(topk, logits.shape[1], self._page_table_1.shape[1])
+        if gather_k == 0:
+            return output
+        topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
+        topk_values = torch.gather(logits, 1, topk_pos)
+        gathered = torch.gather(self._page_table_1[:rows], 1, topk_pos.to(torch.long))
+        output[:, :gather_k] = torch.where(
+            torch.isfinite(topk_values),
+            gathered,
+            torch.full_like(gathered, -1),
+        )
         return output
 
 
@@ -121,21 +156,79 @@ class _FakeRaggedMetadata:
         self,
         *,
         page_table_1: torch.Tensor,
+        real_page_table: torch.Tensor,
         seqlens_expanded: torch.Tensor,
         extend_lens: list[int],
+        indexer_seq_lens: torch.Tensor,
+        k_start: torch.Tensor,
+        k_end: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
     ) -> None:
         self._page_table_1 = page_table_1
+        self._real_page_table = real_page_table
         self._seqlens_expanded = seqlens_expanded
         self._extend_lens = extend_lens
+        self._indexer_seq_lens = indexer_seq_lens
+        self._k_start = k_start
+        self._k_end = k_end
+        self._token_to_batch_idx = token_to_batch_idx
+        self.attn_metadata = type("_FakeAttnMetadata", (), {"topk_indices_offset": None})()
 
     def get_page_table_1(self) -> torch.Tensor:
         return self._page_table_1
+
+    def get_page_table_64(self) -> torch.Tensor:
+        return self._real_page_table
 
     def get_seqlens_expanded(self) -> torch.Tensor:
         return self._seqlens_expanded
 
     def get_nsa_extend_len_cpu(self) -> list[int]:
         return self._extend_lens
+
+    def get_indexer_kvcache_range(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._k_start, self._k_end
+
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        return self._indexer_seq_lens
+
+    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        return self._indexer_seq_lens.cpu()
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        return self._token_to_batch_idx
+
+    def topk_transform(
+        self,
+        logits: torch.Tensor,
+        topk: int,
+        ks: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        ke_offset: torch.Tensor | None = None,
+        batch_idx_list: list[int] | torch.Tensor | None = None,
+        topk_indices_offset_override: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_q, batch_idx_list, topk_indices_offset_override
+        if ks is None:
+            raise RuntimeError("ragged topk_transform requires ks")
+        lengths = ke_offset if ke_offset is not None else self._seqlens_expanded[: logits.shape[0]]
+        output = torch.full((logits.shape[0], topk), -1, dtype=torch.int32, device=logits.device)
+        gather_k = min(topk, logits.shape[1])
+        if gather_k == 0:
+            return output
+        positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32).unsqueeze(0)
+        row_start = ks.unsqueeze(1)
+        row_end = row_start + lengths.unsqueeze(1)
+        valid = (positions >= row_start) & (positions < row_end)
+        masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+        topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :gather_k]
+        topk_values = torch.gather(masked_logits, 1, topk_pos)
+        output[:, :gather_k] = torch.where(
+            torch.isfinite(topk_values),
+            topk_pos.to(torch.int32),
+            torch.full_like(topk_pos, -1, dtype=torch.int32),
+        )
+        return output
 
 
 def _make_fake_indexer(module, *, topk: int):
@@ -144,6 +237,11 @@ def _make_fake_indexer(module, *, topk: int):
         _use_b12x_mla_indexer = staticmethod(module.Indexer._use_b12x_mla_indexer)
         _get_b12x_paged_topk = module.Indexer._get_b12x_paged_topk
         _get_b12x_ragged_topk = module.Indexer._get_b12x_ragged_topk
+
+        @staticmethod
+        def _should_chunk_mqa_logits(num_q: int, num_k: int, device: torch.device):
+            del num_q, num_k, device
+            return False, 0
 
     return _FakeIndexer()
 
@@ -231,16 +329,16 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
         weights,
         metadata,
     )
-    expected = sparse_nsa_index_decode_topk(
+    expected_logits = sparse_nsa_index_decode_logits_paged(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=NSAIndexerDecodeMetadata(
-            page_table_1=page_table_1,
+        metadata=NSAIndexerPagedDecodeMetadata(
+            real_page_table=real_page_table,
             cache_seqlens_int32=seqlens,
         ),
-        topk=topk,
     )
+    expected = metadata.topk_transform(expected_logits, topk)
 
     assert torch.equal(actual, expected)
 
@@ -299,19 +397,19 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
         weights,
         metadata,
     )
-    expected = sparse_nsa_index_decode_topk(
-        q_fp8=q_fp8,
-        weights=weights,
+    expected_logits = sparse_nsa_index_decode_logits_paged(
+        q_fp8=q_fp8[:active_rows],
+        weights=weights[:active_rows],
         index_k_cache=index_k_cache,
-        metadata=NSAIndexerDecodeMetadata(
-            page_table_1=page_table_1[:active_rows],
+        metadata=NSAIndexerPagedDecodeMetadata(
+            real_page_table=real_page_table[:active_rows],
             cache_seqlens_int32=seqlens[:active_rows],
         ),
-        topk=topk,
     )
+    expected = metadata.topk_transform(expected_logits, topk)
+    padding = torch.full((1, topk), -1, dtype=torch.int32)
 
-    assert torch.equal(actual, expected)
-    assert torch.equal(actual[active_rows], torch.full((topk,), -1, dtype=torch.int32))
+    assert torch.equal(actual, torch.cat([expected, padding], dim=0))
 
 
 def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> None:
@@ -319,9 +417,15 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_101)
 
-    num_tokens = 128
-    num_heads = 2
     topk = 5
+    seq_lens = torch.tensor([70, 130], dtype=torch.int32)
+    extend_lens = [2, 3]
+    seqlens_expanded = torch.tensor([70, 70, 130, 130, 130], dtype=torch.int32)
+    token_to_batch_idx = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
+    k_start = torch.tensor([0, 0, 70, 70, 70], dtype=torch.int32)
+    k_end = torch.tensor([70, 70, 200, 200, 200], dtype=torch.int32)
+    num_tokens = 256
+    num_heads = 2
 
     index_k_cache = pack_nsa_index_k_cache_reference(
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32) / 3
@@ -330,11 +434,12 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
         torch.randn((6, num_heads, 128), generator=gen, dtype=torch.float32) / 2
     ).to(torch.float8_e4m3fn)
     weights = torch.randn((6, num_heads, 1), generator=gen, dtype=torch.float32)
-    page_table_1 = torch.full((2, 12), -1, dtype=torch.int32)
-    page_table_1[0, :7] = torch.tensor([1, 3, 5, 7, 9, 11, 13], dtype=torch.int32)
-    page_table_1[1, :9] = torch.tensor([64, 66, 68, 70, 72, 74, 76, 78, 80], dtype=torch.int32)
-    seqlens_expanded = torch.tensor([6, 7, 7, 8, 9], dtype=torch.int32)
-    extend_lens = [2, 3]
+    page_table_1, real_page_table = _make_paged_candidate_tables(
+        page_starts=[1, 2],
+        seqlens=seq_lens.tolist(),
+        width_blocks=3,
+        device=torch.device("cpu"),
+    )
 
     fake_indexer = _make_fake_indexer(module, topk=topk)
     fake_forward_batch = type(
@@ -348,8 +453,13 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
     )()
     metadata = _FakeRaggedMetadata(
         page_table_1=page_table_1,
+        real_page_table=real_page_table,
         seqlens_expanded=seqlens_expanded,
         extend_lens=extend_lens,
+        indexer_seq_lens=seq_lens,
+        k_start=k_start,
+        k_end=k_end,
+        token_to_batch_idx=token_to_batch_idx,
     )
 
     actual = module.Indexer._get_topk_ragged(
@@ -361,19 +471,31 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
         weights,
         metadata,
     )
-    expected = sparse_nsa_index_extend_topk(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        metadata=NSAIndexerExtendMetadata(
-            page_table_1=page_table_1,
-            nsa_seqlens_expanded=seqlens_expanded,
-            nsa_extend_seq_lens_list=extend_lens,
-        ),
-        topk=topk,
+    k_fp8_bytes, k_scale_bytes = fake_forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+        0,
+        seq_lens,
+        real_page_table,
+        int(seq_lens.sum().item()),
+        int(seq_lens.max().item()),
     )
+    kv_fp8 = (
+        k_fp8_bytes.view(torch.float8_e4m3fn),
+        k_scale_bytes.view(torch.float32).squeeze(-1),
+    )
+    expected_logits = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8[: k_start.numel()],
+        weights=weights[: k_start.numel()],
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(
+            k_start=k_start,
+            k_end=k_end,
+        ),
+    )
+    expected = metadata.topk_transform(expected_logits, topk, ks=k_start)
+    padded_expected = torch.full((q_fp8.shape[0], topk), -1, dtype=torch.int32)
+    padded_expected[: expected.shape[0]] = expected
 
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual, padded_expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture coverage")
@@ -396,12 +518,9 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
     )
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device)
-        / 2
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads, 1), generator=gen, dtype=torch.float32).to(
-        device=device
-    )
+    weights = torch.randn((q_rows, num_heads, 1), generator=gen, dtype=torch.float32).to(device=device)
     page_table_1, real_page_table = _make_paged_candidate_tables(
         page_starts=page_starts,
         seqlens=seqlens.tolist(),
@@ -451,16 +570,18 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     graph.replay()
     torch.cuda.synchronize(device)
 
-    expected = sparse_nsa_index_decode_topk(
-        q_fp8=q_fp8,
-        weights=weights,
+    expected_logits = sparse_nsa_index_decode_logits_paged(
+        q_fp8=q_fp8[:active_rows],
+        weights=weights[:active_rows],
         index_k_cache=index_k_cache,
-        metadata=NSAIndexerDecodeMetadata(
-            page_table_1=page_table_1[:active_rows],
+        metadata=NSAIndexerPagedDecodeMetadata(
+            real_page_table=real_page_table[:active_rows],
             cache_seqlens_int32=seqlens[:active_rows],
         ),
-        topk=topk,
     )
+    expected = metadata.topk_transform(expected_logits, topk)
+    padded_expected = torch.full((q_rows, topk), -1, dtype=torch.int32, device=device)
+    padded_expected[:active_rows] = expected
 
     assert captured_out is not None
-    assert torch.equal(captured_out, expected)
+    assert torch.equal(captured_out, padded_expected)

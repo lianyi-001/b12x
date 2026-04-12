@@ -4,58 +4,95 @@ import torch
 
 from b12x.attention.nsa_indexer.reference import (
     pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_reference,
+    sparse_nsa_extend_logits_reference,
+    sparse_nsa_paged_logits_reference,
     unpack_nsa_index_k_cache_reference,
 )
 
 
-def _manual_index_topk(
+_FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def _make_real_page_table(
+    *,
+    page_starts: list[int],
+    seqlens: list[int],
+    width_blocks: int,
+    device: torch.device,
+) -> torch.Tensor:
+    real_page_table = torch.full(
+        (len(seqlens), width_blocks),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    for row_idx, (page_start, seq_len) in enumerate(zip(page_starts, seqlens, strict=True)):
+        block_count = (int(seq_len) + 63) // 64
+        if block_count:
+            real_page_table[row_idx, :block_count] = torch.arange(
+                page_start,
+                page_start + block_count,
+                dtype=torch.int32,
+                device=device,
+            )
+    return real_page_table
+
+
+def _manual_paged_logits(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    page_table_1: torch.Tensor,
+    k_matrix: torch.Tensor,
+    real_page_table: torch.Tensor,
     query_row_to_batch: torch.Tensor,
     seqlens_per_query: torch.Tensor,
-    topk: int,
-    page_size: int = 64,
 ) -> torch.Tensor:
     num_queries = q_fp8.shape[0]
-    output = torch.full((num_queries, topk), -1, dtype=torch.int32, device=q_fp8.device)
-
-    data_bytes = page_size * 128
-    cache = index_k_cache.contiguous()
+    width_tokens = real_page_table.shape[1] * 64
+    out = torch.full((num_queries, width_tokens), float("-inf"), dtype=torch.float32, device=q_fp8.device)
+    q_fp32 = q_fp8.to(torch.float32)
+    weights_f = weights.to(torch.float32)
     for query_row in range(int(query_row_to_batch.numel())):
         batch_row = int(query_row_to_batch[query_row].item())
-        seq_len = int(seqlens_per_query[query_row].item())
-        scores: list[torch.Tensor] = []
-        token_ids: list[int] = []
-        for pos in range(min(seq_len, page_table_1.shape[1])):
-            token_id = int(page_table_1[batch_row, pos].item())
-            if token_id < 0:
+        seq_len = min(int(seqlens_per_query[query_row].item()), width_tokens)
+        for token_pos in range(seq_len):
+            page_col = token_pos // 64
+            page_id = int(real_page_table[batch_row, page_col].item())
+            if page_id < 0:
                 continue
-            page_idx = token_id // page_size
-            slot_idx = token_id % page_size
-            quant = (
-                cache[page_idx, slot_idx * 128 : (slot_idx + 1) * 128]
-                .contiguous()
-                .view(torch.float8_e4m3fn)
-                .to(torch.float32)
-            )
-            scale_offset = data_bytes + slot_idx * 4
-            scale = cache[page_idx, scale_offset : scale_offset + 4].contiguous().view(torch.float32)[0]
-            logits = torch.matmul(q_fp8[query_row].to(torch.float32), quant)
-            score = (torch.relu(logits) * weights[query_row].to(torch.float32)).sum() * scale
-            scores.append(score)
-            token_ids.append(token_id)
-        if not scores:
+            token_idx = page_id * 64 + (token_pos % 64)
+            score = torch.matmul(q_fp32[query_row], k_matrix[token_idx]).relu_()
+            out[query_row, token_pos] = (score * weights_f[query_row]).sum()
+    return out
+
+
+def _quantize_rows_to_kv_fp8(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = k.abs().amax(dim=1) / _FP8_E4M3_MAX
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    quant = (k / scale.unsqueeze(1)).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return quant, scale.to(torch.float32)
+
+
+def _manual_extend_logits(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    k_matrix: torch.Tensor,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+) -> torch.Tensor:
+    num_queries = q_fp8.shape[0]
+    out = torch.full((num_queries, k_matrix.shape[0]), float("-inf"), dtype=torch.float32, device=q_fp8.device)
+    q_fp32 = q_fp8.to(torch.float32)
+    weights_f = weights.to(torch.float32)
+    for query_row in range(int(k_start.numel())):
+        ks = max(0, int(k_start[query_row].item()))
+        ke = min(int(k_end[query_row].item()), k_matrix.shape[0])
+        if ke <= ks:
             continue
-        score_tensor = torch.stack(scores)
-        token_tensor = torch.tensor(token_ids, dtype=torch.int32, device=q_fp8.device)
-        count = min(topk, score_tensor.numel())
-        topk_pos = torch.argsort(score_tensor, descending=True, stable=True)[:count]
-        output[query_row, :count] = token_tensor[topk_pos]
-    return output
+        score = torch.matmul(q_fp32[query_row], k_matrix[ks:ke].transpose(0, 1)).relu_()
+        out[query_row, ks:ke] = (score * weights_f[query_row].unsqueeze(1)).sum(dim=0)
+    return out
 
 
 @torch.inference_mode()
@@ -74,117 +111,81 @@ def test_pack_nsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> Non
         assert rmse <= 0.008, f"num_tokens={num_tokens}: rmse={rmse:.6f}"
 
 
-def test_sparse_nsa_index_reference_matches_manual_decode_topk() -> None:
+def test_sparse_nsa_paged_logits_reference_matches_manual() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_001)
 
-    num_tokens = 96
-    q_rows = 2
+    page_starts = [2, 6, 10]
+    width_blocks = 3
+    num_tokens = (max(page_starts) + width_blocks) * 64
+    q_rows = 3
     num_heads = 4
-    topk = 5
-
+    seqlens = torch.tensor([65, 96, 130], dtype=torch.int32, device=device)
+    real_page_table = _make_real_page_table(
+        page_starts=page_starts,
+        seqlens=seqlens.tolist(),
+        width_blocks=width_blocks,
+        device=device,
+    )
     k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 3
     index_k_cache = pack_nsa_index_k_cache_reference(k)
+    unpacked = unpack_nsa_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
     q_fp8 = (
         torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
     ).to(torch.float8_e4m3fn)
     weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
-    page_table_1 = torch.full((2, 16), -1, dtype=torch.int32, device=device)
-    page_table_1[0, :7] = torch.tensor([4, 9, 11, 18, 33, 40, 63], dtype=torch.int32)
-    page_table_1[1, :9] = torch.tensor([2, 8, 15, 21, 45, 64, 65, 72, 80], dtype=torch.int32)
-    query_row_to_batch = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    seqlens_per_query = torch.tensor([7, 9], dtype=torch.int32, device=device)
 
-    actual = sparse_nsa_index_reference(
+    actual = sparse_nsa_paged_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
-        query_row_to_batch=query_row_to_batch,
-        seqlens_per_query=seqlens_per_query,
-        topk=topk,
+        real_page_table=real_page_table,
+        query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
+        seqlens_per_query=seqlens,
     )
-    expected = _manual_index_topk(
+    expected = _manual_paged_logits(
         q_fp8=q_fp8,
         weights=weights,
-        index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
-        query_row_to_batch=query_row_to_batch,
-        seqlens_per_query=seqlens_per_query,
-        topk=topk,
+        k_matrix=unpacked,
+        real_page_table=real_page_table,
+        query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
+        seqlens_per_query=seqlens,
     )
 
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_nsa_index_reference_handles_extend_expansion_and_padded_rows() -> None:
+def test_sparse_nsa_extend_logits_reference_matches_manual() -> None:
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_002)
 
-    num_tokens = 130
+    q_rows = 5
     num_heads = 3
-    topk = 4
-
-    k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 3
-    index_k_cache = pack_nsa_index_k_cache_reference(k)
+    k_rows = 80
     q_fp8 = (
-        torch.randn((6, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((6, num_heads), generator=gen, dtype=torch.float32, device=device)
-    page_table_1 = torch.full((2, 12), -1, dtype=torch.int32, device=device)
-    page_table_1[0, :8] = torch.tensor([1, 3, 5, 7, 9, 11, 13, 15], dtype=torch.int32)
-    page_table_1[1, :10] = torch.tensor([64, 66, 68, 70, 72, 74, 76, 78, 80, 82], dtype=torch.int32)
-    query_row_to_batch = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32, device=device)
-    seqlens_per_query = torch.tensor([7, 8, 8, 9, 10], dtype=torch.int32, device=device)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.tensor([0, 4, 12, 40, 40], dtype=torch.int32, device=device)
+    k_end = torch.tensor([8, 20, 20, 56, 40], dtype=torch.int32, device=device)
 
-    actual = sparse_nsa_index_reference(
+    actual = sparse_nsa_extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
-        index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
-        query_row_to_batch=query_row_to_batch,
-        seqlens_per_query=seqlens_per_query,
-        topk=topk,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
     )
-
-    expected = _manual_index_topk(
+    expected = _manual_extend_logits(
         q_fp8=q_fp8,
         weights=weights,
-        index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
-        query_row_to_batch=query_row_to_batch,
-        seqlens_per_query=seqlens_per_query,
-        topk=topk,
+        k_matrix=kv_fp8[0].to(torch.float32) * kv_fp8[1].unsqueeze(1),
+        k_start=k_start,
+        k_end=k_end,
     )
 
-    assert torch.equal(actual[:5], expected[:5])
-    assert torch.equal(actual[5], torch.full((topk,), -1, dtype=torch.int32))
-
-
-def test_sparse_nsa_index_reference_prefers_earlier_positions_on_ties() -> None:
-    device = torch.device("cpu")
-    num_tokens = 32
-    num_heads = 3
-    topk = 4
-
-    index_k_cache = pack_nsa_index_k_cache_reference(
-        torch.randn((num_tokens, 128), dtype=torch.float32, device=device) / 3
-    )
-    q_fp8 = torch.zeros((1, num_heads, 128), dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
-    weights = torch.randn((1, num_heads), dtype=torch.float32, device=device)
-    page_table_1 = torch.full((1, 8), -1, dtype=torch.int32, device=device)
-    page_table_1[0, :6] = torch.tensor([19, 7, 23, 5, 11, 13], dtype=torch.int32, device=device)
-
-    actual = sparse_nsa_index_reference(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
-        query_row_to_batch=torch.tensor([0], dtype=torch.int32, device=device),
-        seqlens_per_query=torch.tensor([6], dtype=torch.int32, device=device),
-        topk=topk,
-    )
-
-    assert torch.equal(actual[0], torch.tensor([19, 7, 23, 5], dtype=torch.int32, device=device))
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)

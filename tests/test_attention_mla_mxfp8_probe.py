@@ -99,6 +99,13 @@ def _fill_probe_p_frag(
 
 
 @cute.jit
+def _load_u8_from_u32_row(src_u32: cute.Tensor, row: Int32, col: Int32) -> Uint32:
+    word = Uint32(src_u32[row, col // Int32(4)])
+    shift = (col % Int32(4)) * Int32(8)
+    return (word >> shift) & Uint32(0xFF)
+
+
+@cute.jit
 def _literal_pv_mma_into_ofrag_mxfp8_probe_swap_k_halves(
     o_frag: cute.Tensor,
     p_frag: cute.Tensor,
@@ -1625,6 +1632,243 @@ class TinyBf16RawQkProbeKernel:
             out_dump[lane, reg_id] = Float32(score_frag[0, 0, reg_id])
 
 
+class TinyRawFp8QLoadProbeKernel:
+    num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        q_u32: cute.Tensor,
+        a_lo_raw_dump: cute.Tensor,
+        a_hi_raw_dump: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(q_u32, a_lo_raw_dump, a_hi_raw_dump).launch(
+            grid=(1, 1, 1),
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_u32: cute.Tensor,
+        a_lo_raw_dump: cute.Tensor,
+        a_hi_raw_dump: cute.Tensor,
+    ):
+        lane = cute.arch.lane_idx()
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class SharedStorage:
+            q_stage: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, _MLA_HEADS_PER_TILE * 128],
+                16,
+            ]
+
+        storage = smem.allocate(SharedStorage)
+        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
+
+        linear = lane
+        total = Int32(_MLA_HEADS_PER_TILE) * Int32(128 // 16)
+        while linear < total:
+            row = linear // Int32(128 // 16)
+            vec_idx = linear - row * Int32(128 // 16)
+            dst_addr = _smem_addr_from_b128_offset(
+                q_base_addr,
+                _permuted_offset_128b(row, vec_idx, Int32(128 // 16)),
+            )
+            src_u32 = vec_idx * Int32(4)
+            st_shared_v4_u32(
+                dst_addr,
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(0)]),
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(1)]),
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(2)]),
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(3)]),
+            )
+            linear += Int32(self.num_threads)
+        cute.arch.sync_threads()
+
+        q_offset = _permuted_offset_128b(
+            lane % Int32(16),
+            lane // Int32(16),
+            Int32(128 // 16),
+        )
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset))
+        a_lo_raw_dump[lane, 0] = a0
+        a_lo_raw_dump[lane, 1] = a1
+        a_lo_raw_dump[lane, 2] = a2
+        a_lo_raw_dump[lane, 3] = a3
+
+        q_offset_cur = _advance_offset_by_row_128b(q_offset, 16, Int32(128 // 16))
+        q_offset_mid = _advance_offset_by_column_128b_2(q_offset_cur, 0) - Int32(
+            16 * (128 // 16)
+        )
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_mid))
+        a_hi_raw_dump[lane, 0] = a0
+        a_hi_raw_dump[lane, 1] = a1
+        a_hi_raw_dump[lane, 2] = a2
+        a_hi_raw_dump[lane, 3] = a3
+
+
+class TinyRawFp8QkProbeKernel:
+    num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        q_u32: cute.Tensor,
+        k_u32: cute.Tensor,
+        a_dump: cute.Tensor,
+        out_dump: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(q_u32, k_u32, a_dump, out_dump).launch(
+            grid=(1, 1, 1),
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_u32: cute.Tensor,
+        k_u32: cute.Tensor,
+        a_dump: cute.Tensor,
+        out_dump: cute.Tensor,
+    ):
+        lane = cute.arch.lane_idx()
+        smem = cutlass.utils.SmemAllocator()
+        SharedStorage = get_sparse_mla_shared_storage_cls()
+        storage = smem.allocate(SharedStorage)
+        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
+        k_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+        s_q_bytes = storage.q_stage.get_tensor(
+            cute.make_layout((_MLA_HEADS_PER_TILE, 128), stride=(128, 1))
+        )
+
+        linear = lane
+        total_q = Int32(_MLA_HEADS_PER_TILE) * Int32(128 // 16)
+        while linear < total_q:
+            row = linear // Int32(128 // 16)
+            vec_idx = linear - row * Int32(128 // 16)
+            dst_addr = q_base_addr + row * Int32(128) + vec_idx * Int32(16)
+            src_u32 = vec_idx * Int32(4)
+            st_shared_v4_u32(
+                dst_addr,
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(0)]),
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(1)]),
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(2)]),
+                Uint32(q_u32[Int32(0), row, src_u32 + Int32(3)]),
+            )
+            linear += Int32(self.num_threads)
+
+        linear = lane
+        total_k = Int32(_MLA_TOKEN_TILE) * Int32(_MLA_NOPE_GROUP_KV_VECS)
+        while linear < total_k:
+            row = linear // Int32(_MLA_NOPE_GROUP_KV_VECS)
+            vec_idx = linear - row * Int32(_MLA_NOPE_GROUP_KV_VECS)
+            dst_addr = _smem_addr_from_b128_offset(
+                k_base_addr,
+                _permuted_offset_128b(row, vec_idx, Int32(_MLA_NOPE_GROUP_KV_VECS)),
+            )
+            src_u32 = vec_idx * Int32(4)
+            st_shared_v4_u32(
+                dst_addr,
+                Uint32(k_u32[row, src_u32 + Int32(0)]),
+                Uint32(k_u32[row, src_u32 + Int32(1)]),
+                Uint32(k_u32[row, src_u32 + Int32(2)]),
+                Uint32(k_u32[row, src_u32 + Int32(3)]),
+            )
+            linear += Int32(self.num_threads)
+        cute.arch.sync_threads()
+
+        group = lane // Int32(4)
+        sub = lane % Int32(4)
+        base = sub * Int32(2)
+        q_regs = cute.make_rmem_tensor(cute.make_layout((1, 4), stride=(4, 1)), Uint32)
+        q_regs[0, 0] = (
+            Uint32(s_q_bytes[group, base + Int32(0)])
+            | (Uint32(s_q_bytes[group, base + Int32(1)]) << Int32(8))
+            | (Uint32(s_q_bytes[group, base + Int32(8)]) << Int32(16))
+            | (Uint32(s_q_bytes[group, base + Int32(9)]) << Int32(24))
+        )
+        q_regs[0, 1] = (
+            Uint32(s_q_bytes[group + Int32(8), base + Int32(0)])
+            | (Uint32(s_q_bytes[group + Int32(8), base + Int32(1)]) << Int32(8))
+            | (Uint32(s_q_bytes[group + Int32(8), base + Int32(8)]) << Int32(16))
+            | (Uint32(s_q_bytes[group + Int32(8), base + Int32(9)]) << Int32(24))
+        )
+        q_regs[0, 2] = (
+            Uint32(s_q_bytes[group, base + Int32(16)])
+            | (Uint32(s_q_bytes[group, base + Int32(17)]) << Int32(8))
+            | (Uint32(s_q_bytes[group, base + Int32(24)]) << Int32(16))
+            | (Uint32(s_q_bytes[group, base + Int32(25)]) << Int32(24))
+        )
+        q_regs[0, 3] = (
+            Uint32(s_q_bytes[group + Int32(8), base + Int32(16)])
+            | (Uint32(s_q_bytes[group + Int32(8), base + Int32(17)]) << Int32(8))
+            | (Uint32(s_q_bytes[group + Int32(8), base + Int32(24)]) << Int32(16))
+            | (Uint32(s_q_bytes[group + Int32(8), base + Int32(25)]) << Int32(24))
+        )
+        for reg_id in cutlass.range_constexpr(4):
+            a_dump[lane, reg_id] = q_regs[0, reg_id]
+
+        k_offset = _permuted_offset_128b(
+            lane % Int32(8),
+            (lane % Int32(16)) // Int32(8),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+        ) + Int32(8) * (lane // Int32(16)) * Int32(_MLA_NOPE_GROUP_KV_VECS)
+        b0_k0, b1_k0 = ldmatrix_m8n8x4_left_half_b16(
+            _smem_addr_from_b128_offset(k_base_addr, k_offset)
+        )
+        b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
+            _smem_addr_from_b128_offset(k_base_addr, k_offset)
+        )
+        b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
+        b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
+        b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
+        b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
+
+        unit_scale = Uint32(0x7F7F7F7F)
+        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+            Float32(0.0),
+            Float32(0.0),
+            Float32(0.0),
+            Float32(0.0),
+            q_regs[0, 0],
+            q_regs[0, 1],
+            q_regs[0, 2],
+            q_regs[0, 3],
+            b0_k0,
+            b0_k1,
+            unit_scale,
+            unit_scale,
+        )
+        d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+            Float32(0.0),
+            Float32(0.0),
+            Float32(0.0),
+            Float32(0.0),
+            q_regs[0, 0],
+            q_regs[0, 1],
+            q_regs[0, 2],
+            q_regs[0, 3],
+            b1_k0,
+            b1_k1,
+            unit_scale,
+            unit_scale,
+        )
+        out_dump[lane, 0] = Float32(d0)
+        out_dump[lane, 1] = Float32(d1)
+        out_dump[lane, 2] = Float32(d2)
+        out_dump[lane, 3] = Float32(d3)
+        out_dump[lane, 4] = Float32(d4)
+        out_dump[lane, 5] = Float32(d5)
+        out_dump[lane, 6] = Float32(d6)
+        out_dump[lane, 7] = Float32(d7)
+
+
 def _run_tiny_raw_qk_probe(
     *,
     q: torch.Tensor,
@@ -1667,6 +1911,70 @@ def _run_tiny_raw_qk_probe(
         "a_hi_bf16_dump": a_hi_bf16_dump.cpu(),
         "a_dump": a_dump.cpu(),
         "b_dump": b_dump.cpu(),
+        "out_dump": out_dump.cpu(),
+    }
+
+
+def _run_tiny_raw_fp8_q_load_probe(
+    *,
+    q_fp8: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    q_u32 = _view_last_dim_as_u32(q_fp8.view(torch.uint8))
+    a_lo_raw_dump = torch.empty((32, 4), device=q_fp8.device, dtype=torch.uint32)
+    a_hi_raw_dump = torch.empty((32, 4), device=q_fp8.device, dtype=torch.uint32)
+
+    kernel = TinyRawFp8QLoadProbeKernel()
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q_fp8.device).cuda_stream)
+    compiled = cute.compile(
+        kernel,
+        _to_cute_tensor(q_u32, cutlass.Uint32),
+        _to_cute_tensor(a_lo_raw_dump, cutlass.Uint32),
+        _to_cute_tensor(a_hi_raw_dump, cutlass.Uint32),
+        stream,
+    )
+    compiled(
+        _to_cute_tensor(q_u32, cutlass.Uint32),
+        _to_cute_tensor(a_lo_raw_dump, cutlass.Uint32),
+        _to_cute_tensor(a_hi_raw_dump, cutlass.Uint32),
+        stream,
+    )
+    torch.cuda.synchronize(q_fp8.device)
+    return {
+        "a_lo_raw_dump": a_lo_raw_dump.cpu(),
+        "a_hi_raw_dump": a_hi_raw_dump.cpu(),
+    }
+
+
+def _run_tiny_raw_fp8_qk_probe(
+    *,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    q_u32 = _view_last_dim_as_u32(q_fp8.view(torch.uint8))
+    k_u32 = _view_last_dim_as_u32(k.view(torch.uint8))
+    a_dump = torch.empty((32, 4), device=q_fp8.device, dtype=torch.uint32)
+    out_dump = torch.empty((32, 8), device=q_fp8.device, dtype=torch.float32)
+
+    kernel = TinyRawFp8QkProbeKernel()
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q_fp8.device).cuda_stream)
+    compiled = cute.compile(
+        kernel,
+        _to_cute_tensor(q_u32, cutlass.Uint32),
+        _to_cute_tensor(k_u32, cutlass.Uint32),
+        _to_cute_tensor(a_dump, cutlass.Uint32),
+        _to_cute_tensor(out_dump, cutlass.Float32),
+        stream,
+    )
+    compiled(
+        _to_cute_tensor(q_u32, cutlass.Uint32),
+        _to_cute_tensor(k_u32, cutlass.Uint32),
+        _to_cute_tensor(a_dump, cutlass.Uint32),
+        _to_cute_tensor(out_dump, cutlass.Float32),
+        stream,
+    )
+    torch.cuda.synchronize(q_fp8.device)
+    return {
+        "a_dump": a_dump.cpu(),
         "out_dump": out_dump.cpu(),
     }
 

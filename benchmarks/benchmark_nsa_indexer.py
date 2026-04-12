@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like decode replay for NSA top-k selection."""
+"""Benchmark realistic SGLang-like NSA logits plus top-k transform."""
 
 from __future__ import annotations
 
@@ -15,21 +15,27 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import sparse_nsa_index_reference
+from b12x.attention.nsa_indexer.reference import (
+    sparse_nsa_extend_logits_reference,
+    sparse_nsa_paged_logits_reference,
+)
 from b12x.integration.nsa_indexer import (
-    NSAIndexerDecodeMetadata,
-    NSAIndexerExtendMetadata,
+    NSAIndexerExtendLogitsMetadata,
+    NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
     pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_decode_topk,
-    sparse_nsa_index_extend_topk,
+    sparse_nsa_index_decode_logits_paged,
+    sparse_nsa_index_extend_logits,
 )
 
-from benchmarks.common import make_sparse_pool_locs, require_sm120, scatter_rows_into_pool
 from benchmarks.common import (
     bench_cuda_graph,
     capture_cuda_graph,
     make_dense_candidate_page_table,
+    make_dense_real_page_table,
+    make_sparse_pool_locs,
+    require_sm120,
+    scatter_rows_into_pool,
 )
 
 
@@ -46,13 +52,17 @@ class GLMNSAConfig:
     page_size: int = 64
 
 
+def _align_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 @functools.lru_cache(maxsize=1)
 def _load_glm_config() -> GLMNSAConfig:
     config_path = MODEL_PATH / "config.json"
     if not config_path.exists():
         raise SystemExit(f"GLM-5.1 config not found at {config_path}")
     config = json.loads(config_path.read_text())
-    return GLMNSAConfig(num_heads=int(config["num_attention_heads"]))
+    return GLMNSAConfig(num_heads=int(config["index_n_heads"]))
 
 
 def _parse_csv_ints(value: str) -> list[int]:
@@ -133,41 +143,81 @@ def _assert_exact_match(actual: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
-def _assert_decode_contract_match(
+def _select_paged_topk_from_logits(
     *,
-    actual: torch.Tensor,
-    expected: torch.Tensor,
+    logits: torch.Tensor,
     page_table_1: torch.Tensor,
     seqlens: torch.Tensor,
     topk: int,
-) -> None:
-    for row_idx in range(actual.shape[0]):
-        seq_len = int(seqlens[row_idx].item())
-        if seq_len <= topk:
-            if not torch.equal(actual[row_idx, :seq_len], page_table_1[row_idx, :seq_len]):
-                raise AssertionError(
-                    f"decode trivial-row prefix mismatch at row {row_idx}: "
-                    f"actual={actual[row_idx, :seq_len].tolist()} "
-                    f"expected_prefix={page_table_1[row_idx, :seq_len].tolist()}"
-                )
-            if not torch.equal(
-                actual[row_idx, seq_len:],
-                torch.full((actual.shape[1] - seq_len,), -1, dtype=torch.int32, device=actual.device),
-            ):
-                raise AssertionError(f"decode trivial-row tail mismatch at row {row_idx}")
-            actual_set = {int(token) for token in actual[row_idx].tolist() if int(token) >= 0}
-            expected_set = {int(token) for token in expected[row_idx].tolist() if int(token) >= 0}
-            if actual_set != expected_set:
-                raise AssertionError(
-                    f"decode trivial-row token-set mismatch at row {row_idx}: "
-                    f"actual={sorted(actual_set)} expected={sorted(expected_set)}"
-                )
-        elif not torch.equal(actual[row_idx], expected[row_idx]):
-            mismatch = int((actual[row_idx] != expected[row_idx]).sum().item())
-            raise AssertionError(
-                f"decode non-trivial row mismatch at row {row_idx}: {mismatch} differing entries, "
-                f"actual={actual[row_idx].tolist()} expected={expected[row_idx].tolist()}"
-            )
+) -> torch.Tensor:
+    rows = logits.shape[0]
+    output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    gather_k = min(topk, logits.shape[1], page_table_1.shape[1])
+    if gather_k == 0:
+        return output
+    topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
+    topk_values = torch.gather(logits, 1, topk_pos)
+    gathered = torch.gather(page_table_1, 1, topk_pos.to(torch.long))
+    output[:, :gather_k] = torch.where(
+        torch.isfinite(topk_values),
+        gathered,
+        torch.full_like(gathered, -1),
+    )
+    return output
+
+
+def _select_ragged_topk_from_logits(
+    *,
+    logits: torch.Tensor,
+    k_start: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    rows = logits.shape[0]
+    output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    gather_k = min(topk, logits.shape[1])
+    if gather_k == 0:
+        return output
+    positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32).unsqueeze(0)
+    row_start = k_start.unsqueeze(1)
+    row_end = row_start + lengths.unsqueeze(1)
+    valid = (positions >= row_start) & (positions < row_end)
+    masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+    topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :gather_k]
+    topk_values = torch.gather(masked_logits, 1, topk_pos)
+    output[:, :gather_k] = torch.where(
+        torch.isfinite(topk_values),
+        topk_pos.to(torch.int32),
+        torch.full_like(topk_pos, -1, dtype=torch.int32),
+    )
+    return output
+
+
+def _make_extend_kv_fp8(
+    *,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    data_bytes = page_size * 128
+    total_rows = int(seq_lens.sum().item())
+    k_bytes = torch.empty((total_rows, 128), dtype=torch.uint8, device=index_k_cache.device)
+    scale_bytes = torch.empty((total_rows, 4), dtype=torch.uint8, device=index_k_cache.device)
+    write_row = 0
+    for batch_row in range(real_page_table.shape[0]):
+        seq_len = int(seq_lens[batch_row].item())
+        for token_pos in range(seq_len):
+            page_col = token_pos // page_size
+            slot = token_pos % page_size
+            page_id = int(real_page_table[batch_row, page_col].item())
+            k_bytes[write_row] = index_k_cache[page_id, slot * 128 : (slot + 1) * 128]
+            scale_bytes[write_row] = index_k_cache[
+                page_id,
+                data_bytes + slot * 4 : data_bytes + (slot + 1) * 4,
+            ]
+            write_row += 1
+    return k_bytes.view(torch.float8_e4m3fn), scale_bytes.view(torch.float32).squeeze(-1)
 
 
 def _resolve_graph_width(*, cache_len: int, graph_width: int) -> int:
@@ -190,12 +240,13 @@ def _run_decode_case(
     pool_factor: int,
 ) -> None:
     graph_width = _resolve_graph_width(cache_len=cache_len, graph_width=width)
-    pool_tokens = max(cache_len, cache_len * pool_factor)
+    pool_tokens = _align_up(max(cache_len, cache_len * pool_factor), cfg.page_size)
     pool_locs = make_sparse_pool_locs(
         active_tokens=cache_len,
         pool_tokens=pool_tokens,
         seed=seed + 10,
         device=device,
+        page_size=cfg.page_size,
     )
     q_fp8, weights = _make_q_and_weights(rows=q_rows, cfg=cfg, seed=seed, device=device)
     index_k_cache = _make_index_k_cache(
@@ -209,10 +260,24 @@ def _run_decode_case(
         batch_size=q_rows,
         token_locs=pool_locs,
         width=cache_len,
+        fill_value=-1,
+    )
+    live_real_page_table = make_dense_real_page_table(
+        batch_size=q_rows,
+        token_locs=pool_locs,
+        width_blocks=_align_up(graph_width, cfg.page_size) // cfg.page_size,
+        page_size=cfg.page_size,
     )
     seqlens = torch.full((q_rows,), cache_len, dtype=torch.int32, device=device)
-    graph_page_table_1 = torch.zeros(
-        (q_rows, graph_width),
+    graph_page_table_1 = torch.full(
+        (q_rows, _align_up(graph_width, cfg.page_size)),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_real_page_table = torch.full(
+        (q_rows, _align_up(graph_width, cfg.page_size) // cfg.page_size),
+        -1,
         dtype=torch.int32,
         device=device,
     )
@@ -220,44 +285,49 @@ def _run_decode_case(
 
     def prepare_decode_graph() -> None:
         graph_page_table_1[:, :cache_len].copy_(live_page_table_1)
+        graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
         graph_seqlens.copy_(seqlens)
 
     prepare_decode_graph()
-    metadata = NSAIndexerDecodeMetadata(
-        page_table_1=graph_page_table_1,
+    metadata = NSAIndexerPagedDecodeMetadata(
+        real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_seqlens,
     )
 
     def run():
-        return sparse_nsa_index_decode_topk(
+        logits = sparse_nsa_index_decode_logits_paged(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
             metadata=metadata,
-            topk=topk,
             page_size=cfg.page_size,
+        )
+        return _select_paged_topk_from_logits(
+            logits=logits,
+            page_table_1=graph_page_table_1,
+            seqlens=graph_seqlens,
+            topk=topk,
         )
 
     clear_nsa_indexer_caches()
     actual = run()
-    expected = sparse_nsa_index_reference(
+    expected_logits = sparse_nsa_paged_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        page_table_1=graph_page_table_1,
+        real_page_table=graph_real_page_table,
         query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
         seqlens_per_query=graph_seqlens,
-        topk=topk,
         page_size=cfg.page_size,
     )
-    torch.cuda.synchronize()
-    _assert_decode_contract_match(
-        actual=actual,
-        expected=expected,
+    expected = _select_paged_topk_from_logits(
+        logits=expected_logits,
         page_table_1=graph_page_table_1,
         seqlens=graph_seqlens,
         topk=topk,
     )
+    torch.cuda.synchronize()
+    _assert_exact_match(actual, expected)
 
     graph = capture_cuda_graph(
         run,
@@ -277,6 +347,7 @@ def _run_decode_case(
                 "q_rows": q_rows,
                 "cache_len": cache_len,
                 "graph_width": graph_width,
+                "graph_width_blocks": graph_real_page_table.shape[1],
                 "topk": topk,
                 "pool_tokens": pool_tokens,
                 "metadata_median_us": statistics.median(stats["metadata_us"]),
@@ -306,12 +377,15 @@ def _run_extend_case(
     pool_factor: int,
 ) -> None:
     total_q = batch * q_len
-    pool_tokens = max(cache_len, cache_len * pool_factor)
+    if q_len > cache_len:
+        raise ValueError(f"extend q_len {q_len} must not exceed cache_len {cache_len}")
+    pool_tokens = _align_up(max(cache_len, cache_len * pool_factor), cfg.page_size)
     pool_locs = make_sparse_pool_locs(
         active_tokens=cache_len,
         pool_tokens=pool_tokens,
         seed=seed + 10,
         device=device,
+        page_size=cfg.page_size,
     )
     q_fp8, weights = _make_q_and_weights(rows=total_q, cfg=cfg, seed=seed, device=device)
     index_k_cache = _make_index_k_cache(
@@ -322,55 +396,87 @@ def _run_extend_case(
         device=device,
     )
     valid_per_row = min(width, cache_len)
-    page_table_1 = _make_page_table(
-        rows=batch,
-        width=width,
-        valid_per_row=valid_per_row,
-        token_locs=pool_locs,
-        seed=seed + 2,
-        device=device,
+    page_table_1 = make_dense_candidate_page_table(
+        batch_size=batch,
+        token_locs=pool_locs[:valid_per_row],
+        width=valid_per_row,
+        fill_value=-1,
+    )
+    real_page_table = make_dense_real_page_table(
+        batch_size=batch,
+        token_locs=pool_locs[:valid_per_row],
+        width_blocks=_align_up(valid_per_row, cfg.page_size) // cfg.page_size,
+        page_size=cfg.page_size,
+    )
+    seq_lens = torch.full((batch,), valid_per_row, dtype=torch.int32, device=device)
+    kv_fp8 = _make_extend_kv_fp8(
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seq_lens=seq_lens,
+        page_size=cfg.page_size,
     )
     extend_lengths = [q_len] * batch
-    seqlens_expanded = torch.full((total_q,), valid_per_row, dtype=torch.int32, device=device)
-    metadata = NSAIndexerExtendMetadata(
-        page_table_1=page_table_1,
-        nsa_seqlens_expanded=seqlens_expanded,
-        nsa_extend_seq_lens_list=extend_lengths,
+    batch_offsets = torch.arange(batch, dtype=torch.int32, device=device) * valid_per_row
+    k_start = torch.repeat_interleave(batch_offsets, q_len)
+    per_request_ke = torch.arange(
+        valid_per_row - q_len + 1,
+        valid_per_row + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+    seqlens_expanded = per_request_ke.repeat(batch)
+    metadata = NSAIndexerExtendLogitsMetadata(
+        k_start=k_start,
+        k_end=k_start + seqlens_expanded,
     )
 
     def run():
-        return sparse_nsa_index_extend_topk(
+        logits = sparse_nsa_index_extend_logits(
             q_fp8=q_fp8,
             weights=weights,
-            index_k_cache=index_k_cache,
+            kv_fp8=kv_fp8,
             metadata=metadata,
+        )
+        return _select_ragged_topk_from_logits(
+            logits=logits,
+            k_start=k_start,
+            lengths=seqlens_expanded,
             topk=topk,
-            page_size=cfg.page_size,
         )
 
     clear_nsa_indexer_caches()
     actual = run()
-    expected = sparse_nsa_index_reference(
+    expected_logits = sparse_nsa_extend_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
-        index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
-        query_row_to_batch=torch.repeat_interleave(
-            torch.arange(batch, dtype=torch.int32, device=device),
-            torch.tensor(extend_lengths, dtype=torch.int32, device=device),
-        ),
-        seqlens_per_query=seqlens_expanded,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_start + seqlens_expanded,
+    )
+    expected = _select_ragged_topk_from_logits(
+        logits=expected_logits,
+        k_start=k_start,
+        lengths=seqlens_expanded,
         topk=topk,
-        page_size=cfg.page_size,
     )
     torch.cuda.synchronize()
     _assert_exact_match(actual[: expected.shape[0]], expected)
 
-    graph = _capture_graph(run, warmup=warmup)
-    replay_us = _bench_graph(graph, replays=replays)
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
+    for idx in range(replays):
+        starts[idx].record()
+        run()
+        ends[idx].record()
+    torch.cuda.synchronize()
+    replay_us = [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
     print(
         json.dumps(
             {
+                "contract": "sglang_extend_eager",
                 "mode": "extend",
                 "batch": batch,
                 "q_len": q_len,

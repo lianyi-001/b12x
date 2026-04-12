@@ -41,6 +41,11 @@ class _FakeBackend:
         self.decode_cuda_graph_metadata = {1: metadata}
         self.req_to_token = req_to_token
         self.device = device
+        self.sm_count = (
+            torch.cuda.get_device_properties(device).multi_processor_count
+            if device.type == "cuda"
+            else 1
+        )
         self.nsa_index_topk = req_to_token.shape[1]
         self.nsa_decode_impl = "b12x_mla"
         self.nsa_prefill_impl = "flashmla_sparse"
@@ -92,4 +97,9 @@ def test_sglang_nsa_replay_cuda_graph_handles_frozen_metadata_for_b12x_decode() 
 
     assert torch.equal(metadata.cache_seqlens_int32, torch.tensor([4], dtype=torch.int32, device=device))
     assert torch.equal(metadata.page_table_1[0, :4], req_to_token[0])
-    assert metadata.paged_mqa_schedule_metadata is None
+    if device.type == "cuda":
+        assert metadata.paged_mqa_schedule_metadata is not None
+        assert metadata.paged_mqa_schedule_metadata.shape == (backend.sm_count + 1, 2)
+        assert metadata.paged_mqa_schedule_metadata.dtype == torch.int32
+    else:
+        assert metadata.paged_mqa_schedule_metadata is None

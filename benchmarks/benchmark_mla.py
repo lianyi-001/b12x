@@ -15,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention.mla.split import select_sparse_mla_split_decode_config
-from b12x.attention.nsa_indexer.reference import sparse_nsa_index_reference
+from b12x.attention.nsa_indexer.reference import sparse_nsa_paged_logits_reference
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLAWorkspace,
@@ -25,16 +25,17 @@ from b12x.integration.mla import (
     sparse_mla_decode_forward,
 )
 from b12x.integration.nsa_indexer import (
-    NSAIndexerDecodeMetadata,
+    NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
     pack_nsa_index_k_cache_reference,
-    sparse_nsa_index_decode_topk,
+    sparse_nsa_index_decode_logits_paged,
 )
 
 from benchmarks.common import (
     bench_cuda_graph,
     capture_cuda_graph,
     make_dense_candidate_page_table,
+    make_dense_real_page_table,
     make_sparse_pool_locs,
     require_sm120,
     scatter_rows_into_pool,
@@ -51,6 +52,10 @@ DEFAULT_GRAPH_WIDTH = 8192
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
+
+
+def _align_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
 
 
 @dataclass(frozen=True)
@@ -212,38 +217,52 @@ def _assert_decode_contract_match(
     seqlens: torch.Tensor,
     topk: int,
 ) -> None:
-    for row_idx in range(actual.shape[0]):
-        seq_len = int(seqlens[row_idx].item())
-        if seq_len <= topk:
-            if not torch.equal(actual[row_idx, :seq_len], page_table_1[row_idx, :seq_len]):
-                raise BenchmarkFailure(case, f"trivial-row prefix mismatch at row {row_idx}")
-            if not torch.equal(
-                actual[row_idx, seq_len:],
-                torch.full((actual.shape[1] - seq_len,), -1, dtype=torch.int32, device=actual.device),
-            ):
-                raise BenchmarkFailure(case, f"trivial-row tail mismatch at row {row_idx}")
-            actual_set = {int(token) for token in actual[row_idx].tolist() if int(token) >= 0}
-            expected_set = {int(token) for token in expected[row_idx].tolist() if int(token) >= 0}
-            if actual_set != expected_set:
-                raise BenchmarkFailure(case, f"trivial-row token-set mismatch at row {row_idx}")
-        elif not torch.equal(actual[row_idx], expected[row_idx]):
-            mismatch = int((actual[row_idx] != expected[row_idx]).sum().item())
-            raise BenchmarkFailure(case, f"non-trivial row mismatch at row {row_idx}: {mismatch} differing entries")
+    del page_table_1, seqlens, topk
+    if not torch.equal(actual, expected):
+        mismatch = int((actual != expected).sum().item())
+        raise BenchmarkFailure(case, f"topk mismatch: {mismatch} differing entries")
+
+
+def _select_paged_topk_from_logits(
+    *,
+    logits: torch.Tensor,
+    page_table_1: torch.Tensor,
+    seqlens: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    rows = logits.shape[0]
+    output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    gather_k = min(topk, logits.shape[1], page_table_1.shape[1])
+    if gather_k == 0:
+        return output
+    topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
+    topk_values = torch.gather(logits, 1, topk_pos)
+    gathered = torch.gather(page_table_1, 1, topk_pos.to(torch.long))
+    output[:, :gather_k] = torch.where(
+        torch.isfinite(topk_values),
+        gathered,
+        torch.full_like(gathered, -1),
+    )
+    return output
 
 
 def _make_decode_graph_prepare(
     *,
     live_page_table_1: torch.Tensor,
+    live_real_page_table: torch.Tensor,
     cache_seqlens_int32: torch.Tensor,
     nsa_cache_seqlens_int32: torch.Tensor,
     graph_page_table_1: torch.Tensor,
+    graph_real_page_table: torch.Tensor,
     graph_cache_seqlens_int32: torch.Tensor,
     graph_nsa_cache_seqlens_int32: torch.Tensor,
 ):
     live_width = live_page_table_1.shape[1]
+    live_block_width = live_real_page_table.shape[1]
 
     def prepare() -> None:
         graph_page_table_1[:, :live_width].copy_(live_page_table_1)
+        graph_real_page_table[:, :live_block_width].copy_(live_real_page_table)
         graph_cache_seqlens_int32.copy_(cache_seqlens_int32)
         graph_nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens_int32)
 
@@ -364,12 +383,14 @@ def _run_decode_case(
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
     graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
-    pool_tokens = max(case.cache_len, case.cache_len * pool_factor)
+    aligned_graph_width = _align_up(graph_width, cfg.page_size)
+    pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
     pool_locs = make_sparse_pool_locs(
         active_tokens=case.cache_len,
         pool_tokens=pool_tokens,
         seed=seed + 2,
         device=device,
+        page_size=cfg.page_size,
     )
     q_fp8, weights, index_k_cache = _make_indexer_inputs(
         case=case,
@@ -391,6 +412,13 @@ def _run_decode_case(
         batch_size=case.batch_size,
         token_locs=pool_locs,
         width=case.cache_len,
+        fill_value=-1,
+    )
+    live_real_page_table = make_dense_real_page_table(
+        batch_size=case.batch_size,
+        token_locs=pool_locs,
+        width_blocks=aligned_graph_width // cfg.page_size,
+        page_size=cfg.page_size,
     )
     full_cache_seqlens = torch.full(
         (case.batch_size,),
@@ -404,8 +432,15 @@ def _run_decode_case(
         dtype=torch.int32,
         device=device,
     )
-    graph_candidate_page_table = torch.zeros(
-        (case.batch_size, graph_width),
+    graph_candidate_page_table = torch.full(
+        (case.batch_size, aligned_graph_width),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_real_page_table = torch.full(
+        (case.batch_size, aligned_graph_width // cfg.page_size),
+        -1,
         dtype=torch.int32,
         device=device,
     )
@@ -413,39 +448,51 @@ def _run_decode_case(
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
     prepare_decode_graph = _make_decode_graph_prepare(
         live_page_table_1=live_candidate_page_table,
+        live_real_page_table=live_real_page_table,
         cache_seqlens_int32=full_cache_seqlens,
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         graph_page_table_1=graph_candidate_page_table,
+        graph_real_page_table=graph_real_page_table,
         graph_cache_seqlens_int32=graph_cache_seqlens,
         graph_nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
     )
     prepare_decode_graph()
-    indexer_metadata = NSAIndexerDecodeMetadata(
-        page_table_1=graph_candidate_page_table,
+    indexer_metadata = NSAIndexerPagedDecodeMetadata(
+        real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_cache_seqlens,
     )
 
     def run_indexer():
-        return sparse_nsa_index_decode_topk(
+        logits = sparse_nsa_index_decode_logits_paged(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
             metadata=indexer_metadata,
-            topk=case.topk,
             page_size=cfg.page_size,
+        )
+        return _select_paged_topk_from_logits(
+            logits=logits,
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_cache_seqlens,
+            topk=case.topk,
         )
 
     clear_nsa_indexer_caches()
     actual_topk = run_indexer()
-    expected_topk = sparse_nsa_index_reference(
+    expected_logits = sparse_nsa_paged_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        page_table_1=graph_candidate_page_table,
+        real_page_table=graph_real_page_table,
         query_row_to_batch=torch.arange(case.batch_size, dtype=torch.int32, device=device),
         seqlens_per_query=graph_cache_seqlens,
-        topk=case.topk,
         page_size=cfg.page_size,
+    )
+    expected_topk = _select_paged_topk_from_logits(
+        logits=expected_logits,
+        page_table_1=graph_candidate_page_table,
+        seqlens=graph_cache_seqlens,
+        topk=case.topk,
     )
     torch.cuda.synchronize()
     _assert_decode_contract_match(
@@ -461,7 +508,7 @@ def _run_decode_case(
         page_table_1=actual_topk,
         cache_seqlens_int32=graph_cache_seqlens,
         nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-        max_seq_len_k=graph_width,
+        max_seq_len_k=aligned_graph_width,
     )
     mla_workspace = _make_mla_workspace(cfg=cfg, case=case, device=device)
     split_cfg = select_sparse_mla_split_decode_config(
@@ -483,25 +530,29 @@ def _run_decode_case(
         )
 
     def run_step():
-        topk_indices = sparse_nsa_index_decode_topk(
-            q_fp8=q_fp8,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            metadata=indexer_metadata,
-            topk=case.topk,
-            page_size=cfg.page_size,
-        )
-        return sparse_mla_decode_forward(
-            q_all=q_all,
+            topk_indices = _select_paged_topk_from_logits(
+                logits=sparse_nsa_index_decode_logits_paged(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    index_k_cache=index_k_cache,
+                    metadata=indexer_metadata,
+                    page_size=cfg.page_size,
+                ),
+                page_table_1=graph_candidate_page_table,
+                seqlens=graph_cache_seqlens,
+                topk=case.topk,
+            )
+            return sparse_mla_decode_forward(
+                q_all=q_all,
             kv_cache=kv_cache,
-            metadata=MLASparseDecodeMetadata(
-                page_table_1=topk_indices,
-                cache_seqlens_int32=graph_cache_seqlens,
-                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-                max_seq_len_k=graph_width,
-            ),
-            workspace=mla_workspace,
-            sm_scale=cfg.sm_scale,
+                metadata=MLASparseDecodeMetadata(
+                    page_table_1=topk_indices,
+                    cache_seqlens_int32=graph_cache_seqlens,
+                    nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+                    max_seq_len_k=aligned_graph_width,
+                ),
+                workspace=mla_workspace,
+                sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
 
