@@ -10,6 +10,4 @@ kernels plus the runtime glue needed to launch them cleanly from `sglang`/`vllm`
 python -m pip install b12x
 ```
 
-```
 Ask your friendly neighborhood AI agent for further information on how to use this library.
-```
