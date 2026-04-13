@@ -161,7 +161,7 @@ def _run_sparse_mla(
     use_reference = os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") == "1"
     sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
     split_cfg = None
-    if not use_reference and workspace.mode == "decode":
+    if not use_reference and workspace.mode in ("decode", "verify"):
         split_cfg = select_sparse_mla_split_decode_config(
             q_all=q_all,
             kv_cache=kv_cache,

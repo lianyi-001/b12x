@@ -123,6 +123,75 @@ def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
     assert torch.equal(workspace.nsa_cache_seqlens_int32, cache_seqlens)
 
 
+def test_mla_verify_workspace_allocates_split_buffers() -> None:
+    workspace = _make_workspace(mode="verify", topk=6)
+
+    assert workspace.mode == "verify"
+    assert workspace.tmp_output is not None
+    assert workspace.tmp_lse is not None
+
+
+def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
+    workspace = _make_workspace(mode="verify", topk=2048)
+    captured: dict[str, object] = {}
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=32, num_chunks=64)
+
+    def fake_run_split_decode(**kwargs):
+        captured["run_split"] = True
+        output = kwargs["output"]
+        output.zero_()
+
+    def fail_run_sparse_mla_kernel(**kwargs):
+        raise AssertionError("verify path should not use generic sparse MLA kernel")
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fake_run_split_decode,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_kernel",
+        fail_run_sparse_mla_kernel,
+    )
+
+    q_all = torch.ones((5, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.zeros((5, 2048), dtype=torch.int32)
+    cache_seqlens = torch.full((1,), 12, dtype=torch.int32)
+    nsa_cache_seqlens = torch.full((5,), 12, dtype=torch.int32)
+    nsa_cu = torch.tensor([0, 5], dtype=torch.int32)
+    metadata = MLASparseExtendMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        nsa_cu_seqlens_q=nsa_cu,
+        nsa_cu_seqlens_k=nsa_cu,
+        max_seq_len_q=5,
+        max_seq_len_k=12,
+        mode="target_verify",
+    )
+
+    output = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=1.0,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (5, 8, 256)
+    assert captured["run_split"] is True
+
+
 def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
     workspace = MLAWorkspace.for_contract(
         mode="decode",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode replay: NSA indexer + sparse MLA."""
+"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode/verify replay: NSA indexer + sparse MLA."""
 
 from __future__ import annotations
 
@@ -18,11 +18,13 @@ from b12x.attention.mla.split import select_sparse_mla_split_decode_config
 from b12x.attention.nsa_indexer.reference import sparse_nsa_paged_logits_reference
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
+    MLASparseExtendMetadata,
     MLAWorkspace,
     clear_mla_caches,
     dense_mla_reference,
     pack_mla_kv_cache_reference,
     sparse_mla_decode_forward,
+    sparse_mla_extend_forward,
 )
 from b12x.integration.nsa_indexer import (
     NSAIndexerPagedDecodeMetadata,
@@ -45,6 +47,7 @@ from benchmarks.common import (
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 32768, 131072)
+DEFAULT_VERIFY_Q_LENS = (4,)
 DEFAULT_TP_SIZE = 8
 DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
@@ -86,9 +89,15 @@ class GLMDecodeContractConfig:
 
 @dataclass(frozen=True)
 class DecodeCase:
+    mode: str
     batch_size: int
     cache_len: int
     topk: int
+    q_len: int = 1
+
+    @property
+    def total_q(self) -> int:
+        return self.batch_size * self.q_len
 
 
 @dataclass(frozen=True)
@@ -171,22 +180,45 @@ def _resolve_topk(*, cache_len: int, topk_cap: int) -> int:
 
 def _build_decode_cases(
     *,
+    modes: list[str],
     batch_sizes: list[int],
     cache_lens: list[int],
+    verify_q_lens: list[int],
     topk_cap: int,
 ) -> list[DecodeCase]:
     cases: list[DecodeCase] = []
+    allowed_modes = {"decode", "verify"}
+    for mode in modes:
+        if mode not in allowed_modes:
+            raise ValueError(f"unsupported mode {mode!r}, expected one of {sorted(allowed_modes)}")
     for batch_size in batch_sizes:
         if batch_size <= 0:
             raise ValueError(f"batch sizes must be positive, got {batch_size}")
         for cache_len in cache_lens:
-            cases.append(
-                DecodeCase(
-                    batch_size=batch_size,
-                    cache_len=cache_len,
-                    topk=_resolve_topk(cache_len=cache_len, topk_cap=topk_cap),
+            topk = _resolve_topk(cache_len=cache_len, topk_cap=topk_cap)
+            if "decode" in modes:
+                cases.append(
+                    DecodeCase(
+                        mode="decode",
+                        batch_size=batch_size,
+                        cache_len=cache_len,
+                        topk=topk,
+                        q_len=1,
+                    )
                 )
-            )
+            if "verify" in modes:
+                for q_len in verify_q_lens:
+                    if q_len <= 0:
+                        raise ValueError(f"verify q_len must be positive, got {q_len}")
+                    cases.append(
+                        DecodeCase(
+                            mode="verify",
+                            batch_size=batch_size,
+                            cache_len=cache_len,
+                            topk=topk,
+                            q_len=q_len,
+                        )
+                    )
     return cases
 
 
@@ -281,7 +313,8 @@ def _make_decode_graph_prepare(
 
 def _make_indexer_inputs(
     *,
-    case: DecodeCase,
+    q_rows: int,
+    cache_len: int,
     cfg: GLMDecodeContractConfig,
     seed: int,
     device: torch.device,
@@ -290,20 +323,20 @@ def _make_indexer_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del seed
     q_fp8 = torch.full(
-        (case.batch_size, cfg.index_n_heads, cfg.index_head_dim),
+        (q_rows, cfg.index_n_heads, cfg.index_head_dim),
         0.5,
         dtype=torch.float32,
         device=device,
     ).to(torch.float8_e4m3fn)
     weights = torch.ones(
-        (case.batch_size, cfg.index_n_heads, 1),
+        (q_rows, cfg.index_n_heads, 1),
         dtype=torch.float32,
         device=device,
     )
     token_scores = torch.linspace(
         0.25,
         1.25,
-        case.cache_len,
+        cache_len,
         dtype=torch.float32,
         device=device,
     )
@@ -314,7 +347,8 @@ def _make_indexer_inputs(
 
 def _make_mla_inputs(
     *,
-    case: DecodeCase,
+    q_rows: int,
+    cache_len: int,
     cfg: GLMDecodeContractConfig,
     seed: int,
     device: torch.device,
@@ -325,7 +359,7 @@ def _make_mla_inputs(
     gen.manual_seed(seed)
     q_all = (
         torch.randn(
-            (case.batch_size, cfg.num_local_heads, cfg.q_head_dim),
+            (q_rows, cfg.num_local_heads, cfg.q_head_dim),
             generator=gen,
             dtype=torch.float32,
         )
@@ -335,7 +369,7 @@ def _make_mla_inputs(
     )
     k_nope = (
         torch.randn(
-            (case.cache_len, 1, cfg.kv_lora_rank),
+            (cache_len, 1, cfg.kv_lora_rank),
             generator=gen,
             dtype=torch.float32,
         )
@@ -345,7 +379,7 @@ def _make_mla_inputs(
     )
     k_rope = (
         torch.randn(
-            (case.cache_len, 1, cfg.qk_rope_head_dim),
+            (cache_len, 1, cfg.qk_rope_head_dim),
             generator=gen,
             dtype=torch.float32,
         )
@@ -361,21 +395,24 @@ def _make_mla_inputs(
 
 def _make_mla_workspace(
     *,
+    mode: str,
     cfg: GLMDecodeContractConfig,
-    case: DecodeCase,
     device: torch.device,
+    topk: int,
+    max_total_q: int,
+    max_batch: int,
 ) -> MLAWorkspace:
     return MLAWorkspace.for_fixed_capacity(
-        mode="decode",
+        mode=mode,
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,
         num_q_heads=cfg.num_local_heads,
         head_dim=cfg.q_head_dim,
         v_head_dim=cfg.kv_lora_rank,
-        topk=case.topk,
-        max_total_q=case.batch_size,
-        max_batch=case.batch_size,
+        topk=topk,
+        max_total_q=max_total_q,
+        max_batch=max_batch,
     )
 
 
@@ -403,7 +440,8 @@ def _run_decode_case(
         page_size=cfg.page_size,
     )
     q_fp8, weights, index_k_cache = _make_indexer_inputs(
-        case=case,
+        q_rows=case.total_q,
+        cache_len=case.cache_len,
         cfg=cfg,
         seed=seed,
         device=device,
@@ -411,7 +449,8 @@ def _run_decode_case(
         pool_tokens=pool_tokens,
     )
     q_all, k_nope, k_rope, kv_cache = _make_mla_inputs(
-        case=case,
+        q_rows=case.total_q,
+        cache_len=case.cache_len,
         cfg=cfg,
         seed=seed + 1,
         device=device,
@@ -520,7 +559,14 @@ def _run_decode_case(
         nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
         max_seq_len_k=aligned_graph_width,
     )
-    mla_workspace = _make_mla_workspace(cfg=cfg, case=case, device=device)
+    mla_workspace = _make_mla_workspace(
+        mode="decode",
+        cfg=cfg,
+        device=device,
+        topk=case.topk,
+        max_total_q=case.total_q,
+        max_batch=case.batch_size,
+    )
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -636,6 +682,313 @@ def _run_decode_case(
     )
 
 
+def _run_verify_case(
+    *,
+    case: DecodeCase,
+    cfg: GLMDecodeContractConfig,
+    warmup: int,
+    replays: int,
+    seed: int,
+    device: torch.device,
+    pool_factor: int,
+    graph_width: int,
+) -> CaseReport:
+    if pool_factor <= 0:
+        raise ValueError(f"pool_factor must be positive, got {pool_factor}")
+    if case.q_len <= 1:
+        raise ValueError(f"verify q_len must be > 1, got {case.q_len}")
+    graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
+    aligned_graph_width = _align_up(graph_width, cfg.page_size)
+    pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
+    pool_locs = make_sparse_pool_locs(
+        active_tokens=case.cache_len,
+        pool_tokens=pool_tokens,
+        seed=seed + 2,
+        device=device,
+        page_size=cfg.page_size,
+    )
+    q_fp8, weights, index_k_cache = _make_indexer_inputs(
+        q_rows=case.total_q,
+        cache_len=case.cache_len,
+        cfg=cfg,
+        seed=seed,
+        device=device,
+        pool_locs=pool_locs,
+        pool_tokens=pool_tokens,
+    )
+    q_all, k_nope, k_rope, kv_cache = _make_mla_inputs(
+        q_rows=case.total_q,
+        cache_len=case.cache_len,
+        cfg=cfg,
+        seed=seed + 1,
+        device=device,
+        pool_locs=pool_locs,
+        pool_tokens=pool_tokens,
+    )
+    base_candidate_page_table = make_dense_candidate_page_table(
+        batch_size=case.batch_size,
+        token_locs=pool_locs,
+        width=case.cache_len,
+        fill_value=-1,
+    )
+    base_real_page_table = make_dense_real_page_table(
+        batch_size=case.batch_size,
+        token_locs=pool_locs,
+        width_blocks=aligned_graph_width // cfg.page_size,
+        page_size=cfg.page_size,
+    )
+    live_candidate_page_table = torch.repeat_interleave(
+        base_candidate_page_table,
+        repeats=case.q_len,
+        dim=0,
+    )
+    live_real_page_table = torch.repeat_interleave(
+        base_real_page_table,
+        repeats=case.q_len,
+        dim=0,
+    )
+    batch_cache_seqlens = torch.full(
+        (case.batch_size,),
+        case.cache_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    expanded_cache_seqlens = torch.repeat_interleave(batch_cache_seqlens, repeats=case.q_len)
+    nsa_cache_seqlens = torch.full(
+        (case.total_q,),
+        case.topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens_q = torch.arange(
+        0,
+        case.total_q + 1,
+        step=case.q_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens_k = torch.arange(
+        0,
+        case.total_q * case.topk + 1,
+        step=case.topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_candidate_page_table = torch.full(
+        (case.total_q, aligned_graph_width),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_real_page_table = torch.full(
+        (case.total_q, aligned_graph_width // cfg.page_size),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
+    graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
+    graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+
+    def prepare_verify_graph() -> None:
+        live_width = live_candidate_page_table.shape[1]
+        live_block_width = live_real_page_table.shape[1]
+        graph_candidate_page_table[:, :live_width].copy_(live_candidate_page_table)
+        graph_real_page_table[:, :live_block_width].copy_(live_real_page_table)
+        graph_batch_cache_seqlens.copy_(batch_cache_seqlens)
+        graph_expanded_cache_seqlens.copy_(expanded_cache_seqlens)
+        graph_nsa_cache_seqlens.copy_(nsa_cache_seqlens)
+
+    prepare_verify_graph()
+    indexer_metadata = NSAIndexerPagedDecodeMetadata(
+        real_page_table=graph_real_page_table,
+        cache_seqlens_int32=graph_expanded_cache_seqlens,
+    )
+
+    def run_indexer():
+        logits = sparse_nsa_index_decode_logits_paged(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            metadata=indexer_metadata,
+            page_size=cfg.page_size,
+        )
+        return _select_paged_topk_from_logits(
+            logits=logits,
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_expanded_cache_seqlens,
+            topk=case.topk,
+        )
+
+    clear_nsa_indexer_caches()
+    actual_topk = run_indexer()
+    query_row_to_batch = torch.arange(
+        case.batch_size,
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(case.q_len)
+    expected_logits = sparse_nsa_paged_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=graph_real_page_table,
+        query_row_to_batch=query_row_to_batch,
+        seqlens_per_query=graph_expanded_cache_seqlens,
+        page_size=cfg.page_size,
+    )
+    expected_topk = _select_paged_topk_from_logits(
+        logits=expected_logits,
+        page_table_1=graph_candidate_page_table,
+        seqlens=graph_expanded_cache_seqlens,
+        topk=case.topk,
+    )
+    torch.cuda.synchronize()
+    _assert_decode_contract_match(
+        case=case,
+        actual=actual_topk,
+        expected=expected_topk,
+        page_table_1=graph_candidate_page_table,
+        seqlens=graph_expanded_cache_seqlens,
+        topk=case.topk,
+    )
+
+    mla_metadata = MLASparseExtendMetadata(
+        page_table_1=actual_topk,
+        cache_seqlens_int32=graph_batch_cache_seqlens,
+        nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+        nsa_cu_seqlens_q=cu_seqlens_q,
+        nsa_cu_seqlens_k=cu_seqlens_k,
+        max_seq_len_q=case.q_len,
+        max_seq_len_k=aligned_graph_width,
+        mode="target_verify",
+    )
+    mla_workspace = _make_mla_workspace(
+        mode="verify",
+        cfg=cfg,
+        device=device,
+        topk=case.topk,
+        max_total_q=case.total_q,
+        max_batch=case.batch_size,
+    )
+    split_cfg = select_sparse_mla_split_decode_config(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=actual_topk,
+        output_dtype=q_all.dtype,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+
+    def run_mla():
+        return sparse_mla_extend_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=mla_metadata,
+            workspace=mla_workspace,
+            sm_scale=cfg.sm_scale,
+            v_head_dim=cfg.kv_lora_rank,
+        )
+
+    def run_step():
+        topk_indices = _select_paged_topk_from_logits(
+            logits=sparse_nsa_index_decode_logits_paged(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                metadata=indexer_metadata,
+                page_size=cfg.page_size,
+            ),
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_expanded_cache_seqlens,
+            topk=case.topk,
+        )
+        return sparse_mla_extend_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=MLASparseExtendMetadata(
+                page_table_1=topk_indices,
+                cache_seqlens_int32=graph_batch_cache_seqlens,
+                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+                nsa_cu_seqlens_q=cu_seqlens_q,
+                nsa_cu_seqlens_k=cu_seqlens_k,
+                max_seq_len_q=case.q_len,
+                max_seq_len_k=aligned_graph_width,
+                mode="target_verify",
+            ),
+            workspace=mla_workspace,
+            sm_scale=cfg.sm_scale,
+            v_head_dim=cfg.kv_lora_rank,
+        )
+
+    clear_mla_caches()
+    actual_output = run_mla()
+    expected_output = dense_mla_reference(
+        q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=actual_topk,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize()
+    mla_sanity = _compare(actual_output, expected_output)
+    if mla_sanity.max_abs > MLA_MAX_ABS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"MLA max_abs {mla_sanity.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+        )
+    if mla_sanity.rmse > MLA_RMSE_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"MLA rmse {mla_sanity.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
+        )
+    if mla_sanity.cos < MLA_COS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        )
+
+    clear_nsa_indexer_caches()
+    indexer_graph = capture_cuda_graph(
+        run_indexer,
+        warmup=warmup,
+        prepare=prepare_verify_graph,
+    )
+    indexer_stats = bench_cuda_graph(indexer_graph, replays=replays, prepare=prepare_verify_graph)
+    indexer_us = statistics.median(indexer_stats["replay_us"])
+
+    clear_mla_caches()
+    prepare_verify_graph()
+    mla_graph = capture_cuda_graph(run_mla, warmup=warmup)
+    mla_stats = bench_cuda_graph(mla_graph, replays=replays)
+    mla_us = statistics.median(mla_stats["replay_us"])
+
+    clear_nsa_indexer_caches()
+    clear_mla_caches()
+    step_graph = capture_cuda_graph(
+        run_step,
+        warmup=warmup,
+        prepare=prepare_verify_graph,
+    )
+    step_stats = bench_cuda_graph(
+        step_graph,
+        replays=replays,
+        prepare=prepare_verify_graph,
+    )
+
+    return CaseReport(
+        case=case,
+        graph_width=graph_width,
+        metadata_us=statistics.median(step_stats["metadata_us"]),
+        replay_us=statistics.median(step_stats["replay_us"]),
+        indexer_us=indexer_us,
+        mla_us=mla_us,
+        split_enabled=split_cfg is not None,
+        chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
+        num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
+        mla_sanity=mla_sanity,
+    )
+
+
 def collect_case_reports(
     args: argparse.Namespace,
     *,
@@ -644,8 +997,10 @@ def collect_case_reports(
     cfg = _load_glm_contract_config(tp_size=args.tp_size, tp_rank=args.tp_rank)
     device = require_sm120() if device is None else device
     cases = _build_decode_cases(
+        modes=[mode for mode in args.modes.split(",") if mode],
         batch_sizes=_parse_csv_ints(args.batch_sizes),
         cache_lens=_parse_csv_ints(args.cache_lens),
+        verify_q_lens=_parse_csv_ints(args.verify_q_lens),
         topk_cap=min(args.topk_cap, cfg.index_topk),
     )
     reports: list[CaseReport] = []
@@ -653,6 +1008,17 @@ def collect_case_reports(
     for case in cases:
         reports.append(
             _run_decode_case(
+                case=case,
+                cfg=cfg,
+                warmup=args.warmup,
+                replays=args.replays,
+                seed=case_seed,
+                device=device,
+                pool_factor=args.pool_factor,
+                graph_width=args.graph_width,
+            )
+            if case.mode == "decode"
+            else _run_verify_case(
                 case=case,
                 cfg=cfg,
                 warmup=args.warmup,
@@ -670,7 +1036,8 @@ def collect_case_reports(
 def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
     return (
-        f"glm51-decode tp8 bs={report.case.batch_size:2d} ctx={report.case.cache_len:6d} "
+        f"glm51-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
+        f"q={report.case.q_len:2d} ctx={report.case.cache_len:6d} "
         f"graphw={report.graph_width:6d} topk={report.case.topk:4d} split={split_flag:>3s} "
         f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
         f"step={report.total_us:8.2f} us | "
@@ -703,6 +1070,11 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--modes",
+        default="decode,verify",
+        help="benchmark modes to run: decode, verify, or both via csv (default: decode,verify)",
+    )
+    parser.add_argument(
         "--batch-sizes",
         default="1,2,4,8",
         help=f"decode batch sizes, default {','.join(str(v) for v in DEFAULT_BATCH_SIZES)}",
@@ -711,6 +1083,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cache-lens",
         default="1024,32768,131072",
         help=f"decode cache lengths, default {','.join(str(v) for v in DEFAULT_CACHE_LENS)}",
+    )
+    parser.add_argument(
+        "--verify-q-lens",
+        default="4",
+        help=f"verify q lengths, default {','.join(str(v) for v in DEFAULT_VERIFY_Q_LENS)}",
     )
     parser.add_argument("--topk-cap", type=int, default=2048)
     parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)

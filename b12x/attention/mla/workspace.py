@@ -178,7 +178,7 @@ class MLAWorkspace:
             )
 
     def _allocate_decode_split_buffers(self) -> None:
-        if self.mode != "decode":
+        if self.mode not in ("decode", "verify"):
             return
         if self.tmp_output is None:
             self.tmp_output = torch.empty(
@@ -200,8 +200,8 @@ class MLAWorkspace:
             self.num_chunks_value = None
 
     def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
-        if self.mode != "decode":
-            raise RuntimeError("decode chunk config is only valid for decode workspaces")
+        if self.mode not in ("decode", "verify"):
+            raise RuntimeError("decode chunk config is only valid for decode/verify workspaces")
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
             raise ValueError(
                 f"num_chunks must be in [1, {self.max_chunks_per_row}], got {num_chunks}"
@@ -363,7 +363,7 @@ class MLAWorkspace:
             dtype=self.dtype,
             device=self.device,
         )
-        if self.mode == "decode":
+        if self.mode in ("decode", "verify"):
             self._contract_tmp_output = _shape_only_cuda_tensor(
                 (self.max_total_q, self.num_q_heads, self.max_chunks_per_row, self.v_head_dim),
                 dtype=self.dtype,
