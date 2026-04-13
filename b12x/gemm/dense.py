@@ -1714,7 +1714,7 @@ def _select_default_mma_tiler_mn(m: int, n: int, sm_count: int) -> Tuple[int, in
         if medium_tiles < max(1, sm_count // 2):
             return (64, 64)
         return (128, 64)
-    return (128, 128)
+    return coarse_tile
 
 
 def dense_gemm(

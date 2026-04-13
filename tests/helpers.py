@@ -35,8 +35,8 @@ def require_sm120() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for b12x tests")
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) != (12, 0):
-        pytest.skip(f"SM120 is required for b12x tests, got sm_{major}{minor}")
+    if major != 12 or minor not in (0, 1):
+        pytest.skip(f"SM120 or SM121 is required for b12x tests, got sm_{major}{minor}")
     return torch.device("cuda")
 
 

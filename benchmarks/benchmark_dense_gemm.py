@@ -248,8 +248,8 @@ def main():
     args = parser.parse_args()
 
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) != (12, 0):
-        raise RuntimeError(f"Requires sm_120, got sm_{major}{minor}")
+    if major != 12 or minor not in (0, 1):
+        raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
     torch.empty(1, device="cuda")
 
     print(f"Dense FP4 GEMM: b12x vs {REFERENCE_LABEL}")

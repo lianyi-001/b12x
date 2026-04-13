@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .deps
+.venv/
 .env
 .env.*
 .venv-release/

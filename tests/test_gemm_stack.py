@@ -47,6 +47,28 @@ def _make_quantized_operand(
     return (packed, scales), global_scale
 
 
+def _run_dense_gemm(
+    lhs: tuple[torch.Tensor, torch.Tensor],
+    rhs: tuple[torch.Tensor, torch.Tensor],
+    lhs_scale: torch.Tensor,
+    rhs_scale: torch.Tensor,
+    *,
+    c_dtype_str: str = "bfloat16",
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    alpha = (1.0 / (lhs_scale[0] * rhs_scale[0])).view(1)
+    return dense_gemm(
+        lhs,
+        rhs,
+        out=out,
+        alpha=alpha,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype_str,
+        sf_vec_size=16,
+    )
+
+
 @pytest.mark.parametrize("M,N,K", [
     (128, 128, 128),
     (256, 128, 128),
@@ -104,3 +126,63 @@ def test_dense_gemm_matches_flashinfer_cudnn(
     )
 
     torch.testing.assert_close(dense_out[:, :, 0], cudnn_out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("gate_shape", "down_shape"),
+    [
+        ((32, 2048, 512), (32, 1024, 2048)),
+    ],
+)
+def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
+    gate_shape: tuple[int, int, int],
+    down_shape: tuple[int, int, int],
+) -> None:
+    require_sm120()
+    torch.manual_seed(1234)
+
+    gate_m, gate_n, gate_k = gate_shape
+    down_m, down_n, down_k = down_shape
+    assert gate_m == down_m
+    assert gate_n == down_k
+
+    gate_lhs, gate_lhs_scale = _make_quantized_operand((1, gate_m, gate_k), dtype=torch.bfloat16)
+    gate_rhs, gate_rhs_scale = _make_quantized_operand((1, gate_n, gate_k), dtype=torch.bfloat16)
+    down_lhs, down_lhs_scale = _make_quantized_operand((1, down_m, down_k), dtype=torch.bfloat16)
+    down_rhs, down_rhs_scale = _make_quantized_operand((1, down_n, down_k), dtype=torch.bfloat16)
+
+    eager_gate = _run_dense_gemm(gate_lhs, gate_rhs, gate_lhs_scale, gate_rhs_scale)
+    eager_down = _run_dense_gemm(down_lhs, down_rhs, down_lhs_scale, down_rhs_scale)
+    torch.cuda.synchronize()
+
+    graph_gate = torch.empty_like(eager_gate)
+    graph_down = torch.empty_like(eager_down)
+
+    # Prime the compiled kernels before capture to match the serving warmup path.
+    _run_dense_gemm(gate_lhs, gate_rhs, gate_lhs_scale, gate_rhs_scale)
+    _run_dense_gemm(down_lhs, down_rhs, down_lhs_scale, down_rhs_scale)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_dense_gemm(
+            gate_lhs,
+            gate_rhs,
+            gate_lhs_scale,
+            gate_rhs_scale,
+            out=graph_gate,
+        )
+        _run_dense_gemm(
+            down_lhs,
+            down_rhs,
+            down_lhs_scale,
+            down_rhs_scale,
+            out=graph_down,
+        )
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_gate, eager_gate, rtol=0, atol=0)
+    torch.testing.assert_close(graph_down, eager_down, rtol=0, atol=0)
