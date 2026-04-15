@@ -1511,9 +1511,15 @@ class _DenseGemmLaunch:
                 f"{a_major}, {b_major}, {c_major}"
             )
 
-        self._max_active_clusters = min(
-            get_max_active_clusters(self._cluster_shape_mn[0] * self._cluster_shape_mn[1]),
-            sm_count,
+        cluster_size = self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
+        # For the default single-cluster launch, occupancy is bounded only by
+        # the SM count. Avoid the CUTLASS hardware-info probe here because it
+        # can fail on some driver/runtime combinations with INVALID_HANDLE
+        # while providing no additional information for cluster_size == 1.
+        self._max_active_clusters = (
+            sm_count
+            if cluster_size == 1
+            else min(get_max_active_clusters(cluster_size), sm_count)
         )
 
     @cute.jit
