@@ -113,16 +113,25 @@ def make_nsa_indexer_contract_phantoms(
     """
     device = torch.device(device)
     base_u8 = torch.empty(1, dtype=torch.uint8, device=device)
+    base_u32 = torch.empty(1, dtype=torch.uint32, device=device)
     base_f32 = torch.empty(1, dtype=torch.float32, device=device)
     base_i32 = torch.empty(1, dtype=torch.int32, device=device)
     z = (0,)
     width_tokens = max_pages * page_size
+    padded_width_tokens = ((width_tokens + 63) // 64) * 64
     return {
         "q_bytes": base_u8.as_strided((max_q_rows, num_heads, _INDEX_HEAD_DIM), z * 3),
         "weights": base_f32.as_strided((max_q_rows, num_heads), z * 2),
         "real_page_table": base_i32.as_strided((max_q_rows, max_pages), z * 2),
         "seqlens_per_query": base_i32.as_strided((max_q_rows,), z),
         "logits": base_f32.as_strided((max_q_rows, width_tokens), z * 2),
+        "extend_q_u32": base_u32.as_strided((max_q_rows, num_heads, _INDEX_HEAD_DIM // 4), z * 3),
+        "extend_weights": base_f32.as_strided((max_q_rows, num_heads), z * 2),
+        "extend_k_quant": base_u8.as_strided((padded_width_tokens, _INDEX_HEAD_DIM), z * 2),
+        "extend_k_scale": base_f32.as_strided((padded_width_tokens,), z),
+        "extend_k_start": base_i32.as_strided((max_q_rows,), z),
+        "extend_k_end": base_i32.as_strided((max_q_rows,), z),
+        "extend_logits": base_f32.as_strided((max_q_rows, padded_width_tokens), z * 2),
     }
 
 
@@ -334,6 +343,7 @@ def sparse_nsa_index_extend_logits(
     weights: torch.Tensor,
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
     metadata: NSAIndexerExtendLogitsMetadata,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     k_start = metadata.k_start
     k_end = metadata.k_end
@@ -370,6 +380,7 @@ def sparse_nsa_index_extend_logits(
             k_scale=k_scale,
             k_start=k_start,
             k_end=k_end,
+            contract_phantoms=contract_phantoms,
         )
 
     return sparse_nsa_extend_logits_reference(

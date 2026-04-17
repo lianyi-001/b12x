@@ -739,6 +739,7 @@ def run_sparse_nsa_extend_logits_kernel(
     k_scale: torch.Tensor,
     k_start: torch.Tensor,
     k_end: torch.Tensor,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if not supports_sparse_nsa_extend_logits_kernel(
         q_fp8=q_fp8,
@@ -779,15 +780,16 @@ def run_sparse_nsa_extend_logits_kernel(
         _to_kernel_tensor(out, cutlass.Float32, assumed_align=4),
         current_cuda_stream(),
     )
+    _cp = contract_phantoms or {}
     cache_key = (
-        _tensor_meta_key(q_u32),
-        _tensor_meta_key(weights),
-        _tensor_meta_key(k_quant_bytes),
+        _tensor_meta_key(_cp.get("extend_q_u32", q_u32)),
+        _tensor_meta_key(_cp.get("extend_weights", weights)),
+        _tensor_meta_key(_cp.get("extend_k_quant", k_quant_bytes)),
         _tensor_meta_key(k_tma_desc_ptrs),
-        _tensor_meta_key(k_scale_padded),
-        _tensor_meta_key(k_start),
-        _tensor_meta_key(k_end),
-        _tensor_meta_key(out),
+        _tensor_meta_key(_cp.get("extend_k_scale", k_scale_padded)),
+        _tensor_meta_key(_cp.get("extend_k_start", k_start)),
+        _tensor_meta_key(_cp.get("extend_k_end", k_end)),
+        _tensor_meta_key(_cp.get("extend_logits", out)),
     )
     _run_cached_host_launcher(kernel, cache_key, args)
     return out
