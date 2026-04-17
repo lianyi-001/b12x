@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark: b12x dense_gemm vs FlashInfer-CUTLASS with CUDA graph replay.
 
-Compares block-scaled FP4 dense GEMM performance on GLM-5.1 layer-0 dense MLP
-shapes assuming TP=8, across realistic logical serving batch sizes.
-
-Note: M and N must be multiples of 128 for our kernel's tile constraints,
-so shapes are padded up accordingly.
+Compares block-scaled FP4 dense GEMM performance on the Nemotron 3 Super
+shared-expert down-projection shape `[M, 5376] x [5376, 4096]` across small
+decode-style batch sizes.
 """
 
 from __future__ import annotations
@@ -29,27 +27,23 @@ from b12x.gemm.dense import dense_gemm
 from flashinfer.gemm import mm_fp4
 
 
-def _align128(x: int) -> int:
-    return ((x + 127) // 128) * 128
-
-
-# GLM-5.1 layer 0 is a dense SwiGLU MLP before the routed-MoE stack begins.
-# At TP=8, gate/up shard the intermediate dimension and down consumes that
-# shard on input:
-#   gate/up: [M, 6144] x [6144, 1536]
-#   down:    [M, 1536] x [1536, 6144]
-GLM5_HIDDEN_SIZE = 6144
-GLM5_INTERMEDIATE_SIZE = 12288
-GLM5_TP_SIZE = 8
-GLM5_INTERMEDIATE_TP = GLM5_INTERMEDIATE_SIZE // GLM5_TP_SIZE
+# Nemotron 3 Super shared expert down projection from the released NVFP4
+# checkpoint:
+#   down: [M, 5376] x [5376, 4096]
+NEMOTRON_SHARED_EXPERT_INTERMEDIATE_SIZE = 5376
+NEMOTRON_HIDDEN_SIZE = 4096
 
 GEMM_SPECS = [
     # (name, K, N, note)
-    ("GLM5 dense MLP gate/up", GLM5_HIDDEN_SIZE, GLM5_INTERMEDIATE_TP, "x2 per layer"),
-    ("GLM5 dense MLP down", GLM5_INTERMEDIATE_TP, GLM5_HIDDEN_SIZE, "x1 per layer"),
+    (
+        "Nemotron shared expert down",
+        NEMOTRON_SHARED_EXPERT_INTERMEDIATE_SIZE,
+        NEMOTRON_HIDDEN_SIZE,
+        "NVIDIA Nemotron 3 Super shared_experts.down_proj",
+    ),
 ]
 
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
+BATCH_SIZES = [2, 4, 8]
 REFERENCE_BACKEND = "cutlass"
 REFERENCE_LABEL = "FlashInfer CUTLASS"
 COSINE_THRESHOLD = 0.999999
@@ -253,7 +247,7 @@ def main():
     torch.empty(1, device="cuda")
 
     print(f"Dense FP4 GEMM: b12x vs {REFERENCE_LABEL}")
-    print(f"GLM-5.1 layer-0 dense MLP shapes at TP={GLM5_TP_SIZE}")
+    print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     print("Timing mode: CUDA graph replay")
     if args.check:
         print(f"Correctness check: on (cos >= {COSINE_THRESHOLD:.6f})")
@@ -265,15 +259,13 @@ def main():
     # Collect all results for summary
     all_results = []  # (name, bs, M, N, K, b12x_med, ref_med)
 
-    for name, K, N_raw, note in GEMM_SPECS:
-        N = _align128(N_raw)
-        pad_note = f" (padded from {N_raw})" if N != N_raw else ""
+    for name, K, N, note in GEMM_SPECS:
         print(f"{'=' * 75}")
-        print(f"  {name}  K={K} N={N}{pad_note}  [{note}]")
+        print(f"  {name}  K={K} N={N}  [{note}]")
         print(f"{'=' * 75}")
 
         for bs in args.batch_sizes:
-            M = _align128(bs)
+            M = bs
             try:
                 results = bench_one(
                     M,
@@ -294,7 +286,7 @@ def main():
             b12x_med = statistics.median(results["b12x"]) * 1000 if results.get("b12x") else None
             ref_med = statistics.median(results[REFERENCE_LABEL]) * 1000 if results.get(REFERENCE_LABEL) else None
 
-            parts = [f"  bs={bs:<3} (M={M:>4})"]
+            parts = [f"  bs={bs:<3} (M={M:>2})"]
             if b12x_med is not None:
                 parts.append(f"b12x={b12x_med:6.1f}")
             if ref_med is not None:
@@ -316,16 +308,14 @@ def main():
     print(f"{'=' * 75}")
     header = f"  {'GEMM':<30}"
     for bs in args.batch_sizes:
-        header += f"  bs={bs:<4}"
+        header += f"  M={bs:<5}"
     print(header)
     print("  " + "-" * 70)
 
     ref_ratios = []
-    for name, K, N_raw, note in GEMM_SPECS:
-        N = _align128(N_raw)
+    for name, K, N, note in GEMM_SPECS:
         row = f"  {name:<30}"
         for bs in args.batch_sizes:
-            M = _align128(bs)
             match = [r for r in all_results if r[0] == name and r[1] == bs]
             if match and match[0][5] and match[0][6]:
                 ratio = match[0][5] / match[0][6]

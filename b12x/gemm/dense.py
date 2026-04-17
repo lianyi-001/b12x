@@ -1707,6 +1707,12 @@ def _get_compiled_dense_gemm(
 
 def _select_default_mma_tiler_mn(m: int, n: int, sm_count: int) -> Tuple[int, int]:
     coarse_tile = (128, 128)
+    # The coarse CTA-count heuristic misses exact-small-M, wide-N cases: a wide
+    # N dimension can generate plenty of CTAs even while each 128-row M tile is
+    # mostly empty. When M fits within one 64-row tile, prefer narrowing M
+    # first for wide-N problems before falling back to the occupancy proxy.
+    if m <= 64 and n > 1536:
+        return (64, 128)
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
