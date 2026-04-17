@@ -66,6 +66,19 @@ def default_sparse_mla_split_decode_config_for_width(
     return None
 
 
+def forced_sparse_mla_split_decode_config_for_width(
+    width: int,
+) -> SparseMLASplitDecodeConfig | None:
+    if width <= 0 or width > _SPLIT_MAX_WIDTH:
+        return None
+
+    for chunk_size in _SPLIT_CHUNK_LADDER:
+        num_chunks = _ceil_div(width, chunk_size)
+        if num_chunks <= _SPLIT_MAX_CHUNKS:
+            return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
+    return None
+
+
 @cute.jit
 def _split_output_lane_view(
     tmp_output: cute.Tensor,

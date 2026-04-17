@@ -59,7 +59,6 @@ class MLAWorkspace:
     tmp_lse: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
     num_chunks_ptr: torch.Tensor | None = None
-    q_pad: torch.Tensor | None = None
     sm_scale_tensor: torch.Tensor | None = None
     sm_scale_value: float | None = None
     kv_chunk_size_value: int | None = None
@@ -106,7 +105,6 @@ class MLAWorkspace:
             padded_heads=padded_heads,
             use_cuda_graph=use_cuda_graph,
         )
-        workspace._allocate_padded_query()
         workspace._allocate_split_buffers()
         if use_cuda_graph:
             workspace._allocate_runtime_metadata()
@@ -151,15 +149,6 @@ class MLAWorkspace:
         if use_cuda_graph:
             workspace._allocate_runtime_metadata()
         return workspace
-
-    def _allocate_padded_query(self) -> None:
-        if self.num_q_heads >= self.padded_heads:
-            return
-        self.q_pad = torch.empty(
-            (self.max_total_q, self.padded_heads, self.head_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
 
     def _allocate_runtime_metadata(self) -> None:
         if self.page_table_1_runtime is None:
@@ -401,11 +390,3 @@ class MLAWorkspace:
                 device=self.device,
             )
 
-    def padded_query_view(self, total_q: int) -> torch.Tensor | None:
-        if self.q_pad is None:
-            return None
-        if total_q > self.max_total_q:
-            raise ValueError(
-                f"query rows {total_q} exceed workspace capacity {self.max_total_q}"
-            )
-        return self.q_pad[:total_q]
