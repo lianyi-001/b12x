@@ -129,10 +129,11 @@ def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
         input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
+        activation="silu",
     ):
         del a1_gscale, w1_fp4, w1_blockscale, w1_alphas
         del a2_gscale, w2_fp4, w2_blockscale, w2_alphas
-        del input_scales_are_reciprocal, input_scales_static, fast_math
+        del input_scales_are_reciprocal, input_scales_static, fast_math, activation
         captured["a"] = a
         captured["topk_weights"] = topk_weights
         captured["topk_ids"] = topk_ids
@@ -184,6 +185,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         input_scales_are_reciprocal=False,
         input_scales_static=False,
         fast_math=None,
+        activation="silu",
     ):
         del args
         captured["workspace"] = workspace
@@ -191,6 +193,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         captured["input_scales_are_reciprocal"] = input_scales_are_reciprocal
         captured["input_scales_static"] = input_scales_static
         captured["fast_math"] = fast_math
+        captured["activation"] = activation
         if output is None:
             return torch.ones_like(hidden_states)
         output.fill_(1.0)
@@ -216,6 +219,7 @@ def test_sparse_moe_fp4_forwards_low_level_flags() -> None:
         "input_scales_are_reciprocal": True,
         "input_scales_static": True,
         "fast_math": False,
+        "activation": "silu",
     }
 
 
