@@ -33,6 +33,7 @@ from .kernel import (
     _to_kernel_tensor,
     _torch_to_cutlass_dtype,
     _view_last_dim_as_u32,
+    _workspace_contract_kv_tensors,
     get_sparse_mla_shared_storage_cls,
 )
 from .traits import SparseMLATraits, select_sparse_mla_traits
@@ -462,14 +463,15 @@ def run_sparse_mla_split_decode_forward(
         current_cuda_stream(),
     )
     _cq = getattr(workspace, "_contract_q", None)
+    _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
     _cpt = getattr(workspace, "_contract_page_table", None)
     _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     forward_cache_key = (
         _tensor_meta_key(_cq if _cq is not None else q_u32),
-        _tensor_meta_key(kv_rows_u32),
-        _tensor_meta_key(kv_scales),
+        _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
+        _tensor_meta_key(_cks if _cks is not None else kv_scales),
         _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
         _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
         _tensor_meta_key(kv_chunk_size_ptr),

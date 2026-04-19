@@ -44,6 +44,7 @@ class MLAWorkspace:
     topk: int
     max_total_q: int
     max_batch: int
+    max_kv_rows: int = 0
     page_size: int = 64
     padded_heads: int = 128
     use_cuda_graph: bool = False
@@ -57,6 +58,7 @@ class MLAWorkspace:
     nsa_cache_seqlens_int32_runtime: torch.Tensor | None = None
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
+    ragged_kv_cache: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
     num_chunks_ptr: torch.Tensor | None = None
     sm_scale_tensor: torch.Tensor | None = None
@@ -65,6 +67,8 @@ class MLAWorkspace:
     num_chunks_value: int | None = None
     # Phantom tensors for stable host-launcher cache keys (fixed_capacity only).
     _contract_q: torch.Tensor | None = None
+    _contract_kv_rows: torch.Tensor | None = None
+    _contract_kv_scales: torch.Tensor | None = None
     _contract_page_table: torch.Tensor | None = None
     _contract_nsa_cache_seqlens: torch.Tensor | None = None
     _contract_output: torch.Tensor | None = None
@@ -85,6 +89,7 @@ class MLAWorkspace:
         topk: int,
         max_total_q: int,
         max_batch: int,
+        max_kv_rows: int | None = None,
         page_size: int = 64,
         use_cuda_graph: bool = False,
         padded_heads: int = 128,
@@ -101,6 +106,7 @@ class MLAWorkspace:
             topk=topk,
             max_total_q=int(max_total_q),
             max_batch=int(max_batch),
+            max_kv_rows=max(0, int(max_kv_rows)) if max_kv_rows is not None else 0,
             page_size=page_size,
             padded_heads=padded_heads,
             use_cuda_graph=use_cuda_graph,
@@ -124,6 +130,7 @@ class MLAWorkspace:
         topk: int,
         max_total_q: int,
         max_batch: int,
+        max_kv_rows: int | None = None,
         page_size: int = 64,
         use_cuda_graph: bool = False,
         padded_heads: int = 128,
@@ -139,6 +146,7 @@ class MLAWorkspace:
             topk=topk,
             max_total_q=max_total_q,
             max_batch=max_batch,
+            max_kv_rows=max_kv_rows,
             page_size=page_size,
             use_cuda_graph=use_cuda_graph,
             padded_heads=padded_heads,
@@ -355,6 +363,105 @@ class MLAWorkspace:
         self.cache_seqlens_int32 = self.cache_seqlens_int32_runtime[:batch]
         self.nsa_cache_seqlens_int32 = self.nsa_cache_seqlens_int32_runtime[:rows]
 
+    def gather_ragged_kv_rows(
+        self,
+        *,
+        kv_cache: torch.Tensor,
+        row_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if kv_cache.ndim != 3:
+            raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
+        if row_ids.ndim != 1:
+            raise ValueError(f"row_ids must be rank-1, got {tuple(row_ids.shape)}")
+        if kv_cache.device != self.device:
+            raise ValueError(
+                f"kv_cache device {kv_cache.device} does not match workspace device {self.device}"
+            )
+        if row_ids.device != self.device:
+            raise ValueError(
+                f"row_ids device {row_ids.device} does not match workspace device {self.device}"
+            )
+        if kv_cache.dtype != self.kv_dtype:
+            raise ValueError(
+                f"kv_cache dtype {kv_cache.dtype} does not match workspace kv_dtype {self.kv_dtype}"
+            )
+
+        row_count = int(row_ids.shape[0])
+        capacity = max(int(self.max_kv_rows), row_count, 1)
+        expected_row_shape = tuple(int(dim) for dim in kv_cache.shape[1:])
+        buffer = self.ragged_kv_cache
+        if (
+            buffer is None
+            or buffer.device != self.device
+            or buffer.dtype != kv_cache.dtype
+            or tuple(int(dim) for dim in buffer.shape[1:]) != expected_row_shape
+            or buffer.shape[0] < capacity
+        ):
+            buffer = torch.empty(
+                (capacity, *expected_row_shape),
+                dtype=kv_cache.dtype,
+                device=self.device,
+            )
+            self.ragged_kv_cache = buffer
+            self.max_kv_rows = capacity
+            self._refresh_ragged_kv_contracts()
+        elif self._contract_kv_rows is None or self._contract_kv_scales is None:
+            self._refresh_ragged_kv_contracts()
+
+        assert buffer is not None
+        if row_count != 0:
+            kv_bytes = kv_cache.view(torch.uint8)
+            gathered_bytes = buffer[:row_count].view(torch.uint8)
+            torch.index_select(kv_bytes, 0, row_ids.to(torch.long), out=gathered_bytes)
+        # Return the full-capacity scratch buffer so launcher cache keys follow
+        # workspace capacity instead of the live ragged row count for this prefill.
+        return buffer
+
+    def contract_kv_tensors_for(
+        self,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return stable KV phantoms only for the ragged scratch allocation.
+
+        Extend/verify share a workspace in SGLang. After a ragged prefill allocates
+        `ragged_kv_cache`, later paged launches must not reuse those KV phantoms or
+        they can collide with a launcher compiled for a different KV layout.
+        """
+        buffer = self.ragged_kv_cache
+        if buffer is None:
+            return None, None
+        if kv_cache.device != buffer.device or kv_cache.dtype != buffer.dtype:
+            return None, None
+        if kv_cache.ndim != buffer.ndim:
+            return None, None
+        if kv_cache.data_ptr() != buffer.data_ptr():
+            return None, None
+        if tuple(int(dim) for dim in kv_cache.shape[1:]) != tuple(
+            int(dim) for dim in buffer.shape[1:]
+        ):
+            return None, None
+        return self._contract_kv_rows, self._contract_kv_scales
+
+    def _refresh_ragged_kv_contracts(self) -> None:
+        if self.ragged_kv_cache is None:
+            self._contract_kv_rows = None
+            self._contract_kv_scales = None
+            return
+
+        from .kernel import _extract_packed_kv_runtime_views
+
+        kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(self.ragged_kv_cache)
+        self._contract_kv_rows = _shape_only_cuda_tensor(
+            tuple(int(dim) for dim in kv_rows_u32.shape),
+            dtype=kv_rows_u32.dtype,
+            device=self.device,
+        )
+        self._contract_kv_scales = _shape_only_cuda_tensor(
+            tuple(int(dim) for dim in kv_scales.shape),
+            dtype=kv_scales.dtype,
+            device=self.device,
+        )
+
     def _allocate_contract_phantoms(self) -> None:
         """Create zero-stride phantom tensors at max capacity for stable cache keys."""
         # q is viewed as uint32 in the kernel: (max_total_q, num_q_heads, head_dim // 4).
@@ -389,4 +496,3 @@ class MLAWorkspace:
                 dtype=torch.float32,
                 device=self.device,
             )
-
