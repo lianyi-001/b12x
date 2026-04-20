@@ -42,6 +42,7 @@ from b12x.cute.fp4 import (
     st_shared_v4_u32,
     ue8m0_to_output_scale,
 )
+from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM, _MLA_PACKED_DIM, _MLA_ROPE_DIM
@@ -141,6 +142,21 @@ def _launcher_cache_lookup(
     return cache, compiled
 
 
+def _workspace_contract_kv_tensors(
+    workspace: object | None,
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if workspace is None:
+        return None, None
+    contract_selector = getattr(workspace, "contract_kv_tensors_for", None)
+    if callable(contract_selector):
+        return contract_selector(kv_cache)
+    return (
+        getattr(workspace, "_contract_kv_rows", None),
+        getattr(workspace, "_contract_kv_scales", None),
+    )
+
+
 def _run_cached_host_launcher(
     kernel: object,
     cache_key: tuple[object, ...],
@@ -148,6 +164,11 @@ def _run_cached_host_launcher(
 ) -> None:
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
+        raise_if_kernel_resolution_frozen(
+            "eager host launcher compile",
+            target=kernel,
+            cache_key=cache_key,
+        )
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -2241,13 +2262,14 @@ def run_sparse_mla_kernel(
     )
     # Use phantom tensors from workspace for stable cache keys when available.
     _cq = getattr(workspace, "_contract_q", None)
+    _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
     _cpt = getattr(workspace, "_contract_page_table", None)
     _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
     _co = getattr(workspace, "_contract_output", None)
     cache_key = (
         _tensor_meta_key(_cq if _cq is not None else q_u32),
-        _tensor_meta_key(kv_rows_u32),
-        _tensor_meta_key(kv_scales),
+        _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
+        _tensor_meta_key(_cks if _cks is not None else kv_scales),
         _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
         _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
         _tensor_meta_key(_co if _co is not None else output),

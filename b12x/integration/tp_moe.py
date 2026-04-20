@@ -28,6 +28,7 @@ from b12x.moe.fused.silu import (
     MoEStaticKernelSilu,
 )
 from b12x.moe.tuning import lookup_max_active_clusters
+from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
@@ -189,6 +190,16 @@ class _WeightViews:
 
 
 @dataclass(frozen=True)
+class _ExactRelu2Bs1NemotronLauncher:
+    plan: TPMoEPlan
+    weights: _WeightViews
+    input_gs: torch.Tensor
+    down_input_scale: torch.Tensor
+    compiled: object
+    mac: int
+
+
+@dataclass(frozen=True)
 class _ActivationKernelSpec:
     activation: str
     is_gated: bool
@@ -251,6 +262,8 @@ _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
+_EXACT_RELU2_BS1_NEMOTRON_CACHE: Dict[Tuple, _ExactRelu2Bs1NemotronLauncher] = {}
+_LAST_EXACT_RELU2_BS1_NEMOTRON: Tuple = (None, None)  # (cache_key, launcher)
 _CURRENT_DISPATCH_STAGE: str | None = None
 
 
@@ -273,6 +286,7 @@ def clear_tp_moe_caches() -> None:
     """
     global _LAST_WEIGHTS
     global _LAST_KERNEL
+    global _LAST_EXACT_RELU2_BS1_NEMOTRON
     global _MICRO_COMPACT_CUTOVER_PAIRS_CACHE
     global _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
     global _DYNAMIC_MULTICTA_CACHE
@@ -282,6 +296,7 @@ def clear_tp_moe_caches() -> None:
     _STATIC_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
     _MAC_CACHE.clear()
+    _EXACT_RELU2_BS1_NEMOTRON_CACHE.clear()
     _PLAIN_PARAM_CACHE.clear()
     _MICRO_COMPACT_CUTOVER_PAIRS_CACHE = None
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = None
@@ -289,6 +304,7 @@ def clear_tp_moe_caches() -> None:
     _DYNAMIC_CHUNK_MULTIPLIER_CACHE = None
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
+    _LAST_EXACT_RELU2_BS1_NEMOTRON = (None, None)
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -359,6 +375,13 @@ def _get_dynamic_chunk_multiplier() -> int:
     return _DYNAMIC_CHUNK_MULTIPLIER_CACHE
 
 
+def _get_relu2_bs1_spark_micro_cap() -> int:
+    cap = _first_env("B12X_RELU2_BS1_SPARK_MICRO_CAP")
+    if cap is None:
+        return 42
+    return max(1, int(cap))
+
+
 def _flatten_routing_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     with record_function("tp_moe.flatten_routing_ids"):
         flat_ids = topk_ids.view(-1)
@@ -387,7 +410,7 @@ def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
     with record_function("tp_moe.prepare_expert_scale"):
         if scale.numel() == 1:
             with record_function("tp_moe.prepare_expert_scale.expand_scalar"):
-                return scale.expand(weight_E).to(torch.float32).contiguous()
+                return _get_plain_cuda_tensor(scale.expand(weight_E), dtype=torch.float32)
         if scale.numel() != weight_E:
             raise ValueError(f"expected expert scale with {weight_E} elements, got {scale.numel()}")
         return _get_plain_cuda_tensor(scale, dtype=torch.float32)
@@ -850,6 +873,26 @@ def _make_workspace_plan(
     )
 
 
+def _make_exact_relu2_bs1_nemotron_plan(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> TPMoEPlan:
+    return TPMoEPlan(
+        implementation="static",
+        state_E=22,
+        weight_E=512,
+        routed_rows=22,
+        max_rows=22,
+        k=1024,
+        n=2688,
+        num_topk=22,
+        device=device,
+        dtype=dtype,
+        max_tokens_per_launch=1,
+    )
+
+
 def _validate_workspace(
     workspace: TPMoEWorkspace,
     *,
@@ -956,6 +999,36 @@ def _workspace_pool_key(
     )
 
 
+def _lookup_capture_static_workspace(
+    workspace: TPMoEWorkspacePool,
+    *,
+    plan: TPMoEPlan,
+) -> TPCompactStaticWorkspace | None:
+    if plan.implementation != "static":
+        return None
+    for candidate in workspace.workspaces.values():
+        if not isinstance(candidate, TPCompactStaticWorkspace):
+            continue
+        if (
+            candidate.implementation != plan.implementation
+            or candidate.weight_E != plan.weight_E
+            or candidate.k != plan.k
+            or candidate.n != plan.n
+            or candidate.num_topk != plan.num_topk
+            or candidate.device != plan.device
+            or candidate.dtype != plan.dtype
+        ):
+            continue
+        if candidate.state_E < plan.state_E:
+            continue
+        if candidate.max_rows < plan.max_rows:
+            continue
+        if candidate.routed_rows_capacity < plan.routed_rows:
+            continue
+        return candidate
+    return None
+
+
 def _resolve_workspace(
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
     *,
@@ -994,6 +1067,14 @@ def _resolve_workspace(
         dtype=plan.dtype,
     )
     resolved = workspace.workspaces.get(key)
+    if resolved is None and torch.cuda.is_current_stream_capturing():
+        capture_static = _lookup_capture_static_workspace(workspace, plan=plan)
+        if capture_static is not None:
+            # Capture may switch to a dedicated stream, but the compact static
+            # workspace is stream-agnostic scratch. Reuse the warmed eager
+            # workspace instead of allocating a fresh one inside capture.
+            workspace.workspaces[key] = capture_static
+            resolved = capture_static
     if resolved is None:
         resolved = _alloc_workspace(
             plan.implementation,
@@ -1167,11 +1248,27 @@ def _get_impl_mac(impl: str, *, routed_rows: int | None = None) -> int:
     return mac
 
 
-def _select_micro_mma_tiler_mn(max_rows: int, n: int) -> tuple[int, int]:
+def _select_micro_mma_tiler_mn(
+    max_rows: int,
+    n: int,
+    *,
+    resident_clusters: int | None = None,
+) -> tuple[int, int]:
     if os.environ.get("B12X_MOE_TILE_MN"):
         return tuple(int(x) for x in os.environ["B12X_MOE_TILE_MN"].split("x"))
     sm_count = get_num_sm(torch.device("cuda"))
+    if resident_clusters is not None and resident_clusters < sm_count:
+        # The small-M 64x128 path only pays off when the launch can actually
+        # fill the machine. If a backend-specific cap is already leaving SMs
+        # idle, shrinking tile_m just increases barrier/scheduling overhead.
+        return (128, 128)
     coarse_tile = (128, 128)
+    # The routed-row proxy can hide exact-small-M underfill when N is wide:
+    # enough 128-column tiles may exist to satisfy the CTA-count heuristic even
+    # though each CTA's 128-row M slice is mostly empty. When the routed work
+    # fits within one 64-row tile, prefer narrowing M first for wide-N cases.
+    if max_rows <= 64 and n > 1536:
+        return (64, 128)
     coarse_tiles = ((max_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
@@ -1203,7 +1300,11 @@ def _get_static_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if num_topk > 1:
-        mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n)
+        mma_tiler_mn = _select_micro_mma_tiler_mn(
+            routed_rows,
+            n,
+            resident_clusters=mac,
+        )
 
     global _LAST_KERNEL
     cache_key = (
@@ -1310,6 +1411,7 @@ def _get_static_kernel(
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
     )
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     compiled = cute.compile(
         kernel,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1344,6 +1446,8 @@ def _get_micro_kernel(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     share_input_across_experts: bool = False,
+    share_expert_scales: bool = False,
+    single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
 ):
@@ -1351,12 +1455,17 @@ def _get_micro_kernel(
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     routed_rows = m * num_topk
-    mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n)
+    mma_tiler_mn = _select_micro_mma_tiler_mn(
+        routed_rows,
+        n,
+        resident_clusters=mac,
+    )
 
     global _LAST_KERNEL
     cache_key = (
         "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math, share_input_across_experts, activation,
+        input_scales_are_reciprocal, fast_math, share_input_across_experts, share_expert_scales, single_token,
+        activation,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1380,6 +1489,8 @@ def _get_micro_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=single_token,
     )
     kernel = activation_spec.make_micro_kernel(**kernel_kwargs)
 
@@ -1455,6 +1566,7 @@ def _get_micro_kernel(
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
     )
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     compiled = cute.compile(
         kernel,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1709,6 +1821,7 @@ def _get_dynamic_kernel(
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     token_weights_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=cache_key)
     compiled = cute.compile(
         launch,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1733,6 +1846,202 @@ def _get_dynamic_kernel(
         _DYNAMIC_KERNEL_CACHE[cache_key] = result
     _LAST_KERNEL = (cache_key, result)
     return result
+
+
+def _is_exact_relu2_bs1_nemotron_case(
+    *,
+    activation: str,
+    a: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    return (
+        activation == "relu2"
+        and a.dtype == torch.bfloat16
+        and a.shape == (1, 1024)
+        and w1_fp4.shape == (512, 2688, 512)
+        and w2_fp4.shape == (512, 1024, 1344)
+        and topk_ids.shape == (1, 22)
+        and topk_weights.shape == (1, 22)
+        and a1_gscale.numel() == 1
+        and a2_gscale.numel() == 1
+    )
+
+
+def _get_exact_relu2_bs1_nemotron_launcher(
+    *,
+    a: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+) -> _ExactRelu2Bs1NemotronLauncher:
+    global _LAST_EXACT_RELU2_BS1_NEMOTRON
+    plan = _make_exact_relu2_bs1_nemotron_plan(device=a.device, dtype=a.dtype)
+    cache_key = (
+        plan.device.index or 0,
+        plan.dtype,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        w1_fp4.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_fp4.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w2_alphas.data_ptr(),
+        a1_gscale.data_ptr(),
+        int(a1_gscale._version),
+        a2_gscale.data_ptr(),
+        int(a2_gscale._version),
+    )
+    last_key, last_launcher = _LAST_EXACT_RELU2_BS1_NEMOTRON
+    if last_key == cache_key:
+        return last_launcher
+    cached = _EXACT_RELU2_BS1_NEMOTRON_CACHE.get(cache_key)
+    if cached is not None:
+        _LAST_EXACT_RELU2_BS1_NEMOTRON = (cache_key, cached)
+        return cached
+
+    weights = _get_weight_views(
+        w1_fp4,
+        w1_blockscale,
+        w2_fp4,
+        w2_blockscale,
+        w1_alphas,
+        w2_alphas,
+        plan.n,
+        plan.k,
+        activation_spec=_ACTIVATION_KERNEL_SPECS["relu2"],
+    )
+    input_gs = _prepare_expert_scale(a1_gscale, plan.weight_E)
+    down_input_scale = _prepare_expert_scale(a2_gscale, plan.weight_E)
+    micro_work_tiles = plan.routed_rows * max(1, (plan.n + 128 - 1) // 128)
+    micro_mac = min(_get_impl_mac("micro", routed_rows=plan.routed_rows), micro_work_tiles)
+    if get_num_sm(plan.device) <= 96:
+        micro_mac = min(micro_mac, _get_relu2_bs1_spark_micro_cap())
+    compiled, mac = _get_micro_kernel(
+        plan.state_E,
+        plan.weight_E,
+        1,
+        plan.k,
+        plan.n,
+        plan.num_topk,
+        plan.max_rows,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        share_input_across_experts=True,
+        share_expert_scales=False,
+        single_token=True,
+        mac_override=micro_mac,
+        activation="relu2",
+    )
+    launcher = _ExactRelu2Bs1NemotronLauncher(
+        plan=plan,
+        weights=weights,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        compiled=compiled,
+        mac=mac,
+    )
+    _EXACT_RELU2_BS1_NEMOTRON_CACHE[cache_key] = launcher
+    _LAST_EXACT_RELU2_BS1_NEMOTRON = (cache_key, launcher)
+    return launcher
+
+
+def _resolve_scatter_output(
+    *,
+    a: torch.Tensor,
+    output: torch.Tensor | None,
+    device: torch.device,
+    m: int,
+    k: int,
+) -> torch.Tensor:
+    if output is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+        scatter_output = torch.zeros(m, k, dtype=a.dtype, device=device)
+    else:
+        scatter_output = output
+    if scatter_output.shape != (m, k):
+        raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
+    if scatter_output.dtype != a.dtype:
+        raise ValueError(f"output must have dtype {a.dtype}, got {scatter_output.dtype}")
+    if scatter_output.device != device:
+        raise ValueError(f"output must be on device {device}, got {scatter_output.device}")
+    if not scatter_output.is_contiguous():
+        raise ValueError("output must be contiguous")
+    return scatter_output
+
+
+def _launch_exact_relu2_bs1_nemotron(
+    *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    scatter_output: torch.Tensor,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    input_scales_static: bool,
+) -> torch.Tensor:
+    flat_ids = _flatten_routing_ids(topk_ids)
+    flat_weights = _flatten_routing_weights(topk_weights)
+    launcher = _get_exact_relu2_bs1_nemotron_launcher(
+        a=a,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        topk_ids_dtype=flat_ids.dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+    )
+    resolved = _resolve_workspace(
+        workspace,
+        plan=launcher.plan,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    assert isinstance(resolved, TPCompactStaticWorkspace)
+    launcher.compiled(
+        a, flat_ids, flat_weights,
+        resolved.packed_a_view, resolved.sfa_ptr,
+        resolved.packed_a_flat, resolved.scale_flat,
+        resolved.barrier_count, resolved.barrier_epoch,
+        launcher.weights.w13_fp4, launcher.weights.sfb_w13_ptr,
+        launcher.weights.down_fp4, launcher.weights.sfb_down_ptr,
+        resolved.row_counts, resolved.active_expert_count, resolved.weight_expert_ids, resolved.global_to_local_expert,
+        launcher.input_gs, launcher.weights.w1_alpha, launcher.weights.w2_alpha, launcher.down_input_scale,
+        scatter_output, resolved.token_map, resolved.token_weights,
+        launcher.mac, current_cuda_stream(),
+    )
+    return scatter_output
 
 
 def _launch_dynamic(
@@ -1824,6 +2133,7 @@ def _launch_compact_static(
     fast_math: bool,
     stream,
     share_input_across_experts: bool = False,
+    share_expert_scales: bool = False,
     activation: str = "silu",
 ) -> None:
     micro_cutover_pairs = _get_micro_compact_cutover_pairs()
@@ -1845,10 +2155,27 @@ def _launch_compact_static(
         # barriers without owning useful work.
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         micro_mac = min(_get_impl_mac("micro", routed_rows=routed_rows), micro_work_tiles)
-        # m==1 shortcut: a single token's top-k is already a dense unique
-        # expert set, so we can build the compact local-id mapping directly
-        # without running the Triton compaction prepass.
-        if m == 1:
+        if (
+            activation == "relu2"
+            and m == 1
+            and routed_rows <= 24
+            and get_num_sm(a.device) <= 96
+        ):
+            # Spark-class parts are bandwidth-limited in this single-token
+            # relu2 path. The generic decode ladder over-resides the micro
+            # kernel here, which shows up as extra barrier churn in graph replay.
+            micro_mac = min(micro_mac, _get_relu2_bs1_spark_micro_cap())
+            # The shared-scale specialization trims a couple of global reads, but
+            # on Spark's single-token relu2 path it also shifts the micro kernel's
+            # register/occupancy balance enough to lose the cap-43 win.
+            share_expert_scales = False
+        # m==1 relu2 shortcut: a single token's top-k is already a dense local
+        # expert set. Keep the routed expert ids in-place so graph replay does
+        # not pay to restage compact ids every launch.
+        if m == 1 and activation == "relu2":
+            launch_ids = flat_ids
+        # Other m==1 activations still need the compact local-id mapping.
+        elif m == 1:
             compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             compact_ids.copy_(torch.arange(flat_ids.numel(), device=flat_ids.device, dtype=torch.int32))
             workspace.weight_expert_ids[: flat_ids.numel()].copy_(flat_ids.to(torch.int32))
@@ -1865,10 +2192,12 @@ def _launch_compact_static(
             launch_ids = compact_ids
         compiled, mac = _get_micro_kernel(
             workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
-            topk_ids_dtype=torch.int32,
+            topk_ids_dtype=launch_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=(m == 1 and activation == "relu2"),
             mac_override=micro_mac,
             activation=activation,
         )
@@ -1938,6 +2267,51 @@ def b12x_moe_fp4(
     num_topk = topk_ids.shape[1]
     routed_rows = m * num_topk
     device = a.device
+    if apply_router_weight_on_input:
+        raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
+    if fast_math is None:
+        fast_math = _FAST_MATH_DEFAULT
+    # Shared scalar input scales are weight-side constants in the benchmarked
+    # path, so treat them as static and avoid re-expanding them every launch.
+    effective_input_scales_static = (
+        input_scales_static
+        or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
+    )
+    if _is_exact_relu2_bs1_nemotron_case(
+        activation=activation,
+        a=a,
+        w1_fp4=w1_fp4,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    ):
+        scatter_output = _resolve_scatter_output(
+            a=a,
+            output=output,
+            device=device,
+            m=m,
+            k=k,
+        )
+        return _launch_exact_relu2_bs1_nemotron(
+            workspace=workspace,
+            a=a,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            scatter_output=scatter_output,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            fast_math=fast_math,
+            input_scales_static=effective_input_scales_static,
+        )
     workspace_policy = _workspace_policy(workspace)
     plan = _make_workspace_plan(
         num_tokens=m,
@@ -1949,17 +2323,6 @@ def b12x_moe_fp4(
         dtype=a.dtype,
         topk_ids=topk_ids,
         eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
-    )
-
-    if apply_router_weight_on_input:
-        raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
-    if fast_math is None:
-        fast_math = _FAST_MATH_DEFAULT
-    # Shared scalar input scales are weight-side constants in the benchmarked
-    # path, so treat them as static and avoid re-expanding them every launch.
-    effective_input_scales_static = (
-        input_scales_static
-        or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
 
     impl = plan.implementation
@@ -2107,6 +2470,7 @@ def b12x_moe_fp4(
                 and a1_gscale.numel() == 1
                 and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
+            share_expert_scales=(a1_gscale.numel() == 1 and a2_gscale.numel() == 1),
             activation=activation,
         )
     return scatter_output

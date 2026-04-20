@@ -8,7 +8,7 @@ import torch
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import convert_sf_from_mma_layout, get_num_sm
-from b12x.gemm.dense import dense_gemm
+from b12x.gemm.dense import _select_default_mma_tiler_mn, dense_gemm
 
 _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
@@ -186,3 +186,21 @@ def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
 
     torch.testing.assert_close(graph_gate, eager_gate, rtol=0, atol=0)
     torch.testing.assert_close(graph_down, eager_down, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "sm_count", "expected"),
+    [
+        (2, 4096, 48, (64, 128)),
+        (64, 4096, 48, (64, 128)),
+        (96, 4096, 48, (128, 128)),
+        (2, 1024, 48, (64, 64)),
+    ],
+)
+def test_default_dense_tile_selector_handles_small_m_wide_n(
+    m: int,
+    n: int,
+    sm_count: int,
+    expected: tuple[int, int],
+) -> None:
+    assert _select_default_mma_tiler_mn(m, n, sm_count) == expected

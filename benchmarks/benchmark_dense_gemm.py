@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark: b12x dense_gemm vs FlashInfer-CUTLASS with CUDA graph replay.
 
-Compares block-scaled FP4 dense GEMM performance on GLM-5.1 layer-0 dense MLP
-shapes assuming TP=8, across realistic logical serving batch sizes.
-
-Note: M and N must be multiples of 128 for our kernel's tile constraints,
-so shapes are padded up accordingly.
+Compares block-scaled FP4 dense GEMM performance on the Nemotron 3 Super
+shared-expert down-projection shape `[M, 5376] x [5376, 4096]` across small
+decode-style batch sizes.
 """
 
 from __future__ import annotations
@@ -23,36 +21,35 @@ import torch
 import torch.nn.functional as F
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
-from b12x.cute.utils import convert_sf_from_mma_layout
+from b12x.cute.utils import convert_sf_from_mma_layout, get_hardware_info
 from b12x.gemm.dense import dense_gemm
 
 from flashinfer.gemm import mm_fp4
 
 
-def _align128(x: int) -> int:
-    return ((x + 127) // 128) * 128
-
-
-# GLM-5.1 layer 0 is a dense SwiGLU MLP before the routed-MoE stack begins.
-# At TP=8, gate/up shard the intermediate dimension and down consumes that
-# shard on input:
-#   gate/up: [M, 6144] x [6144, 1536]
-#   down:    [M, 1536] x [1536, 6144]
-GLM5_HIDDEN_SIZE = 6144
-GLM5_INTERMEDIATE_SIZE = 12288
-GLM5_TP_SIZE = 8
-GLM5_INTERMEDIATE_TP = GLM5_INTERMEDIATE_SIZE // GLM5_TP_SIZE
+# Nemotron 3 Super shared expert down projection from the released NVFP4
+# checkpoint:
+#   down: [M, 5376] x [5376, 4096]
+NEMOTRON_SHARED_EXPERT_INTERMEDIATE_SIZE = 5376
+NEMOTRON_HIDDEN_SIZE = 4096
 
 GEMM_SPECS = [
     # (name, K, N, note)
-    ("GLM5 dense MLP gate/up", GLM5_HIDDEN_SIZE, GLM5_INTERMEDIATE_TP, "x2 per layer"),
-    ("GLM5 dense MLP down", GLM5_INTERMEDIATE_TP, GLM5_HIDDEN_SIZE, "x1 per layer"),
+    (
+        "Nemotron shared expert down",
+        NEMOTRON_SHARED_EXPERT_INTERMEDIATE_SIZE,
+        NEMOTRON_HIDDEN_SIZE,
+        "NVIDIA Nemotron 3 Super shared_experts.down_proj",
+    ),
 ]
 
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
+BATCH_SIZES = [2, 4, 8]
 REFERENCE_BACKEND = "cutlass"
 REFERENCE_LABEL = "FlashInfer CUTLASS"
 COSINE_THRESHOLD = 0.999999
+_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_AUTO_L2_FLUSH_MULTIPLIER = 2
+_FALLBACK_L2_FLUSH_BYTES = 32 << 20
 
 
 class BenchmarkAbort(RuntimeError):
@@ -63,13 +60,58 @@ class CorrectnessError(BenchmarkAbort):
     """Raised when replay outputs fail the correctness gate."""
 
 
-def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> List[float]:
+def resolve_l2_flush_bytes(bytes_hint: int) -> int:
+    if bytes_hint < 0:
+        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
+    if bytes_hint > 0:
+        return int(bytes_hint)
+    try:
+        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
+    except Exception:
+        l2_bytes = 0
+    if l2_bytes > 0:
+        return l2_bytes * _AUTO_L2_FLUSH_MULTIPLIER
+    return _FALLBACK_L2_FLUSH_BYTES
+
+
+def make_l2_flush_fn(
+    *,
+    enabled: bool,
+    bytes_hint: int = 0,
+) -> Callable[[], None] | None:
+    if not enabled:
+        return None
+    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
+    device_idx = torch.cuda.current_device()
+    key = (device_idx, flush_bytes)
+    buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
+    if buffer is None:
+        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
+        _L2_FLUSH_BUFFER_CACHE[key] = buffer
+
+    def flush(cache_buffer: torch.Tensor = buffer) -> None:
+        cache_buffer.bitwise_not_()
+
+    return flush
+
+
+def bench_events(
+    fn: Callable[[], None],
+    *,
+    warmup: int,
+    iters: int,
+    l2_flush: Callable[[], None] | None = None,
+) -> List[float]:
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         fn()
     torch.cuda.synchronize()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
+        if l2_flush is not None:
+            l2_flush()
         starts[i].record()
         fn()
         ends[i].record()
@@ -159,6 +201,7 @@ def bench_one(
     warmup: int,
     iters: int,
     check: bool,
+    l2_flush: Callable[[], None] | None,
 ):
     """Benchmark one (M,N,K) problem with CUDA graph replay timing."""
     torch.manual_seed(42)
@@ -186,7 +229,12 @@ def bench_one(
         b12x_replay = capture_graph_replay(b12x_launch)
         results["b12x_replay"] = b12x_replay
         results["b12x_out"] = b12x_out
-        results["b12x"] = bench_events(b12x_replay, warmup=warmup, iters=iters)
+        results["b12x"] = bench_events(
+            b12x_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
     except Exception as exc:
         results["b12x"] = None
         print(f"      b12x FAILED: {exc}")
@@ -204,7 +252,12 @@ def bench_one(
         ref_replay = capture_graph_replay(cutlass_launch)
         results["ref_replay"] = ref_replay
         results["ref_out"] = ref_out
-        results[REFERENCE_LABEL] = bench_events(ref_replay, warmup=warmup, iters=iters)
+        results[REFERENCE_LABEL] = bench_events(
+            ref_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
     except Exception as exc:
         results[REFERENCE_LABEL] = None
         print(f"      {REFERENCE_LABEL} FAILED: {exc}")
@@ -232,6 +285,18 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=BATCH_SIZES)
+    parser.add_argument(
+        "--flush-l2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evict GPU L2 before each warmup and timed launch (default: enabled).",
+    )
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
+    )
     parser.set_defaults(check=True)
     parser.add_argument(
         "--check",
@@ -251,10 +316,16 @@ def main():
     if major != 12 or minor not in (0, 1):
         raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
     torch.empty(1, device="cuda")
+    l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     print(f"Dense FP4 GEMM: b12x vs {REFERENCE_LABEL}")
-    print(f"GLM-5.1 layer-0 dense MLP shapes at TP={GLM5_TP_SIZE}")
+    print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     print("Timing mode: CUDA graph replay")
+    if args.flush_l2:
+        print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
+    else:
+        print("L2 flush: off")
     if args.check:
         print(f"Correctness check: on (cos >= {COSINE_THRESHOLD:.6f})")
     else:
@@ -265,15 +336,13 @@ def main():
     # Collect all results for summary
     all_results = []  # (name, bs, M, N, K, b12x_med, ref_med)
 
-    for name, K, N_raw, note in GEMM_SPECS:
-        N = _align128(N_raw)
-        pad_note = f" (padded from {N_raw})" if N != N_raw else ""
+    for name, K, N, note in GEMM_SPECS:
         print(f"{'=' * 75}")
-        print(f"  {name}  K={K} N={N}{pad_note}  [{note}]")
+        print(f"  {name}  K={K} N={N}  [{note}]")
         print(f"{'=' * 75}")
 
         for bs in args.batch_sizes:
-            M = _align128(bs)
+            M = bs
             try:
                 results = bench_one(
                     M,
@@ -282,6 +351,7 @@ def main():
                     warmup=args.warmup,
                     iters=args.iters,
                     check=args.check,
+                    l2_flush=l2_flush,
                 )
             except BenchmarkAbort as exc:
                 print(
@@ -294,7 +364,7 @@ def main():
             b12x_med = statistics.median(results["b12x"]) * 1000 if results.get("b12x") else None
             ref_med = statistics.median(results[REFERENCE_LABEL]) * 1000 if results.get(REFERENCE_LABEL) else None
 
-            parts = [f"  bs={bs:<3} (M={M:>4})"]
+            parts = [f"  bs={bs:<3} (M={M:>2})"]
             if b12x_med is not None:
                 parts.append(f"b12x={b12x_med:6.1f}")
             if ref_med is not None:
@@ -316,16 +386,14 @@ def main():
     print(f"{'=' * 75}")
     header = f"  {'GEMM':<30}"
     for bs in args.batch_sizes:
-        header += f"  bs={bs:<4}"
+        header += f"  M={bs:<5}"
     print(header)
     print("  " + "-" * 70)
 
     ref_ratios = []
-    for name, K, N_raw, note in GEMM_SPECS:
-        N = _align128(N_raw)
+    for name, K, N, note in GEMM_SPECS:
         row = f"  {name:<30}"
         for bs in args.batch_sizes:
-            M = _align128(bs)
             match = [r for r in all_results if r[0] == name and r[1] == bs]
             if match and match[0][5] and match[0][6]:
                 ratio = match[0][5] / match[0][6]

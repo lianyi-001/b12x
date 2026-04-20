@@ -16,10 +16,11 @@ from .kernel import (
 from .reference import sparse_mla_reference
 from .split import (
     clear_sparse_mla_split_kernel_cache,
+    forced_sparse_mla_split_decode_config_for_width,
     run_sparse_mla_split_decode,
     select_sparse_mla_split_decode_config,
 )
-from .workspace import MLAWorkspace
+from .workspace import B12XAttentionWorkspace
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ def sparse_mla_decode_forward(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     metadata: MLASparseDecodeMetadata,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -85,7 +86,7 @@ def sparse_mla_extend_forward(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     metadata: MLASparseExtendMetadata,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -107,7 +108,7 @@ def _run_sparse_mla(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -172,6 +173,7 @@ def _run_sparse_mla(
     use_reference = os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") == "1"
     sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
     split_cfg = None
+    force_split = workspace.mode in ("extend", "verify", "draft_extend")
     if not use_reference:
         split_cfg = select_sparse_mla_split_decode_config(
             q_all=q_all,
@@ -181,13 +183,36 @@ def _run_sparse_mla(
             output_dtype=q_all.dtype,
             v_head_dim=v_head_dim,
         )
+        if (
+            force_split
+            and split_cfg is None
+            and q_all.device.type == "cuda"
+            and supports_sparse_mla_kernel(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=selected_indices,
+                v_head_dim=v_head_dim,
+            )
+        ):
+            forced_width = int(selected_indices.shape[1])
+            if active_token_counts is not None and active_token_counts.numel() > 0:
+                if (
+                    active_token_counts.device.type != "cuda"
+                    or not torch.cuda.is_current_stream_capturing()
+                ):
+                    forced_width = min(
+                        forced_width,
+                        max(0, int(active_token_counts.max().item())),
+                    )
+            split_cfg = forced_sparse_mla_split_decode_config_for_width(forced_width)
     if split_cfg is not None:
         if workspace.tmp_output is None or workspace.tmp_lse is None:
             raise RuntimeError("workspace is missing split MLA buffers")
-        workspace.set_split_chunk_config(
-            kv_chunk_size=split_cfg.chunk_size,
-            num_chunks=split_cfg.num_chunks,
-        )
+        if not (workspace.fixed_capacity or workspace.use_cuda_graph):
+            workspace.set_split_chunk_config(
+                kv_chunk_size=split_cfg.chunk_size,
+                num_chunks=split_cfg.num_chunks,
+            )
         launch_num_chunks = (
             workspace.max_chunks_per_row if (workspace.fixed_capacity or workspace.use_cuda_graph) else split_cfg.num_chunks
         )
@@ -251,7 +276,7 @@ def _run_sparse_mla(
 
 def _get_sm_scale_tensor(
     *,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     device: torch.device,
     sm_scale: float,
 ) -> torch.Tensor:

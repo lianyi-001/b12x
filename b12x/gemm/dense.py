@@ -43,6 +43,7 @@ import functools
 import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
+from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from b12x.cute.utils import (
     current_cuda_stream,
@@ -54,6 +55,7 @@ from b12x.cute.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
+from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 
 # Workaround for nvidia-cutlass-dsl 4.4.1 bug:
@@ -108,6 +110,7 @@ class DenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        single_work_tile_per_cta: bool = False,
         use_prefetch: bool = False,
         enable_pdl: bool = True,
     ):
@@ -123,6 +126,7 @@ class DenseGemmKernel:
         self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)  # Always (1,1,1) on the current target
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
+        self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
 
@@ -1142,8 +1146,14 @@ class DenseGemmKernel:
                                 tma_store_pipeline.producer_acquire()
 
                 # Advance to the next work tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.single_work_tile_per_cta):
+                    work_tile = WorkTileInfo(
+                        work_tile.tile_idx,
+                        cutlass.Boolean(0),
+                    )
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
                 if has_multi_epi_store:
                     tma_store_pipeline.producer_tail()
 
@@ -1212,8 +1222,14 @@ class DenseGemmKernel:
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
                     mainloop_producer_state.advance()
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.single_work_tile_per_cta):
+                    work_tile = WorkTileInfo(
+                        work_tile.tile_idx,
+                        cutlass.Boolean(0),
+                    )
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             mainloop_pipeline.producer_tail(mainloop_producer_state)
         return
@@ -1250,12 +1266,14 @@ class DenseGemmKernel:
         )
         mbar_helpers_bytes = 1024
 
-        ab_stage = (
+        raw_ab_stage = (
             (smem_capacity - occupancy * 1024) // occupancy
             - mbar_helpers_bytes
             - epi_bytes
         ) // (ab_bytes_per_stage + sf_bytes_per_stage)
-        ab_stage = max(1, min(ab_stage, 4))
+        ab_stage = max(1, min(raw_ab_stage, 4))
+        if tile_shape_mnk[0] == 64 and tile_shape_mnk[1] == 128:
+            ab_stage = max(1, min(raw_ab_stage, 5))
         return ab_stage, epi_stage
 
     @staticmethod
@@ -1560,11 +1578,19 @@ class _DenseGemmLaunch:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
         sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
+        tile_m, tile_n = self._mma_tiler_mn
+        single_work_tile_per_cta = (
+            ((self._m + tile_m - 1) // tile_m)
+            * ((self._n + tile_n - 1) // tile_n)
+            * self._l
+            <= self._max_active_clusters
+        )
 
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
+            single_work_tile_per_cta=single_work_tile_per_cta,
         )(
             a_tensor,
             b_tensor,
@@ -1642,25 +1668,31 @@ def _get_compiled_dense_gemm(
             make_ptr(alpha_dtype, alpha_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
         ]
 
+    launch = _DenseGemmLaunch(
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        alpha_dtype=alpha_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sm_count=sm_count,
+        sm_version=sm_version,
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=launch,
+        cache_key=(m, n, k, l, mma_tiler_mn, cluster_shape_mn, sm_count, sm_version),
+    )
     compiled_kernel = cute.compile(
-        _DenseGemmLaunch(
-            m=m,
-            n=n,
-            k=k,
-            l=l,
-            a_major=a_major,
-            b_major=b_major,
-            c_major=c_major,
-            ab_dtype=ab_dtype,
-            sf_dtype=sf_dtype,
-            c_dtype=c_dtype,
-            alpha_dtype=alpha_dtype,
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sm_count=sm_count,
-            sm_version=sm_version,
-        ),
+        launch,
         *_make_runtime_pointers(None),
         current_cuda_stream(),
     )
@@ -1710,6 +1742,15 @@ def _select_default_mma_tiler_mn(m: int, n: int, sm_count: int) -> Tuple[int, in
     coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
+    # The coarse CTA-count heuristic misses exact-small-M, wide-N cases: a wide
+    # N dimension can generate plenty of CTAs even while each 128-row M tile is
+    # mostly empty. Keep using the narrower 64x128 tile while the 128x128 plan
+    # still leaves the GPU below the existing half-SM occupancy proxy.
+    if n > 1536:
+        if m <= 64:
+            return (64, 128)
+        if m <= 256 and coarse_tiles < max(1, sm_count // 2):
+            return (64, 128)
     if m <= 128 and coarse_tiles < max(1, sm_count // 2):
         if n > 1536:
             return (64, 128)

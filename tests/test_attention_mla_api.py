@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    MLAWorkspace,
+    B12XAttentionWorkspace,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
+from b12x.attention.mla import kernel as mla_kernel
+from b12x.attention.mla import split as mla_split
 
 
-def _make_workspace(*, mode: str, topk: int = 4) -> MLAWorkspace:
-    return MLAWorkspace.for_fixed_capacity(
+def _make_workspace(*, mode: str, topk: int = 4) -> B12XAttentionWorkspace:
+    return B12XAttentionWorkspace.for_fixed_capacity(
         mode=mode,
         device="cpu",
         dtype=torch.bfloat16,
@@ -146,6 +149,133 @@ def test_mla_verify_workspace_allocates_split_buffers() -> None:
     assert workspace.mode == "verify"
     assert workspace.tmp_output is not None
     assert workspace.tmp_lse is not None
+
+
+def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="extend",
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=8,
+        head_dim=256,
+        v_head_dim=256,
+        topk=6,
+        max_total_q=8,
+        max_batch=4,
+        max_kv_rows=16,
+    )
+    kv_cache = torch.arange(24 * 656, dtype=torch.uint8).reshape(24, 1, 656)
+
+    gathered = workspace.gather_ragged_kv_rows(
+        kv_cache=kv_cache,
+        row_ids=torch.tensor([2, 5, 7, 11], dtype=torch.int32),
+    )
+
+    assert gathered.shape == (16, 1, 656)
+    assert torch.equal(gathered[:4], kv_cache[torch.tensor([2, 5, 7, 11], dtype=torch.long)])
+    assert workspace._contract_kv_rows is not None
+    assert workspace._contract_kv_scales is not None
+
+    data_ptr = gathered.data_ptr()
+    gathered_again = workspace.gather_ragged_kv_rows(
+        kv_cache=kv_cache,
+        row_ids=torch.tensor([1, 3], dtype=torch.int32),
+    )
+
+    assert gathered_again.data_ptr() == data_ptr
+    assert torch.equal(gathered_again[:2], kv_cache[torch.tensor([1, 3], dtype=torch.long)])
+
+
+def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="extend",
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=8,
+        head_dim=256,
+        v_head_dim=256,
+        topk=2048,
+        max_total_q=8,
+        max_batch=4,
+        max_kv_rows=16,
+    )
+    full_kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
+    ragged_kv_cache = workspace.gather_ragged_kv_rows(
+        kv_cache=full_kv_cache,
+        row_ids=torch.tensor([2, 5, 7, 11], dtype=torch.int32),
+    )
+    q_all = torch.zeros((5, 8, 256), dtype=torch.bfloat16)
+    page_table_1 = torch.zeros((5, 2048), dtype=torch.int32)
+    active_token_counts = torch.full((5,), 12, dtype=torch.int32)
+    sm_scale = torch.ones((1,), dtype=torch.float32)
+    assert workspace.tmp_output is not None
+    assert workspace.tmp_lse is not None
+    workspace.set_split_chunk_config(kv_chunk_size=32, num_chunks=64)
+
+    captured_cache_keys: list[tuple[object, ...]] = []
+
+    def fake_run_cached_host_launcher(kernel, cache_key, args):
+        del kernel, args
+        captured_cache_keys.append(cache_key)
+
+    def identity_to_kernel_tensor(tensor, dtype, *, assumed_align=16):
+        del dtype, assumed_align
+        return tensor
+
+    def fake_build_sparse_mla_split_forward_kernel(traits, launch_num_chunks, head_tiles):
+        del traits, launch_num_chunks, head_tiles
+        return object()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(mla_split, "_run_cached_host_launcher", fake_run_cached_host_launcher)
+    monkeypatch.setattr(mla_split, "_to_kernel_tensor", identity_to_kernel_tensor)
+    monkeypatch.setattr(mla_split, "select_sparse_mla_traits", lambda **kwargs: object())
+    monkeypatch.setattr(
+        mla_split,
+        "_build_sparse_mla_split_forward_kernel",
+        fake_build_sparse_mla_split_forward_kernel,
+    )
+    monkeypatch.setattr(mla_split, "current_cuda_stream", lambda: None)
+    try:
+        mla_split.run_sparse_mla_split_decode_forward(
+            q_all=q_all,
+            kv_cache=full_kv_cache,
+            page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
+            sm_scale=sm_scale,
+            kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
+            num_chunks_ptr=workspace.num_chunks_ptr,
+            tmp_output=workspace.tmp_output,
+            tmp_lse=workspace.tmp_lse,
+            launch_num_chunks=64,
+            workspace=workspace,
+        )
+        mla_split.run_sparse_mla_split_decode_forward(
+            q_all=q_all,
+            kv_cache=ragged_kv_cache,
+            page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
+            sm_scale=sm_scale,
+            kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
+            num_chunks_ptr=workspace.num_chunks_ptr,
+            tmp_output=workspace.tmp_output,
+            tmp_lse=workspace.tmp_lse,
+            launch_num_chunks=64,
+            workspace=workspace,
+        )
+    finally:
+        monkeypatch.undo()
+
+    full_kv_rows_u32, full_kv_scales = mla_kernel._extract_packed_kv_runtime_views(full_kv_cache)
+    assert len(captured_cache_keys) == 2
+    assert captured_cache_keys[0][1] == mla_kernel._tensor_meta_key(full_kv_rows_u32)
+    assert captured_cache_keys[0][2] == mla_kernel._tensor_meta_key(full_kv_scales)
+    assert workspace._contract_kv_rows is not None
+    assert workspace._contract_kv_scales is not None
+    assert captured_cache_keys[1][1] == mla_kernel._tensor_meta_key(workspace._contract_kv_rows)
+    assert captured_cache_keys[1][2] == mla_kernel._tensor_meta_key(workspace._contract_kv_scales)
 
 
 def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
@@ -330,7 +460,7 @@ def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> 
 
 
 def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
-    workspace = MLAWorkspace.for_contract(
+    workspace = B12XAttentionWorkspace.for_contract(
         mode="decode",
         device="cpu",
         dtype=torch.bfloat16,
@@ -358,7 +488,7 @@ def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
 
 
 def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> None:
-    workspace = MLAWorkspace.for_fixed_capacity(
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device="cpu",
         dtype=torch.bfloat16,

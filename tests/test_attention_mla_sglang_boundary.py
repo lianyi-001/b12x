@@ -4,6 +4,7 @@ import importlib
 from pathlib import Path
 import random
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -86,9 +87,15 @@ def _make_fake_backend(
     nsa_backend_module,
     num_q_heads: int | None = None,
 ):
+    backend_cls = nsa_backend_module.NativeSparseAttnBackend
+
     class _FakeBackend:
         _get_b12x_workspace = _get_b12x_workspace_method(nsa_backend_module)
+        _gather_b12x_extend_kv_rows = backend_cls._gather_b12x_extend_kv_rows
         _reshape_b12x_decode_kv_rows = _get_b12x_decode_kv_reshape_method(nsa_backend_module)
+        _b12x_eager_extend_total_q_capacity = backend_cls._b12x_eager_extend_total_q_capacity
+        _b12x_eager_extend_batch_capacity = backend_cls._b12x_eager_extend_batch_capacity
+        _b12x_eager_extend_kv_rows_capacity = backend_cls._b12x_eager_extend_kv_rows_capacity
 
         def __init__(self):
             self.device = device
@@ -101,8 +108,67 @@ def _make_fake_backend(
             self.real_page_size = 64
             self.b12x_workspaces: dict[str, object] = {}
             self.b12x_mla_workspaces = self.b12x_workspaces
+            self.max_running_requests = 32
+            self.server_args = type(
+                "_FakeServerArgs",
+                (),
+                {
+                    "chunked_prefill_size": -1,
+                    "max_prefill_tokens": 4096,
+                    "prefill_max_requests": None,
+                },
+            )()
 
     return _FakeBackend()
+
+
+def test_sglang_b12x_ragged_extend_kv_gather_uses_chunk_capacity() -> None:
+    nsa_backend_module = _import_sglang_nsa_backend()
+    cfg = SimpleNamespace(num_heads=8, kv_lora_rank=512, qk_rope_head_dim=64)
+    backend = _make_fake_backend(
+        cfg,
+        device=torch.device("cpu"),
+        topk=8,
+        nsa_backend_module=nsa_backend_module,
+    )
+    kv_cache = torch.arange(32 * 656, dtype=torch.uint8).reshape(32, 1, 656)
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=[0],
+        out_cache_loc=torch.tensor([2, 6, 9], dtype=torch.int32),
+        get_max_chunk_capacity=lambda: 12,
+    )
+    workspace = backend._get_b12x_workspace(
+        mode="extend",
+        total_q=1,
+        batch=1,
+        v_head_dim=cfg.kv_lora_rank,
+        max_kv_rows=backend._b12x_eager_extend_kv_rows_capacity(
+            forward_batch, required_rows=3
+        ),
+    )
+
+    gathered = backend._gather_b12x_extend_kv_rows(
+        kv_cache=kv_cache,
+        forward_batch=forward_batch,
+        metadata=SimpleNamespace(seq_lens_sum=3, page_table_1_flattened=None),
+        workspace=workspace,
+    )
+
+    assert workspace.max_kv_rows == 12
+    assert gathered.shape == (12, 1, 656)
+    assert torch.equal(gathered[:3], kv_cache[torch.tensor([2, 6, 9], dtype=torch.long)])
+
+    first_ptr = gathered.data_ptr()
+    forward_batch.out_cache_loc = torch.tensor([1, 4], dtype=torch.int32)
+    gathered_again = backend._gather_b12x_extend_kv_rows(
+        kv_cache=kv_cache,
+        forward_batch=forward_batch,
+        metadata=SimpleNamespace(seq_lens_sum=2, page_table_1_flattened=None),
+        workspace=workspace,
+    )
+
+    assert gathered_again.data_ptr() == first_ptr
+    assert torch.equal(gathered_again[:2], kv_cache[torch.tensor([1, 4], dtype=torch.long)])
 
 
 def _forward_b12x_mla(

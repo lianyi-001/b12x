@@ -47,6 +47,41 @@ def _dynamic_token_count(spec: ModelSpec) -> int:
     return (tp_moe._get_static_compact_cutover_pairs() // spec.top_k) + 1
 
 
+@pytest.mark.parametrize(
+    ("max_rows", "n", "sm_count", "expected"),
+    [
+        (22, 2688, 48, (64, 128)),
+        (44, 4096, 48, (64, 128)),
+        (96, 4096, 48, (128, 128)),
+    ],
+)
+def test_micro_mma_tile_selector_handles_small_row_underfill(
+    monkeypatch: pytest.MonkeyPatch,
+    max_rows: int,
+    n: int,
+    sm_count: int,
+    expected: tuple[int, int],
+) -> None:
+    monkeypatch.setattr(tp_moe, "get_num_sm", lambda _device: sm_count)
+    assert tp_moe._select_micro_mma_tiler_mn(max_rows, n) == expected
+
+
+def test_micro_mma_tile_selector_disables_underfill_when_residency_is_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe, "get_num_sm", lambda _device: 48)
+    assert tp_moe._select_micro_mma_tiler_mn(
+        22,
+        2688,
+        resident_clusters=42,
+    ) == (128, 128)
+    assert tp_moe._select_micro_mma_tiler_mn(
+        22,
+        2688,
+        resident_clusters=48,
+    ) == (64, 128)
+
+
 def _assert_oracle_match(metrics, *, label: str, max_abs: float = 2e-3, min_cos: float = 0.98) -> None:
     assert metrics.max_abs <= max_abs, f"{label}: max_abs={metrics.max_abs:.6f}"
     assert metrics.cos > min_cos, f"{label}: cos={metrics.cos:.6f}"
