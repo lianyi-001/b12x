@@ -34,14 +34,14 @@ from cutlass._mlir.dialects import llvm
 
 
 # =============================================================================
-# Constants
+# 常量 和 布局工具
 # =============================================================================
 
-FLOAT4_E2M1_MAX = 6.0  # Maximum value representable in FP4 E2M1
-FLOAT8_E4M3_MAX = 448.0  # Maximum value representable in FP8 E4M3
-SF_VEC_SIZE = 16  # Elements per scale factor block
-COPY_BITS = 128  # 128-bit vectorized loads
-_FP4_MAG_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+FLOAT4_E2M1_MAX = 6.0  # FP4 E2M1 最大值
+FLOAT8_E4M3_MAX = 448.0  # FP8 E4M3 最大值
+SF_VEC_SIZE = 16  # 每个 block-scale vector 的元素数量（FP4 E2M1 每 16 个元素一个 scale） scale factor（缩放因子）
+COPY_BITS = 128  # 每次全局内存访问的位数（字节数 * 8）
+_FP4_MAG_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0) # FP4 E2M1 的所有可能的绝对值
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -179,11 +179,10 @@ def relu2_quantize_grouped_nvfp4_torch(
 
 
 # =============================================================================
-# Architecture Detection
+# 架构检测
 # =============================================================================
 
-
-@functools.lru_cache(maxsize=16)
+@functools.lru_cache(maxsize=16) # 缓存结果以避免重复查询设备属性
 def get_sm_version(device: int | torch.device | str | None = None) -> int:
     """Get the SM version of a CUDA device.
 
@@ -203,11 +202,11 @@ def get_sm_version(device: int | torch.device | str | None = None) -> int:
 
 
 # =============================================================================
-# PTX Intrinsics - Cluster Operations
+# PTX Intrinsics - 集群内通信和共享内存访问
 # =============================================================================
 
 
-@dsl_user_op
+@dsl_user_op # 装饰器表示这是一个用户定义的操作，可以在 DSL 中调用
 def set_block_rank(
     smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
 ) -> Int32:
@@ -261,7 +260,7 @@ def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
 
 
 # =============================================================================
-# PTX Intrinsics - 128-bit Vectorized Global Loads/Stores
+# PTX Intrinsics - 128-bit 向量化内存读写
 # =============================================================================
 
 
@@ -606,7 +605,7 @@ def get_ptr_as_int64(tensor: cute.Tensor, offset, *, loc=None, ip=None) -> Int64
 
 
 # =============================================================================
-# PTX Intrinsics - Global Atomics
+# PTX Intrinsics - 原子操作 
 # =============================================================================
 
 
@@ -647,7 +646,7 @@ def st_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
 
 
 # =============================================================================
-# PTX Intrinsics - Scatter Atomics
+# PTX Intrinsics - FP4x2 原子加法（用于 block-scale factor 更新）
 # =============================================================================
 
 
@@ -704,7 +703,7 @@ def scatter_add_v4_bf16x2(addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=No
 
 
 # =============================================================================
-# PTX Intrinsics - Math Operations
+# PTX Intrinsics - FP32 数学运算（近似倒数、最小值、最大值、绝对值）
 # =============================================================================
 
 
@@ -773,7 +772,7 @@ def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 # =============================================================================
-# Half2 SIMD Intrinsics
+# Half2 SIMD Intrinsics（中文注释：Half2 是一种包含两个 FP16 值的 32 位数据类型，以下是针对 Half2 的 SIMD 操作）
 # =============================================================================
 
 
@@ -1676,7 +1675,7 @@ def ue8m0_to_output_scale(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 # =============================================================================
-# E2M1 Conversion
+# E2M1 内部使用的辅助函数 - 主要是将8个float32转换为8个E2M1值并打包到uint32中
 # =============================================================================
 
 
@@ -2139,7 +2138,7 @@ def relu2_quantize_block_fp4(
 
 
 # =============================================================================
-# Helper Functions for Float32 SF Block Processing
+# Helper Functions for Float32 SF Block Processing 
 # =============================================================================
 
 
