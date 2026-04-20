@@ -254,11 +254,15 @@ class SparseMLASplitDecodeForwardKernel:
             SharedStorage = get_sparse_mla_shared_storage_cls()
             storage = smem.allocate(SharedStorage)
             sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-            sScale = storage.token_scale.get_tensor(
+            sScale = storage.token_scale_a.get_tensor(
+                cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
+            )
+            sScale_b = storage.token_scale_b.get_tensor(
                 cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
             )
             q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
-            kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
+            kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+            kv_base_b = shared_ptr_to_u32(storage.kv_stage_b.data_ptr())
 
             _run_one_pass_sparse_mla_tile(
                 q_u32,
@@ -279,6 +283,8 @@ class SparseMLASplitDecodeForwardKernel:
                 q_idx,
                 chunk_idx,
                 tmp_lse,
+                kv_base_b,
+                sScale_b,
             )
 
 
