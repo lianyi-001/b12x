@@ -46,6 +46,15 @@ _MAX_Q_HEADS = 64
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 _EXTEND_TMA_DESC_CACHE_SIZE = 32
 
+_PREFILL_BLOCK_Q = 32  # Same Q tile size as decode
+_PREFILL_BLOCK_K = 128  # 2x K tile — halves redundant Q reads from global
+_PREFILL_WARPS_Q = _PREFILL_BLOCK_Q // 16  # 2
+_PREFILL_WARPS_K = 4  # 4 K-warps, each covering 32 K-rows via num_mma_kv=2
+_PREFILL_WARPS_PER_CTA = _PREFILL_WARPS_Q * _PREFILL_WARPS_K  # 8
+_PREFILL_THREADS_PER_CTA = _PREFILL_WARPS_PER_CTA * _WARP_THREADS  # 256
+_PREFILL_NUM_MMA_Q = 1  # same as decode
+_PREFILL_NUM_MMA_KV = 2  # each K-warp covers 32 K-rows (2x16)
+
 
 def _to_kernel_tensor(
     tensor: torch.Tensor,
@@ -117,8 +126,9 @@ def _pad_kv_rows(
     *,
     k_quant: torch.Tensor,
     k_scale: torch.Tensor,
+    pad_block_k: int = _BLOCK_K,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    padded_rows = ((k_quant.shape[0] + _BLOCK_K - 1) // _BLOCK_K) * _BLOCK_K
+    padded_rows = ((k_quant.shape[0] + pad_block_k - 1) // pad_block_k) * pad_block_k
     k_quant = k_quant.contiguous()
     k_scale = k_scale.contiguous()
     if padded_rows == k_quant.shape[0]:
@@ -162,12 +172,7 @@ def _encode_extend_k_tma_descriptor(
     if k_quant_bytes.dtype != torch.uint8:
         raise TypeError(f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}")
 
-    swizzle_name = os.environ.get("B12X_NSA_EXTEND_TMA_SWIZZLE", "")
-    swizzle = (
-        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
-        if swizzle_name == "128B"
-        else cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
-    )
+    # Phase 3: Always use SWIZZLE_128B — hardware XOR pattern matches _permuted_offset_128b
     U64 = cuda.cuuint64_t
     U32 = cuda.cuuint32_t
     row_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
@@ -183,7 +188,7 @@ def _encode_extend_k_tma_descriptor(
         [U32(_INDEX_HEAD_DIM), U32(_BLOCK_K)],
         [U32(1), U32(1)],
         cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-        swizzle,
+        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
         cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
         cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
     )
@@ -218,6 +223,74 @@ def _get_cached_extend_k_tma_descriptor(
         cache.move_to_end(key)
         return cached
     desc = _encode_extend_k_tma_descriptor(k_quant_bytes)
+    cache[key] = desc
+    if len(cache) > _EXTEND_TMA_DESC_CACHE_SIZE:
+        cache.popitem(last=False)
+    return desc
+
+
+def _encode_extend_k_tma_descriptor_prefill(
+    k_quant_bytes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TMA descriptor for prefill kernel with _PREFILL_BLOCK_K=128 tile."""
+    if k_quant_bytes.ndim != 2 or k_quant_bytes.shape[1] != _INDEX_HEAD_DIM:
+        raise ValueError(
+            f"k_quant_bytes must have shape (rows, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
+        )
+    if k_quant_bytes.dtype != torch.uint8:
+        raise TypeError(f"k_quant_bytes must be dtype torch.uint8, got {k_quant_bytes.dtype}")
+
+    U64 = cuda.cuuint64_t
+    U32 = cuda.cuuint32_t
+    row_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
+    base_ptr = int(k_quant_bytes.data_ptr())
+    total_rows = int(k_quant_bytes.shape[0])
+
+    result, tensor_map = cuda.cuTensorMapEncodeTiled(
+        cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        2,
+        base_ptr,
+        [U64(_INDEX_HEAD_DIM), U64(total_rows)],
+        [U64(row_bytes)],
+        [U32(_INDEX_HEAD_DIM), U32(_PREFILL_BLOCK_K)],
+        [U32(1), U32(1)],
+        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    )
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuTensorMapEncodeTiled (prefill) failed: {result}")
+
+    desc = torch.tensor(
+        [int(word) for word in tensor_map.opaque],
+        dtype=torch.uint64,
+        device=k_quant_bytes.device,
+    )
+    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    return desc, desc_ptrs
+
+
+def _get_cached_extend_k_tma_descriptor_prefill(
+    k_quant_bytes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        int(k_quant_bytes.data_ptr()),
+        tuple(k_quant_bytes.shape),
+        tuple(k_quant_bytes.stride()),
+        str(k_quant_bytes.dtype),
+        (k_quant_bytes.device.type, k_quant_bytes.device.index),
+        "prefill",
+    )
+    cache = getattr(_get_cached_extend_k_tma_descriptor_prefill, "_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(_get_cached_extend_k_tma_descriptor_prefill, "_cache", cache)
+    cached = cache.get(key)
+    if cached is not None:
+        cache.move_to_end(key)
+        return cached
+    desc = _encode_extend_k_tma_descriptor_prefill(k_quant_bytes)
     cache[key] = desc
     if len(cache) > _EXTEND_TMA_DESC_CACHE_SIZE:
         cache.popitem(last=False)
@@ -409,31 +482,12 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         )
 
 
-@cute.jit
-def _repack_k_tile_to_permuted(
-    k_linear_base_addr: Int32,
-    k_perm_base_addr: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_BLOCK_K * _FP8_ROW_VECS)
-    while linear < total:
-        row = linear // Int32(_FP8_ROW_VECS)
-        vec_idx = linear - row * Int32(_FP8_ROW_VECS)
-        src_addr = k_linear_base_addr + Int32((row * Int32(_INDEX_HEAD_DIM) + vec_idx * Int32(16)))
-        dst_addr = _smem_addr_from_b128_offset(
-            k_perm_base_addr,
-            _permuted_offset_128b(row, vec_idx, Int32(_FP8_ROW_VECS)),
-        )
-        v0, v1, v2, v3 = ld_shared_v4_u32(src_addr)
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_THREADS_PER_CTA)
 
 
 class SparseNSAExtendLogitsKernel:
     """Ragged logits kernel with Q and weights read from global memory.
 
-    Phase 1 only: Q and weights read from global (no per-head smem staging or syncs).
+    Phase 1+2+3: Q/weights from global, warp-ballot liveness, TMA SWIZZLE_128B (no k_linear/repack).
     """
 
     @cute.jit
@@ -508,10 +562,6 @@ class SparseNSAExtendLogitsKernel:
                 cute.struct.MemRange[cutlass.Int32, 1],
                 16,
             ]
-            k_linear: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _BLOCK_K * _INDEX_HEAD_DIM],
-                1024,
-            ]
             k_perm: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint8, _BLOCK_K * _INDEX_HEAD_DIM],
                 1024,
@@ -531,15 +581,14 @@ class SparseNSAExtendLogitsKernel:
 
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
-        k_linear_base_addr = shared_ptr_to_u32(storage.k_linear.data_ptr())
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
+        s_k_perm_bytes = storage.k_perm.get_tensor(
+            cute.make_layout((_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
+        )
         s_scales = storage.scales.get_tensor(cute.make_layout((_BLOCK_K,), stride=(1,)))
         s_k_start = storage.k_start.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
         s_k_end = storage.k_end.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
         s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
-        s_k_linear_bytes = storage.k_linear.get_tensor(
-            cute.make_layout((_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
-        )
 
         if tx == 0:
             cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
@@ -576,7 +625,7 @@ class SparseNSAExtendLogitsKernel:
                         Int32(_BLOCK_K * _INDEX_HEAD_DIM),
                     )
                     _cp_async_bulk_tensor_2d(
-                        shared_ptr_to_u32(s_k_linear_bytes.iterator),
+                        shared_ptr_to_u32(s_k_perm_bytes.iterator),
                         Int64(k_tma_desc_ptrs[Int32(0)]),
                         Int32(0),
                         k_tile_base,
@@ -588,7 +637,6 @@ class SparseNSAExtendLogitsKernel:
             )
             cute.arch.sync_threads()
 
-            _repack_k_tile_to_permuted(k_linear_base_addr, k_perm_base_addr, tx)
             scale_linear = tx
             while scale_linear < Int32(_BLOCK_K):
                 s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
@@ -659,6 +707,257 @@ class SparseNSAExtendLogitsKernel:
                     if k_row >= row_start and k_row < row_end:
                         logits_out[q_row, k_row] = Float32(acc_frag[0, 0, reg_id] * s_scales[k_local])
 
+
+
+
+class SparseNSAExtendLogitsPrefillKernel:
+    """Prefill-specialized extend logits kernel with _PREFILL_BLOCK_K=128.
+
+    Uses 2 Q-warps x 4 K-warps = 256 threads. Each K-warp covers 32 K-rows
+    (num_mma_kv=2), so the CTA processes 128 K rows per tile. This halves the
+    number of K-CTAs, which halves redundant Q reads from global memory —
+    the dominant cost for large prefill.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        q_u32: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        k_scales: cute.Tensor,
+        k_start: cute.Tensor,
+        k_end: cute.Tensor,
+        logits_out: cute.Tensor,
+        valid_q_rows: Int32,
+        valid_k_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            q_u32,
+            weights,
+            k_quant_bytes,
+            k_tma_desc_ptrs,
+            k_scales,
+            k_start,
+            k_end,
+            logits_out,
+            valid_q_rows,
+            valid_k_rows,
+        ).launch(
+            grid=(
+                (valid_q_rows + _PREFILL_BLOCK_Q - 1) // _PREFILL_BLOCK_Q,
+                (valid_k_rows + _PREFILL_BLOCK_K - 1) // _PREFILL_BLOCK_K,
+                1,
+            ),
+            block=[_PREFILL_THREADS_PER_CTA, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_u32: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        k_scales: cute.Tensor,
+        k_start: cute.Tensor,
+        k_end: cute.Tensor,
+        logits_out: cute.Tensor,
+        valid_q_rows: Int32,
+        valid_k_rows: Int32,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        q_tile_idx, k_tile_idx, _ = cute.arch.block_idx()
+        lane = tx % Int32(_WARP_THREADS)
+        warp_idx = tx // Int32(_WARP_THREADS)
+        warp_k_idx = warp_idx % Int32(_PREFILL_WARPS_K)
+        warp_q_idx = warp_idx // Int32(_PREFILL_WARPS_K)
+
+        q_tile_base = q_tile_idx * Int32(_PREFILL_BLOCK_Q)
+        k_tile_base = k_tile_idx * Int32(_PREFILL_BLOCK_K)
+        valid_q_rows = Int32(valid_q_rows)
+        k_total_rows = Int32(valid_k_rows)
+        num_heads = Int32(q_u32.shape[1])
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class SharedStorage:
+            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
+            tile_live: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 1],
+                16,
+            ]
+            k_perm: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, _PREFILL_BLOCK_K * _INDEX_HEAD_DIM],
+                1024,
+            ]
+            scales: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_K],
+                16,
+            ]
+            k_start: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
+                16,
+            ]
+            k_end: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _PREFILL_BLOCK_Q],
+                16,
+            ]
+
+        storage = smem.allocate(SharedStorage)
+        mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
+        k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
+        s_k_perm_bytes = storage.k_perm.get_tensor(
+            cute.make_layout((_PREFILL_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
+        )
+        s_scales = storage.scales.get_tensor(cute.make_layout((_PREFILL_BLOCK_K,), stride=(1,)))
+        s_k_start = storage.k_start.get_tensor(cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,)))
+        s_k_end = storage.k_end.get_tensor(cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,)))
+        s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
+
+        if tx == 0:
+            cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
+        row_linear = tx
+        while row_linear < Int32(_PREFILL_BLOCK_Q):
+            q_row = q_tile_base + row_linear
+            s_k_start[row_linear] = Int32(k_start[q_row]) if q_row < valid_q_rows else Int32(0)
+            s_k_end[row_linear] = Int32(k_end[q_row]) if q_row < valid_q_rows else Int32(0)
+            row_linear += Int32(_PREFILL_THREADS_PER_CTA)
+        cute.arch.sync_threads()
+
+        # Single ballot liveness check (32 Q-rows, same as decode)
+        if warp_idx == Int32(0):
+            tile_k_end = k_tile_base + Int32(_PREFILL_BLOCK_K)
+            if tile_k_end > k_total_rows:
+                tile_k_end = k_total_rows
+            row_start = Int32(s_k_start[tx])
+            row_end = Int32(s_k_end[tx])
+            row_live = (row_end > k_tile_base) & (row_start < tile_k_end) & (k_tile_base < tile_k_end)
+            ballot = cute.arch.vote_ballot_sync(Boolean(row_live))
+            if tx == Int32(0):
+                s_tile_live[Int32(0)] = ballot
+        cute.arch.sync_threads()
+
+        if s_tile_live[Int32(0)] != Int32(0):
+            # TMA load K-tile (128 rows x 128 bytes = 16 KB)
+            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            if warp_idx == Int32(0):
+                full_mbar_ptr = mbar_ptr_k + producer_state.index
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        full_mbar_ptr,
+                        Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM),
+                    )
+                    _cp_async_bulk_tensor_2d(
+                        shared_ptr_to_u32(s_k_perm_bytes.iterator),
+                        Int64(k_tma_desc_ptrs[Int32(0)]),
+                        Int32(0),
+                        k_tile_base,
+                        shared_ptr_to_u32(full_mbar_ptr),
+                    )
+            cute.arch.mbarrier_wait(
+                mbar_ptr_k + consumer_state.index,
+                phase=consumer_state.phase,
+            )
+            cute.arch.sync_threads()
+
+            # Load scales (128 values)
+            scale_linear = tx
+            while scale_linear < Int32(_PREFILL_BLOCK_K):
+                s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
+                scale_linear += Int32(_PREFILL_THREADS_PER_CTA)
+            cute.arch.sync_threads()
+
+            # Accumulator: (1, NUM_MMA_KV, 8) — separate accumulator per K-sub-tile
+            acc_layout = cute.make_layout(
+                (1, _PREFILL_NUM_MMA_KV, 8), stride=(16, 8, 1)
+            )
+            acc_frag = cute.make_rmem_tensor(acc_layout, Float32)
+            for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
+                for reg_id in cutlass.range_constexpr(8):
+                    acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
+
+            head_idx = Int32(0)
+            while head_idx < num_heads:
+                score_frag = cute.make_rmem_tensor(acc_layout, Float32)
+                for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
+                    for reg_id in cutlass.range_constexpr(8):
+                        score_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
+                _literal_qk_mma_into_sfrag_mxfp8_raw(
+                    score_frag,
+                    q_u32,
+                    head_idx,
+                    q_tile_base,
+                    valid_q_rows,
+                    k_perm_base_addr,
+                    lane,
+                    warp_q_idx,
+                    warp_k_idx,
+                    Int32(0),
+                    Int32(_PREFILL_NUM_MMA_Q),
+                    Int32(_PREFILL_NUM_MMA_KV),
+                    Int32(_INDEX_HEAD_DIM // 16),
+                    Int32(_FP8_ROW_VECS),
+                )
+                # Accumulate per K-sub-tile
+                lane_group = lane // Int32(4)
+                for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
+                    for reg_id in cutlass.range_constexpr(8):
+                        row_slot = (reg_id % 4) // 2
+                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        if q_local < Int32(_PREFILL_BLOCK_Q):
+                            acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                                acc_frag[Int32(0), mma_kv, reg_id]
+                                + attention_utils.fmax(
+                                    score_frag[Int32(0), mma_kv, reg_id],
+                                    Float32(0.0),
+                                )
+                                * (
+                                    Float32(weights[q_tile_base + q_local, head_idx])
+                                    if q_tile_base + q_local < valid_q_rows
+                                    else Float32(0.0)
+                                )
+                            )
+                head_idx += Int32(1)
+
+            # Write back — each warp covers 32 Q × 32 K (via 2 K-sub-tiles)
+            lane_group = lane // Int32(4)
+            lane_pair_base = Int32(2) * (lane % Int32(4))
+            for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
+                for reg_id in cutlass.range_constexpr(8):
+                    row_slot = (reg_id % 4) // 2
+                    q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                    k_local = (
+                        warp_k_idx * Int32(32)
+                        + mma_kv * Int32(16)
+                        + lane_pair_base
+                        + Int32(8 * (reg_id // 4))
+                        + Int32(reg_id % 2)
+                    )
+                    q_row = q_tile_base + q_local
+                    k_row = k_tile_base + k_local
+                    if (
+                        q_local < Int32(_PREFILL_BLOCK_Q)
+                        and k_local < Int32(_PREFILL_BLOCK_K)
+                        and q_row < valid_q_rows
+                        and k_row < k_total_rows
+                    ):
+                        row_start = Int32(s_k_start[q_local])
+                        row_end = Int32(s_k_end[q_local])
+                        if k_row >= row_start and k_row < row_end:
+                            logits_out[q_row, k_row] = Float32(
+                                acc_frag[Int32(0), mma_kv, reg_id] * s_scales[k_local]
+                            )
+
+
+@lru_cache(maxsize=16)
+def _build_sparse_nsa_extend_prefill_kernel() -> SparseNSAExtendLogitsPrefillKernel:
+    return SparseNSAExtendLogitsPrefillKernel()
 
 @lru_cache(maxsize=16)
 def _build_sparse_nsa_extend_kernel() -> SparseNSAExtendLogitsKernel:
@@ -739,6 +1038,16 @@ def run_sparse_nsa_extend_logits_kernel(
     valid_q_rows = int(k_start.shape[0])
     k_rows = int(k_quant.shape[0])
 
+    # Dispatch: use prefill kernel for large q_len, decode kernel otherwise.
+    # Prefill kernel (BK=128) halves redundant Q reads but has lower occupancy
+    # (5 CTAs/SM vs 8). Only beneficial when q_len is large enough that the
+    # Q-read savings outweigh the occupancy loss.
+    _prefill_env = os.environ.get("B12X_NSA_EXTEND_PREFILL_THRESHOLD", None)
+    if _prefill_env is not None:
+        _use_prefill = int(_prefill_env) > 0
+    else:
+        _use_prefill = valid_q_rows >= 256
+
     if workspace is not None:
         staged = workspace.stage_nsa_indexer_extend(
             q_fp8=q_fp8,
@@ -770,7 +1079,8 @@ def run_sparse_nsa_extend_logits_kernel(
             return out_view
 
         q_bytes = q_fp8.contiguous().view(torch.uint8)
-        k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale)
+        _pad_k = _PREFILL_BLOCK_K if _use_prefill else _BLOCK_K
+        k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale, pad_block_k=_pad_k)
         k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
         q_u32 = _view_last_dim_as_u32(q_bytes)
         weights_kernel = weights.contiguous()
@@ -781,8 +1091,16 @@ def run_sparse_nsa_extend_logits_kernel(
     if valid_q_rows == 0 or k_rows == 0:
         return out_view
 
-    _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
-    kernel = _build_sparse_nsa_extend_kernel()
+    if _use_prefill:
+        _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor_prefill(k_quant_bytes)
+    else:
+        _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
+
+    if _use_prefill:
+        kernel = _build_sparse_nsa_extend_prefill_kernel()
+    else:
+        kernel = _build_sparse_nsa_extend_kernel()
+
     args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32),
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
@@ -806,6 +1124,7 @@ def run_sparse_nsa_extend_logits_kernel(
         _tensor_meta_key(_cp.get("extend_k_start", k_start_kernel)),
         _tensor_meta_key(_cp.get("extend_k_end", k_end_kernel)),
         _tensor_meta_key(_cp.get("extend_logits", out_kernel)),
+        ("prefill" if _use_prefill else "decode"),
     )
     _run_cached_host_launcher(kernel, cache_key, args)
     return out_view
