@@ -952,6 +952,7 @@ def _update_softmax_stats_b2(
     score_frag: cute.Tensor,
     m_frag: cute.Tensor,
     d_frag: cute.Tensor,
+    o_rescale_frag: cute.Tensor,
 ):
     for row_slot in cutlass.range_constexpr(2):
         m_prev = Float32(m_frag[0, row_slot])
@@ -976,6 +977,7 @@ def _update_softmax_stats_b2(
             if m_prev == -Float32.inf
             else _exp2_approx_ftz_f32(m_prev - m_new)
         )
+        o_rescale_frag[0, row_slot] = scale_term
         # d_frag is stored as the 4-lane reduced total on every lane in the row group.
         # Divide by 4 before the next reduction so we do not re-count the prior state.
         d_acc = Float32(d_frag[0, row_slot] * scale_term * Float32(0.25))
@@ -1844,7 +1846,7 @@ def _store_output_groups_chunked(
 
 
 @cute.jit
-def _run_two_pass_sparse_mla_tile(
+def _run_one_pass_sparse_mla_tile(
     q_u32: cute.Tensor,
     kv_rows_u32: cute.Tensor,
     kv_scales: cute.Tensor,
@@ -1871,9 +1873,11 @@ def _run_two_pass_sparse_mla_tile(
 
     m_frag = cute.make_rmem_tensor(md_layout, Float32)
     d_frag = cute.make_rmem_tensor(md_layout, Float32)
+    o_rescale_frag = cute.make_rmem_tensor(md_layout, Float32)
     for row_slot in cutlass.range_constexpr(2):
         m_frag[0, row_slot] = Float32(-Float32.inf)
         d_frag[0, row_slot] = Float32(0.0)
+        o_rescale_frag[0, row_slot] = Float32(1.0)
 
     o_frag0 = cute.make_rmem_tensor(o_layout, Float32)
     o_frag1 = cute.make_rmem_tensor(o_layout, Float32)
@@ -1884,6 +1888,7 @@ def _run_two_pass_sparse_mla_tile(
     _zero_output_frag(o_frag2)
     _zero_output_frag(o_frag3)
     if token_end - token_start <= Int32(_MLA_TOKEN_TILE):
+        # Single-tile path: already single-pass, unchanged
         score_frag = cute.make_rmem_tensor(frag_layout, Float32)
         if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
             _compute_score_tile_scaled(
@@ -1922,7 +1927,7 @@ def _run_two_pass_sparse_mla_tile(
                 sm_scale_log2,
                 lane,
             )
-        _update_softmax_stats_b2(score_frag, m_frag, d_frag)
+        _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
         p_frag = cute.make_rmem_tensor(p_layout, Uint32)
         _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
         if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
@@ -1951,6 +1956,7 @@ def _run_two_pass_sparse_mla_tile(
                 lane,
             )
     else:
+        # Multi-tile: single-pass with online softmax O rescaling (Flash Attention)
         token_base = token_start
         while token_base < token_end:
             tile_end = cutlass.select_(
@@ -1959,7 +1965,7 @@ def _run_two_pass_sparse_mla_tile(
                 token_end,
             )
             score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-            _compute_score_tile_scaled(
+            _compute_score_tile_scaled_from_staged_nope(
                 score_frag,
                 q_u32,
                 kv_rows_u32,
@@ -1969,6 +1975,7 @@ def _run_two_pass_sparse_mla_tile(
                 sScale,
                 q_base_addr,
                 kv_base_addr,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
                 q_idx,
                 head_tile_start,
                 token_base,
@@ -1976,45 +1983,41 @@ def _run_two_pass_sparse_mla_tile(
                 sm_scale_log2,
                 lane,
             )
-            _update_softmax_stats_b2(score_frag, m_frag, d_frag)
-            token_base = tile_end
+            # Update softmax stats and get O rescaling factor
+            _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
 
-        token_base = token_start
-        while token_base < token_end:
-            tile_end = cutlass.select_(
-                token_base + Int32(_MLA_TOKEN_TILE) < token_end,
-                token_base + Int32(_MLA_TOKEN_TILE),
-                token_end,
-            )
-            score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-            _compute_score_tile_scaled(
-                score_frag,
-                q_u32,
-                kv_rows_u32,
-                kv_scales,
-                page_table_1,
-                sTokenIdx,
-                sScale,
-                q_base_addr,
-                kv_base_addr,
-                q_idx,
-                head_tile_start,
-                token_base,
-                tile_end,
-                sm_scale_log2,
-                lane,
-            )
+            # Rescale O accumulator: O *= exp2(m_prev - m_new) for each row_slot
+            for row_slot in cutlass.range_constexpr(2):
+                rs = Float32(o_rescale_frag[0, row_slot])
+                for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+                    reg_base = row_slot * 2
+                    o_frag0[0, mma_d, reg_base + 0] = Float32(o_frag0[0, mma_d, reg_base + 0] * rs)
+                    o_frag0[0, mma_d, reg_base + 1] = Float32(o_frag0[0, mma_d, reg_base + 1] * rs)
+                    o_frag0[0, mma_d, reg_base + 4] = Float32(o_frag0[0, mma_d, reg_base + 4] * rs)
+                    o_frag0[0, mma_d, reg_base + 5] = Float32(o_frag0[0, mma_d, reg_base + 5] * rs)
+                    o_frag1[0, mma_d, reg_base + 0] = Float32(o_frag1[0, mma_d, reg_base + 0] * rs)
+                    o_frag1[0, mma_d, reg_base + 1] = Float32(o_frag1[0, mma_d, reg_base + 1] * rs)
+                    o_frag1[0, mma_d, reg_base + 4] = Float32(o_frag1[0, mma_d, reg_base + 4] * rs)
+                    o_frag1[0, mma_d, reg_base + 5] = Float32(o_frag1[0, mma_d, reg_base + 5] * rs)
+                    o_frag2[0, mma_d, reg_base + 0] = Float32(o_frag2[0, mma_d, reg_base + 0] * rs)
+                    o_frag2[0, mma_d, reg_base + 1] = Float32(o_frag2[0, mma_d, reg_base + 1] * rs)
+                    o_frag2[0, mma_d, reg_base + 4] = Float32(o_frag2[0, mma_d, reg_base + 4] * rs)
+                    o_frag2[0, mma_d, reg_base + 5] = Float32(o_frag2[0, mma_d, reg_base + 5] * rs)
+                    o_frag3[0, mma_d, reg_base + 0] = Float32(o_frag3[0, mma_d, reg_base + 0] * rs)
+                    o_frag3[0, mma_d, reg_base + 1] = Float32(o_frag3[0, mma_d, reg_base + 1] * rs)
+                    o_frag3[0, mma_d, reg_base + 4] = Float32(o_frag3[0, mma_d, reg_base + 4] * rs)
+                    o_frag3[0, mma_d, reg_base + 5] = Float32(o_frag3[0, mma_d, reg_base + 5] * rs)
+
+            # Normalize P from this tile's scores and do PV accumulation
+            # V is already staged in smem from the QK async copy, so use staged PV
             p_frag = cute.make_rmem_tensor(p_layout, Uint32)
             _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
-            _accumulate_pv_groups_from_p_frag(
+            _accumulate_pv_groups_from_p_frag_staged(
                 o_frag0,
                 o_frag1,
                 o_frag2,
                 o_frag3,
                 p_frag,
-                kv_rows_u32,
-                kv_scales,
-                sTokenIdx,
                 sScale,
                 kv_base_addr,
                 lane,
@@ -2056,7 +2059,6 @@ def _run_two_pass_sparse_mla_tile(
             lane,
         )
 
-
 def get_sparse_mla_shared_storage_cls():
     class SharedStorage:
         pass
@@ -2083,7 +2085,7 @@ def get_sparse_mla_shared_storage_cls():
 
 
 class SparseMLAKernel:
-    """Two-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
+    """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
 
     def __init__(self, head_tiles: int):
         self.head_tiles = int(head_tiles)
@@ -2141,7 +2143,7 @@ class SparseMLAKernel:
         q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
         kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
 
-        _run_two_pass_sparse_mla_tile(
+        _run_one_pass_sparse_mla_tile(
             q_u32,
             kv_rows_u32,
             kv_scales,

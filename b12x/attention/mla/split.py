@@ -28,7 +28,7 @@ from .kernel import (
     _log2_approx_ftz_f32,
     _clamp_active_token_count,
     _run_cached_host_launcher,
-    _run_two_pass_sparse_mla_tile,
+    _run_one_pass_sparse_mla_tile,
     _tensor_meta_key,
     _to_kernel_tensor,
     _torch_to_cutlass_dtype,
@@ -260,7 +260,7 @@ class SparseMLASplitDecodeForwardKernel:
             q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
             kv_base_addr = shared_ptr_to_u32(storage.kv_stage.data_ptr())
 
-            _run_two_pass_sparse_mla_tile(
+            _run_one_pass_sparse_mla_tile(
                 q_u32,
                 kv_rows_u32,
                 kv_scales,
