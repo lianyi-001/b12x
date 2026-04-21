@@ -48,13 +48,13 @@ _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 _EXTEND_TMA_DESC_CACHE_SIZE = 32
 
 _PREFILL_BLOCK_Q = 32  # Same Q tile size as decode
-_PREFILL_BLOCK_K = 128  # 2x K tile — halves redundant Q reads from global
+_PREFILL_BLOCK_K = 256  # 4x K tile — fewer CTAs, more work per CTA
 _PREFILL_WARPS_Q = _PREFILL_BLOCK_Q // 16  # 2
 _PREFILL_WARPS_K = 4  # 4 K-warps, each covering 32 K-rows via num_mma_kv=2
 _PREFILL_WARPS_PER_CTA = _PREFILL_WARPS_Q * _PREFILL_WARPS_K  # 8
 _PREFILL_THREADS_PER_CTA = _PREFILL_WARPS_PER_CTA * _WARP_THREADS  # 256
 _PREFILL_NUM_MMA_Q = 1  # same as decode
-_PREFILL_NUM_MMA_KV = 2  # each K-warp covers 32 K-rows (2x16)
+_PREFILL_NUM_MMA_KV = 4  # each K-warp covers 64 K-rows (4x16)
 
 _PREFILL_Q_STAGE_ROWS = _PREFILL_BLOCK_Q   # 32 Q rows per tile
 _PREFILL_Q_STAGE_COLS = _INDEX_HEAD_DIM    # 128 bytes per Q row
@@ -1184,7 +1184,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                         )
                 head_idx += Int32(1)
 
-            # Write back — each warp covers 32 Q × 32 K (via 2 K-sub-tiles)
+            # Write back — each K-warp covers NUM_MMA_KV * 16 K-rows
             lane_group = lane // Int32(4)
             lane_pair_base = Int32(2) * (lane % Int32(4))
             for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
@@ -1192,7 +1192,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                     row_slot = (reg_id % 4) // 2
                     q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
                     k_local = (
-                        warp_k_idx * Int32(32)
+                        warp_k_idx * Int32(_PREFILL_NUM_MMA_KV * 16)
                         + mma_kv * Int32(16)
                         + lane_pair_base
                         + Int32(8 * (reg_id // 4))

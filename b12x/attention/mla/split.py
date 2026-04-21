@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import cuda.bindings.driver as cuda
+import os
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -134,6 +135,10 @@ def select_sparse_mla_split_decode_config(
     if active_token_counts is not None and active_token_counts.numel() > 0:
         if active_token_counts.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
             width = min(width, max(0, int(active_token_counts.max().item())))
+    env_chunk = os.environ.get("B12X_MLA_SPLIT_CHUNK_SIZE", None)
+    if env_chunk is not None:
+        chunk_size = int(env_chunk)
+        return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=_ceil_div(width, chunk_size))
     return default_sparse_mla_split_decode_config_for_width(width)
 
 
