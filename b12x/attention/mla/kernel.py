@@ -2109,8 +2109,6 @@ def _run_one_pass_sparse_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
-    kv_base_b: Int32,
-    sScale_b: cute.Tensor,
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -2202,34 +2200,18 @@ def _run_one_pass_sparse_mla_tile(
                 lane,
             )
     else:
-        # Multi-tile: single-pass with double-buffered K/V software pipelining
+        # Multi-tile: serial K/V staging (single buffer, saves ~21KB smem for 2x occupancy)
         num_heads = Int32(q_u32.shape[1])
         num_kv = Int32(kv_rows_u32.shape[0])
 
-        # Double-buffered smem addresses for pipelining
-        # kv_base_addr/sTokenIdx/sScale are buffer A (also used by single-tile path)
-        # sTokenIdx is single-buffered (only needed during staging + QK, not PV)
-        kv_base_a = kv_base_addr
-        sScale_a = sScale
-
-        # Prologue: stage and load first tile into buffer A
-        tile_end_0 = cutlass.select_(
-            token_start + Int32(_MLA_TOKEN_TILE) < token_end,
-            token_start + Int32(_MLA_TOKEN_TILE),
-            token_end,
-        )
-        _pipeline_stage_tile_async(
-            q_u32, kv_rows_u32, kv_scales, page_table_1,
-            sTokenIdx, sScale_a,
-            q_base_addr, kv_base_a, kv_base_a + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
-            q_idx, head_tile_start, token_start, tile_end_0, num_kv, lane,
+        # Prologue: stage Q into smem once (Q is the same for all tiles)
+        _pipeline_stage_q_async(
+            q_u32, q_base_addr, q_idx, head_tile_start, lane,
         )
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        # Ping-pong state: use_buf_a=1 means current tile is in buffer A
-        use_buf_a = Int32(1)
-        token_base = tile_end_0
+        token_base = token_start
 
         while token_base < token_end:
             tile_end = cutlass.select_(
@@ -2237,38 +2219,26 @@ def _run_one_pass_sparse_mla_tile(
                 token_base + Int32(_MLA_TOKEN_TILE),
                 token_end,
             )
-            has_next = tile_end < token_end
-            next_tile_end = cutlass.select_(
-                tile_end + Int32(_MLA_TOKEN_TILE) < token_end,
-                tile_end + Int32(_MLA_TOKEN_TILE),
-                token_end,
+
+            # Stage K/V for this tile into kv_stage_a
+            _pipeline_stage_kv_async(
+                kv_rows_u32, kv_scales, page_table_1,
+                sTokenIdx, sScale,
+                kv_base_addr,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
+                q_idx, token_base, tile_end, num_kv, lane,
             )
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
 
-            # Select current and next buffer
-            curr_kv_base = cutlass.select_(use_buf_a == Int32(1), kv_base_a, kv_base_b)
-            curr_sScale = cutlass.select_(use_buf_a == Int32(1), sScale_a, sScale_b)
-            next_kv_base = cutlass.select_(use_buf_a == Int32(1), kv_base_b, kv_base_a)
-            next_sScale = cutlass.select_(use_buf_a == Int32(1), sScale_b, sScale_a)
-
-            # --- Start async K/V load for next tile (overlaps with compute) ---
-            # K/V staging does NOT touch q_stage, so it's safe before QK
-            if has_next:
-                _pipeline_stage_kv_async(
-                    kv_rows_u32, kv_scales, page_table_1,
-                    sTokenIdx, next_sScale,
-                    next_kv_base,
-                    next_kv_base + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
-                    q_idx, tile_end, next_tile_end, num_kv, lane,
-                )
-
-            # --- Compute QK on current tile (reads q_stage + current K/V buffer) ---
+            # Compute QK on current tile (reads q_stage + kv_stage_a)
             score_frag = cute.make_rmem_tensor(frag_layout, Float32)
             _qk_compute_from_staged_data(
                 score_frag,
                 q_base_addr,
-                curr_kv_base,
-                curr_kv_base + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
-                curr_sScale,
+                kv_base_addr,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
+                sScale,
                 sTokenIdx,
                 head_tile_start,
                 tile_end - token_base,
@@ -2278,13 +2248,7 @@ def _run_one_pass_sparse_mla_tile(
                 lane,
             )
 
-            # --- After QK, q_stage is free. Stage Q for next tile (async) ---
-            if has_next:
-                _pipeline_stage_q_async(
-                    q_u32, q_base_addr, q_idx, head_tile_start, lane,
-                )
-
-            # --- Softmax + O rescale + P norm + PV (no q_stage or sTokenIdx needed) ---
+            # Softmax + O rescale + P norm + PV
             _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
 
             # Rescale O accumulator: O *= exp2(m_prev - m_new) for each row_slot
@@ -2313,14 +2277,8 @@ def _run_one_pass_sparse_mla_tile(
             _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
             _accumulate_pv_groups_from_p_frag_staged(
                 o_frag0, o_frag1, o_frag2, o_frag3,
-                p_frag, curr_sScale, curr_kv_base, lane,
+                p_frag, sScale, kv_base_addr, lane,
             )
-
-            # --- Wait for next tile's async loads to complete ---
-            if has_next:
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
-                use_buf_a = Int32(1) - use_buf_a
 
             token_base = tile_end
     if cutlass.const_expr(lse_tensor is None):
@@ -2371,19 +2329,11 @@ def get_sparse_mla_shared_storage_cls():
             cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
             128,
         ],
-        "kv_stage_b": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
-            128,
-        ],
         "token_idx": cute.struct.Align[
             cute.struct.MemRange[cutlass.Int32, _MLA_TOKEN_TILE],
             16,
         ],
         "token_scale_a": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, _MLA_SCALE_STAGE_ELEMS],
-            16,
-        ],
-        "token_scale_b": cute.struct.Align[
             cute.struct.MemRange[cutlass.Float32, _MLA_SCALE_STAGE_ELEMS],
             16,
         ],
@@ -2446,11 +2396,8 @@ class SparseMLAKernel:
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
         sScale = storage.token_scale_a.get_tensor(
             cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,)))
-        sScale_b = storage.token_scale_b.get_tensor(
-            cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,)))
         q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
         kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
-        kv_base_b = shared_ptr_to_u32(storage.kv_stage_b.data_ptr())
 
         _run_one_pass_sparse_mla_tile(
             q_u32,
@@ -2471,8 +2418,6 @@ class SparseMLAKernel:
             q_idx,
             Int32(0),
             None,
-            kv_base_b,
-            sScale_b,
         )
 
 @lru_cache(maxsize=16)

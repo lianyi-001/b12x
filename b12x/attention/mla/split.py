@@ -314,8 +314,6 @@ class SparseMLASplitDecodeForwardKernel:
                 q_idx,
                 chunk_idx,
                 tmp_lse,
-                Int32(0),  # kv_base_b unused in single-tile path
-                sScale,    # sScale_b unused in single-tile path, pass sScale as placeholder
             )
 
 
