@@ -20,6 +20,7 @@ from b12x.attention import pipeline
 from b12x.attention import utils as attention_utils
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
+    get_ptr_as_int64,
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
@@ -715,6 +716,27 @@ class SparseNSAExtendLogitsKernel:
 
 
 
+def cp_async_128b_pred(smem_addr: Int32, gmem_addr: Int64, predicate: Int32, *, loc=None, ip=None):
+    """Async 16B global→shared copy, predicated. Both addresses must be 16B-aligned."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(predicate).ir_value(loc=loc, ip=ip),
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        " .reg .pred p;\n"
+        " setp.ne.b32 p, $0, 0;\n"
+        " @p cp.async.cg.shared.global.L2::128B [$1], [$2], 16;\n"
+        "}",
+        "r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def ld_shared_u32(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
     """Load 32 bits from shared memory."""
     result = llvm.inline_asm(
@@ -920,7 +942,8 @@ class SparseNSAExtendLogitsPrefillKernel:
                 1024,
             ]
             q_bytes_smem: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS],
+                # 2x for double-buffered cp.async pipelining: buf A/B alternate per head.
+                cute.struct.MemRange[cutlass.Uint8, _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * 2],
                 1024,
             ]
             scales: cute.struct.Align[
@@ -1012,24 +1035,48 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for reg_id in cutlass.range_constexpr(8):
                     acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
 
-            # Cooperative v4 Q staging: 8 threads per row, each writes 4 consecutive
-            # u32 words via a single v4 store. Stage current head at start of each
-            # iter to avoid aliasing a concurrent MMA read in another warp.
+            # Double-buffered cp.async Q staging with 1-stage software pipelining:
+            # head h's MMA reads from buffer[h%2] while head h+1's cp.async writes
+            # the other buffer. Per-thread: one aligned 16B chunk of the 32x128 Q tile
+            # (256 threads x 16B = 4096B = one head's Q in smem).
             threads_per_row = Int32(8)
             row_local = tx // threads_per_row
             col_group = tx % threads_per_row
             u32_col_base = col_group * Int32(4)
             q_row = q_tile_base + row_local
-            in_bounds = row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows
-            q_smem_stage_addr = q_smem_base + row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_col_base * Int32(4)
+            in_bounds_pred = Int32(1) if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows) else Int32(0)
+            thread_offset = row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_col_base * Int32(4)
+            q_stage_bytes = Int32(_PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS)
+            q_smem_buf_a = q_smem_base + thread_offset
+            q_smem_buf_b = q_smem_base + q_stage_bytes + thread_offset
+            q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
+
+            # Issue cp.async for head 0 → buffer A.
+            gmem_u32_offset_h0 = (q_row_for_async * num_heads + Int32(0)) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
+            cp_async_128b_pred(
+                q_smem_buf_a,
+                get_ptr_as_int64(q_u32, gmem_u32_offset_h0),
+                in_bounds_pred,
+            )
+            cute.arch.cp_async_commit_group()
 
             head_idx = Int32(0)
             while head_idx < num_heads:
-                v0 = Uint32(q_u32[q_row, head_idx, u32_col_base]) if in_bounds else Uint32(0)
-                v1 = Uint32(q_u32[q_row, head_idx, u32_col_base + Int32(1)]) if in_bounds else Uint32(0)
-                v2 = Uint32(q_u32[q_row, head_idx, u32_col_base + Int32(2)]) if in_bounds else Uint32(0)
-                v3 = Uint32(q_u32[q_row, head_idx, u32_col_base + Int32(3)]) if in_bounds else Uint32(0)
-                st_shared_v4_u32(q_smem_stage_addr, v0, v1, v2, v3)
+                next_head = head_idx + Int32(1)
+                curr_is_a = (head_idx & Int32(1)) == Int32(0)
+                curr_mma_base = q_smem_base if curr_is_a else (q_smem_base + q_stage_bytes)
+                next_stage_addr = q_smem_buf_b if curr_is_a else q_smem_buf_a
+                if next_head < num_heads:
+                    gmem_u32_offset_next = (q_row_for_async * num_heads + next_head) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
+                    cp_async_128b_pred(
+                        next_stage_addr,
+                        get_ptr_as_int64(q_u32, gmem_u32_offset_next),
+                        in_bounds_pred,
+                    )
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(1)
+                else:
+                    cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
 
                 score_frag = cute.make_rmem_tensor(acc_layout, Float32)
@@ -1038,7 +1085,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                         score_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
                 _prefill_qk_mma_from_smem_q(
                     score_frag,
-                    q_smem_base,
+                    curr_mma_base,
                     k_perm_base_addr,
                     lane,
                     warp_q_idx,
@@ -1068,7 +1115,6 @@ class SparseNSAExtendLogitsPrefillKernel:
                                     else Float32(0.0)
                                 )
                             )
-                cute.arch.sync_threads()
                 head_idx += Int32(1)
 
             # Write back — each warp covers 32 Q × 32 K (via 2 K-sub-tiles)
