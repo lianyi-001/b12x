@@ -1469,27 +1469,11 @@ def _get_impl_mac(impl: str, *, routed_rows: int | None = None) -> int:
     return mac
 
 
-def _select_micro_mma_tiler_mn(
-    max_rows: int,
-    n: int,
-    *,
-    resident_clusters: int | None = None,
-) -> tuple[int, int]:
+def _select_micro_mma_tiler_mn(max_rows: int, n: int) -> tuple[int, int]:
     if os.environ.get("B12X_MOE_TILE_MN"):
         return tuple(int(x) for x in os.environ["B12X_MOE_TILE_MN"].split("x"))
     sm_count = get_num_sm(torch.device("cuda"))
-    if resident_clusters is not None and resident_clusters < sm_count:
-        # The small-M 64x128 path only pays off when the launch can actually
-        # fill the machine. If a backend-specific cap is already leaving SMs
-        # idle, shrinking tile_m just increases barrier/scheduling overhead.
-        return (128, 128)
     coarse_tile = (128, 128)
-    # The routed-row proxy can hide exact-small-M underfill when N is wide:
-    # enough 128-column tiles may exist to satisfy the CTA-count heuristic even
-    # though each CTA's 128-row M slice is mostly empty. When the routed work
-    # fits within one 64-row tile, prefer narrowing M first for wide-N cases.
-    if max_rows <= 64 and n > 1536:
-        return (64, 128)
     coarse_tiles = ((max_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
@@ -1521,11 +1505,7 @@ def _get_static_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if num_topk > 1:
-        mma_tiler_mn = _select_micro_mma_tiler_mn(
-            routed_rows,
-            n,
-            resident_clusters=mac,
-        )
+        mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n)
 
     global _LAST_KERNEL
     cache_key = (
@@ -1676,11 +1656,7 @@ def _get_micro_kernel(
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
     routed_rows = m * num_topk
-    mma_tiler_mn = _select_micro_mma_tiler_mn(
-        routed_rows,
-        n,
-        resident_clusters=mac,
-    )
+    mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n)
 
     global _LAST_KERNEL
     cache_key = (
@@ -2430,7 +2406,10 @@ def _launch_compact_static(
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
-            single_token=(m == 1 and activation == "relu2"),
+            single_token=(
+                m == 1
+                and (activation == "relu2" or share_input_across_experts)
+            ),
             mac_override=micro_mac,
             activation=activation,
         )
@@ -2698,7 +2677,7 @@ def b12x_moe_fp4(
             fast_math=fast_math,
             stream=stream,
             share_input_across_experts=(
-                activation == "relu2"
+                activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
                 and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
