@@ -23,6 +23,11 @@ from .split import (
 from .workspace import B12XAttentionWorkspace
 
 
+_MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
+_MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
+_MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
+
+
 @dataclass(frozen=True)
 class MLASparseDecodeMetadata:
     page_table_1: torch.Tensor
@@ -56,6 +61,49 @@ def clear_mla_caches() -> None:
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_mla_prefill_strategy() -> Literal["auto", "single", "split"]:
+    if _env_flag(_MLA_FORCE_SINGLE_PASS_ENV):
+        return "single"
+    if _env_flag(_MLA_FORCE_SPLIT_ENV):
+        return "split"
+
+    value = os.environ.get(_MLA_STRATEGY_ENV, "auto").strip().lower()
+    if value in ("auto", ""):
+        return "auto"
+    if value in ("single", "single-pass", "nonsplit", "onepass"):
+        return "single"
+    if value == "split":
+        return "split"
+    raise ValueError(
+        f"{_MLA_STRATEGY_ENV} must be auto, split, or single-pass/nonsplit; got {value!r}"
+    )
+
+
+def _apply_mla_prefill_strategy(
+    *,
+    split_cfg,
+    workspace: B12XAttentionWorkspace,
+    active_token_counts: torch.Tensor,
+    device: torch.device,
+    q_rows: int,
+    topk_width: int,
+):
+    if split_cfg is None:
+        return None
+
+    strategy = _resolve_mla_prefill_strategy()
+    if strategy == "single":
+        return None
+    if strategy == "split":
+        return split_cfg
+
+    return split_cfg
 
 
 def sparse_mla_decode_forward(
@@ -205,10 +253,21 @@ def _run_sparse_mla(
                         max(0, int(active_token_counts.max().item())),
                     )
             split_cfg = forced_sparse_mla_split_decode_config_for_width(forced_width)
+        split_cfg = _apply_mla_prefill_strategy(
+            split_cfg=split_cfg,
+            workspace=workspace,
+            active_token_counts=active_token_counts,
+            device=q_all.device,
+            q_rows=int(q_all.shape[0]),
+            topk_width=int(selected_indices.shape[1]),
+        )
     if split_cfg is not None:
         if workspace.tmp_output is None or workspace.tmp_lse is None:
             raise RuntimeError("workspace is missing split MLA buffers")
-        if not (workspace.fixed_capacity or workspace.use_cuda_graph):
+        if (
+            not _is_cuda_graph_capture_active(q_all.device)
+            or not (workspace.fixed_capacity or workspace.use_cuda_graph)
+        ):
             workspace.set_split_chunk_config(
                 kv_chunk_size=split_cfg.chunk_size,
                 num_chunks=split_cfg.num_chunks,

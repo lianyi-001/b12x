@@ -294,6 +294,7 @@ def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
         output.zero_()
 
     def fail_run_sparse_mla_kernel(**kwargs):
+        del kwargs
         raise AssertionError("verify path should not use generic sparse MLA kernel")
 
     monkeypatch.setattr(
@@ -355,6 +356,7 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
         output.zero_()
 
     def fail_run_sparse_mla_kernel(**kwargs):
+        del kwargs
         raise AssertionError("extend split path should not use generic sparse MLA kernel")
 
     monkeypatch.setattr(

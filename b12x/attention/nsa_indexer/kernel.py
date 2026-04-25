@@ -68,6 +68,53 @@ def _page_splits_for_num_heads(num_heads: int) -> int:
     return _PAGE_SIZE // tokens_per_work
 
 
+@lru_cache(maxsize=16)
+def _paged_indexer_shared_storage_cls(
+    padded_q_heads: int,
+    tokens_per_work: int,
+    num_q_head_tiles: int,
+):
+    class SharedStorage:
+        pass
+
+    def k_page_storage():
+        return cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
+            1024,
+        ]
+
+    annotations = {
+        "mbar_ptr_k": cute.struct.MemRange[cutlass.Int64, 1],
+        "q_bytes": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(padded_q_heads) * _INDEX_HEAD_DIM],
+            16,
+        ],
+        "weights": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, int(padded_q_heads)],
+            16,
+        ],
+    }
+    annotations["k_page"] = k_page_storage()
+    annotations.update(
+        {
+            "k_page_perm": k_page_storage(),
+            "scales": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, _PAGE_SIZE],
+                16,
+            ],
+            "partial_logits": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32,
+                    int(tokens_per_work) * int(num_q_head_tiles),
+                ],
+                16,
+            ],
+        }
+    )
+    SharedStorage.__annotations__ = annotations
+    return cute.struct(SharedStorage)
+
+
 def _to_kernel_tensor(
     tensor: torch.Tensor,
     dtype: type[cutlass.Numeric],
@@ -525,6 +572,13 @@ class SparseNSAPagedLogitsKernel:
         self.tokens_per_work = _PAGED_TOKENS_PER_GROUP * self.token_groups
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
 
+    def _get_shared_storage_cls(self):
+        return _paged_indexer_shared_storage_cls(
+            self.padded_q_heads,
+            self.tokens_per_work,
+            self.num_q_head_tiles,
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -548,6 +602,7 @@ class SparseNSAPagedLogitsKernel:
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
+        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -567,6 +622,7 @@ class SparseNSAPagedLogitsKernel:
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -591,34 +647,7 @@ class SparseNSAPagedLogitsKernel:
         warp_idx = tx // Int32(_WARP_THREADS)
 
         smem = cutlass.utils.SmemAllocator()
-
-        @cute.struct
-        class SharedStorage:
-            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            q_bytes: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, self.padded_q_heads * _INDEX_HEAD_DIM],
-                16,
-            ]
-            weights: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.padded_q_heads],
-                16,
-            ]
-            k_page: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            k_page_perm: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            scales: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PAGE_SIZE],
-                16,
-            ]
-            partial_logits: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.tokens_per_work * self.num_q_head_tiles],
-                16,
-            ]
+        SharedStorage = self._get_shared_storage_cls()
 
         width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
         live_width = Int32(active_width[Int32(0)])
@@ -821,6 +850,13 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
         self.schedule_pages_per_split = int(PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT)
 
+    def _get_shared_storage_cls(self):
+        return _paged_indexer_shared_storage_cls(
+            self.padded_q_heads,
+            self.tokens_per_work,
+            self.num_q_head_tiles,
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -845,6 +881,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
+        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -865,6 +902,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -890,34 +928,7 @@ class SparseNSAScheduledSingleRowLogitsKernel:
         warp_idx = tx // Int32(_WARP_THREADS)
 
         smem = cutlass.utils.SmemAllocator()
-
-        @cute.struct
-        class SharedStorage:
-            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            q_bytes: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, self.padded_q_heads * _INDEX_HEAD_DIM],
-                16,
-            ]
-            weights: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.padded_q_heads],
-                16,
-            ]
-            k_page: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            k_page_perm: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            scales: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PAGE_SIZE],
-                16,
-            ]
-            partial_logits: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.tokens_per_work * self.num_q_head_tiles],
-                16,
-            ]
+        SharedStorage = self._get_shared_storage_cls()
 
         width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
         live_width = Int32(active_width[Int32(0)])
@@ -1106,6 +1117,13 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
         self.schedule_pages_per_split = int(PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT)
 
+    def _get_shared_storage_cls(self):
+        return _paged_indexer_shared_storage_cls(
+            self.padded_q_heads,
+            self.tokens_per_work,
+            self.num_q_head_tiles,
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -1130,6 +1148,7 @@ class SparseNSAScheduledMultiRowLogitsKernel:
             (_PAGE_SIZE, _INDEX_HEAD_DIM),
             1,
         )
+        SharedStorage = self._get_shared_storage_cls()
         self.kernel(
             q_bytes,
             weights,
@@ -1150,6 +1169,7 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                 1,
             ),
             block=[_PAGED_THREADS_PER_CTA, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -1175,34 +1195,7 @@ class SparseNSAScheduledMultiRowLogitsKernel:
         warp_idx = tx // Int32(_WARP_THREADS)
 
         smem = cutlass.utils.SmemAllocator()
-
-        @cute.struct
-        class SharedStorage:
-            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            q_bytes: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, self.padded_q_heads * _INDEX_HEAD_DIM],
-                16,
-            ]
-            weights: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.padded_q_heads],
-                16,
-            ]
-            k_page: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            k_page_perm: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
-                1024,
-            ]
-            scales: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PAGE_SIZE],
-                16,
-            ]
-            partial_logits: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.tokens_per_work * self.num_q_head_tiles],
-                16,
-            ]
+        SharedStorage = self._get_shared_storage_cls()
 
         width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
         live_width = Int32(active_width[Int32(0)])

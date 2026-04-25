@@ -962,6 +962,7 @@ class B12XAttentionWorkspace:
         k_scale: torch.Tensor,
         k_start: torch.Tensor,
         k_end: torch.Tensor,
+        preinitialize_invalid_logits: bool = True,
     ) -> dict[str, torch.Tensor]:
         if (
             self.indexer_k_quant_bytes is None
@@ -986,6 +987,11 @@ class B12XAttentionWorkspace:
         valid_q_rows = int(k_start.shape[0])
         k_rows = int(k_quant.shape[0])
         padded_k_rows = _align_up(max(k_rows, 1), _NSA_INDEXER_BLOCK_K)
+        if not preinitialize_invalid_logits and valid_q_rows != q_rows_total:
+            raise ValueError(
+                "preinitialize_invalid_logits=False requires all q rows to be valid; "
+                f"got q_rows={q_rows_total} and valid_q_rows={valid_q_rows}"
+            )
 
         if q_rows_total > self.max_total_q:
             raise ValueError(
@@ -1049,7 +1055,7 @@ class B12XAttentionWorkspace:
         logits_view = self.indexer_extend_logits.narrow(0, 0, q_rows_total * k_rows).view(
             q_rows_total, k_rows
         )
-        if q_rows_total != 0 and k_rows != 0:
+        if preinitialize_invalid_logits and q_rows_total != 0 and k_rows != 0:
             logits_view.fill_(float("-inf"))
         return {
             "q_u32": q_u32,

@@ -74,6 +74,17 @@ def test_build_decode_cases_supports_staggered_row_contexts() -> None:
     )
 
 
+def test_target_prefill64k_bs1_preset_sets_target_shape() -> None:
+    args = benchmark_mla._parse_args(["--preset", benchmark_mla.TARGET_PREFILL64K_BS1_PRESET])
+
+    assert args.modes == "prefill"
+    assert args.batch_sizes == "1"
+    assert args.cache_lens == "65536"
+    assert args.verify_q_lens == "2048"
+    assert args.topk_cap == 2048
+    assert args.graph_width == 65536
+
+
 def test_render_case_line_reports_public_step_metrics() -> None:
     report = benchmark_mla.CaseReport(
         case=benchmark_mla.DecodeCase(mode="prefill", batch_size=4, cache_len=32768, topk=2048, q_len=16384),
@@ -104,6 +115,7 @@ def test_render_case_line_reports_public_step_metrics() -> None:
     assert "replay=" in line
     assert "indexer=" in line
     assert "mla=" in line
+    assert "idx_bk=decode" in line
 
 
 def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:

@@ -16,6 +16,7 @@ from .kernel import (
     supports_sparse_nsa_paged_logits_kernel,
 )
 from .extend_kernel import (
+    resolve_sparse_nsa_extend_prefill_block_k,
     run_sparse_nsa_extend_logits_kernel,
     supports_sparse_nsa_extend_logits_kernel,
 )
@@ -437,6 +438,7 @@ def sparse_nsa_index_extend_logits(
     metadata: NSAIndexerExtendLogitsMetadata,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
+    preinitialize_invalid_logits: bool = True,
 ) -> torch.Tensor:
     k_start = metadata.k_start
     k_end = metadata.k_end
@@ -475,6 +477,7 @@ def sparse_nsa_index_extend_logits(
             k_end=k_end,
             contract_phantoms=contract_phantoms,
             workspace=workspace,
+            preinitialize_invalid_logits=preinitialize_invalid_logits,
         )
 
     return sparse_nsa_extend_logits_reference(
