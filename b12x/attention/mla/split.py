@@ -23,6 +23,7 @@ from .kernel import (
     _MLA_NOPE_DIM,
     _MLA_OUTPUT_FRAGMENTS_PER_LANE,
     _MLA_Q_STAGE_BYTES,
+    _MLA_Q_GROUP_STAGE_BYTES,
     _MLA_SCALE_GROUPS,
     _MLA_SCALE_STAGE_ELEMS,
     _MLA_TOKEN_TILE,
@@ -58,11 +59,15 @@ def get_sparse_mla_split_shared_storage_cls():
         pass
 
     SharedStorage.__annotations__ = {
-        "q_stage": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(_MLA_Q_STAGE_BYTES)],
+        "q_group_stage": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(_MLA_Q_GROUP_STAGE_BYTES)],
             128,
         ],
         "kv_stage_a": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
+            128,
+        ],
+        "kv_stage_b": cute.struct.Align[
             cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
             128,
         ],
@@ -86,26 +91,32 @@ class SparseMLASplitDecodeConfig:
 
 def default_sparse_mla_split_decode_config_for_width(
     width: int,
+    *,
+    max_chunks: int = _SPLIT_MAX_CHUNKS,
 ) -> SparseMLASplitDecodeConfig | None:
     if width <= _SPLIT_CHUNK_LADDER[0] or width > _SPLIT_MAX_WIDTH:
         return None
 
+    max_chunks = max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS))
     for chunk_size in _SPLIT_CHUNK_LADDER:
         num_chunks = _ceil_div(width, chunk_size)
-        if num_chunks <= _SPLIT_MAX_CHUNKS:
+        if num_chunks <= max_chunks:
             return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
     return None
 
 
 def forced_sparse_mla_split_decode_config_for_width(
     width: int,
+    *,
+    max_chunks: int = _SPLIT_MAX_CHUNKS,
 ) -> SparseMLASplitDecodeConfig | None:
     if width <= 0 or width > _SPLIT_MAX_WIDTH:
         return None
 
+    max_chunks = max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS))
     for chunk_size in _SPLIT_CHUNK_LADDER:
         num_chunks = _ceil_div(width, chunk_size)
-        if num_chunks <= _SPLIT_MAX_CHUNKS:
+        if num_chunks <= max_chunks:
             return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
     return None
 
@@ -149,6 +160,7 @@ def select_sparse_mla_split_decode_config(
     active_token_counts: torch.Tensor | None = None,
     output_dtype: torch.dtype,
     v_head_dim: int,
+    max_chunks: int = _SPLIT_MAX_CHUNKS,
 ) -> SparseMLASplitDecodeConfig | None:
     traits = select_sparse_mla_traits(
         q_all=q_all,
@@ -167,8 +179,11 @@ def select_sparse_mla_split_decode_config(
     env_chunk = os.environ.get("B12X_MLA_SPLIT_CHUNK_SIZE", None)
     if env_chunk is not None:
         chunk_size = int(env_chunk)
-        return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=_ceil_div(width, chunk_size))
-    return default_sparse_mla_split_decode_config_for_width(width)
+        num_chunks = _ceil_div(width, chunk_size)
+        if num_chunks > max(1, min(int(max_chunks), _SPLIT_MAX_CHUNKS)):
+            return None
+        return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
+    return default_sparse_mla_split_decode_config_for_width(width, max_chunks=max_chunks)
 
 
 @cute.jit
@@ -292,8 +307,9 @@ class SparseMLASplitDecodeForwardKernel:
                 cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
             )
 
-            q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
+            q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
             kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+            kv_stage_b_addr = shared_ptr_to_u32(storage.kv_stage_b.data_ptr())
 
             _run_one_pass_sparse_mla_tile(
                 q_u32,
@@ -304,6 +320,7 @@ class SparseMLASplitDecodeForwardKernel:
                 sScale,
                 q_base_addr,
                 kv_base_addr,
+                kv_stage_b_addr,
                 q_idx,
                 head_tile_start,
                 token_start,

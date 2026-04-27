@@ -71,10 +71,12 @@ _MLA_KV_NOPE_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_NOPE_GROUP_ELEMS
 _MLA_KV_NOPE_QK_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_NOPE_GROUP_ELEMS * 2
 _MLA_KV_ROPE_STAGE_BYTES = _MLA_TOKEN_TILE * _MLA_ROPE_DIM * 2
 _MLA_Q_STAGE_BYTES = _MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES + _MLA_Q_ROPE_STAGE_BYTES
-_MLA_KV_STAGE_BYTES = max(
-    _MLA_KV_NOPE_QK_STAGE_BYTES,
-    _MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES + _MLA_KV_ROPE_STAGE_BYTES,
-)
+# Per-group Q stage: one nope group (4KB) or rope (2KB) at a time.
+# Reduces smem ~23KB -> ~9KB, enabling ~11 CTAs/SM (vs 4).
+_MLA_Q_GROUP_STAGE_BYTES = _MLA_Q_NOPE_STAGE_BYTES
+# Per-group streaming: KV stage holds one nope group OR rope at a time.
+# Reduces smem ~38.6KB -> ~22.6KB, enabling 4 CTAs/SM (vs 2).
+_MLA_KV_STAGE_BYTES = _MLA_KV_NOPE_STAGE_BYTES
 _MLA_SCALE_STAGE_ELEMS = _MLA_TOKEN_TILE * _MLA_SCALE_GROUPS
 _MLA_SCALE_BYTES = _MLA_SCALE_GROUPS * 4
 _MLA_NOPE_U32_OFFSET = 0
@@ -1562,8 +1564,7 @@ def _compute_score_tile_scaled_from_staged_nope(
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
     q_base_addr: Int32,
-    kv_nope_base_addr: Int32,
-    kv_rope_base_addr: Int32,
+    kv_base_addr: Int32,
     q_idx: Int32,
     head_tile_start: Int32,
     token_base: Int32,
@@ -1580,6 +1581,11 @@ def _compute_score_tile_scaled_from_staged_nope(
     _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
     cute.arch.sync_threads()
     _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
+
+    _zero_score_frag(score_frag)
+    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
+
+    # Per-group Q+KV co-streaming (4KB Q group stage)
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
         _stage_q_u32_block_async(
@@ -1589,57 +1595,29 @@ def _compute_score_tile_scaled_from_staged_nope(
             group_idx * Int32(_MLA_NOPE_GROUP_Q_U32),
             Int32(_MLA_NOPE_GROUP_Q_VECS),
             Int32(_MLA_NOPE_GROUP_Q_VECS),
-            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
+            q_base_addr,
             lane,
         )
-    _stage_q_u32_block_async(
-        q_u32,
-        q_idx,
-        head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
         _stage_kv_u32_block_async(
             kv_rows_u32,
             sTokenIdx,
             Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
-            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
+            kv_base_addr,
             num_kv,
             lane,
         )
         cute.arch.cp_async_commit_group()
-    _stage_kv_u32_block_async(
-        kv_rows_u32,
-        sTokenIdx,
-        Int32(_MLA_ROPE_U32_OFFSET),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        kv_rope_base_addr,
-        num_kv,
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
-    cute.arch.cp_async_wait_group(0)
-    cute.arch.sync_threads()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
 
-    _zero_score_frag(score_frag)
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
         frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
         _zero_score_frag(frag_tmp)
         _literal_qk_mma_into_sfrag_mxfp8_raw(
             frag_tmp,
-            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
-            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
+            q_base_addr,
+            kv_base_addr,
             lane,
             Int32(0),
             Int32(1),
@@ -1655,13 +1633,39 @@ def _compute_score_tile_scaled_from_staged_nope(
             group_idx * Int32(_MLA_TOKEN_TILE),
             lane,
         )
+        cute.arch.sync_threads()
+
+    # Rope QK: co-stream Q rope + KV rope
+    _stage_q_u32_block_async(
+        q_u32,
+        q_idx,
+        head_tile_start,
+        Int32(_MLA_NOPE_DIM // 2),
+        Int32(_MLA_ROPE_VECS),
+        Int32(_MLA_ROPE_VECS),
+        q_base_addr,
+        lane,
+    )
+    _stage_kv_u32_block_async(
+        kv_rows_u32,
+        sTokenIdx,
+        Int32(_MLA_ROPE_U32_OFFSET),
+        Int32(_MLA_ROPE_VECS),
+        Int32(_MLA_ROPE_VECS),
+        kv_base_addr,
+        num_kv,
+        lane,
+    )
+    cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_wait_group(0)
+    cute.arch.sync_threads()
 
     frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
     _zero_score_frag(frag_rope)
     _literal_qk_mma_into_sfrag_bf16(
         frag_rope,
-        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
-        kv_rope_base_addr,
+        q_base_addr,
+        kv_base_addr,
         lane,
         Int32(0),
         Int32(1),
@@ -1700,51 +1704,6 @@ def _compute_score_tile_scaled_from_staged_nope(
             )
     cute.arch.sync_threads()
 
-
-
-@cute.jit
-def _pipeline_stage_kv_async(
-    kv_rows_u32: cute.Tensor,
-    kv_scales: cute.Tensor,
-    page_table_1: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    kv_nope_base_addr: Int32,
-    kv_rope_base_addr: Int32,
-    q_idx: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    """Stage token indices, scales, and K/V into smem for one tile (async, no Q staging)."""
-    _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
-    cute.arch.sync_threads()
-    _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_kv_u32_block_async(
-            kv_rows_u32,
-            sTokenIdx,
-            Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
-            num_kv,
-            lane,
-        )
-        cute.arch.cp_async_commit_group()
-    _stage_kv_u32_block_async(
-        kv_rows_u32,
-        sTokenIdx,
-        Int32(_MLA_ROPE_U32_OFFSET),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        kv_rope_base_addr,
-        num_kv,
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
 
 
 
@@ -1782,166 +1741,7 @@ def _pipeline_stage_q_async(
     cute.arch.cp_async_commit_group()
 
 
-@cute.jit
-def _pipeline_stage_tile_async(
-    q_u32: cute.Tensor,
-    kv_rows_u32: cute.Tensor,
-    kv_scales: cute.Tensor,
-    page_table_1: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    sScale: cute.Tensor,
-    q_base_addr: Int32,
-    kv_nope_base_addr: Int32,
-    kv_rope_base_addr: Int32,
-    q_idx: Int32,
-    head_tile_start: Int32,
-    token_base: Int32,
-    token_end: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    """Stage token indices, scales, Q, and K/V into smem for one tile (async)."""
-    tile_tokens = token_end - token_base
-    _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
-    cute.arch.sync_threads()
-    _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_q_u32_block_async(
-            q_u32,
-            q_idx,
-            head_tile_start,
-            group_idx * Int32(_MLA_NOPE_GROUP_Q_U32),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
-            lane,
-        )
-    _stage_q_u32_block_async(
-        q_u32,
-        q_idx,
-        head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        _stage_kv_u32_block_async(
-            kv_rows_u32,
-            sTokenIdx,
-            Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
-            num_kv,
-            lane,
-        )
-        cute.arch.cp_async_commit_group()
-    _stage_kv_u32_block_async(
-        kv_rows_u32,
-        sTokenIdx,
-        Int32(_MLA_ROPE_U32_OFFSET),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-        kv_rope_base_addr,
-        num_kv,
-        lane,
-    )
-    cute.arch.cp_async_commit_group()
 
-
-
-@cute.jit
-def _qk_compute_from_staged_data(
-    score_frag: cute.Tensor,
-    q_base_addr: Int32,
-    kv_nope_base_addr: Int32,
-    kv_rope_base_addr: Int32,
-    sScale: cute.Tensor,
-    sTokenIdx: cute.Tensor,
-    head_tile_start: Int32,
-    tile_tokens: Int32,
-    sm_scale_log2: Float32,
-    num_heads: Int32,
-    num_kv: Int32,
-    lane: Int32,
-):
-    """QK compute from staged Q+K smem data. Assumes cp.async wait already done."""
-    lane_group = lane // Int32(4)
-    lane_pair_base = Int32(2) * (lane % Int32(4))
-    _zero_score_frag(score_frag)
-    frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
-    for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
-        group_idx = Int32(block_offset)
-        frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
-        _zero_score_frag(frag_tmp)
-        _literal_qk_mma_into_sfrag_mxfp8_raw(
-            frag_tmp,
-            q_base_addr + group_idx * Int32(_MLA_Q_NOPE_STAGE_BYTES),
-            kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
-            lane,
-            Int32(0),
-            Int32(1),
-            Int32(_MLA_NUM_MMA_KV),
-            Int32(_MLA_NOPE_QK_NUM_MMA_D),
-            Int32(_MLA_NOPE_GROUP_Q_VECS),
-            Int32(_MLA_NOPE_GROUP_KV_VECS),
-        )
-        _accumulate_scaled_score_frag(
-            score_frag,
-            frag_tmp,
-            sScale,
-            group_idx * Int32(_MLA_TOKEN_TILE),
-            lane,
-        )
-
-    frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
-    _zero_score_frag(frag_rope)
-    _literal_qk_mma_into_sfrag_bf16(
-        frag_rope,
-        q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
-        kv_rope_base_addr,
-        lane,
-        Int32(0),
-        Int32(1),
-        Int32(_MLA_NUM_MMA_KV),
-        Int32(_MLA_QK_NUM_MMA_D),
-        Int32(_MLA_ROPE_VECS),
-        Int32(_MLA_ROPE_VECS),
-    )
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            score_frag[0, mma_kv, reg_id] = Float32(score_frag[0, mma_kv, reg_id] + frag_rope[0, mma_kv, reg_id])
-
-    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
-        for reg_id in cutlass.range_constexpr(8):
-            row_slot = (reg_id % 4) // 2
-            head_local = lane_group + Int32(8) * row_slot
-            head_idx = head_tile_start + head_local
-            token_local = (
-                mma_kv * 16
-                + lane_pair_base
-                + Int32(8) * (reg_id // 4)
-                + Int32(reg_id % 2)
-            )
-            token_idx = Int32(sTokenIdx[token_local])
-            valid = token_local < tile_tokens
-            if valid:
-                valid = valid and token_idx >= Int32(0)
-            if valid:
-                valid = valid and token_idx < num_kv
-            if valid:
-                valid = valid and head_idx < num_heads
-            score_frag[0, mma_kv, reg_id] = (
-                Float32(score_frag[0, mma_kv, reg_id] * sm_scale_log2)
-                if valid
-                else Float32(-Float32.inf)
-            )
-    cute.arch.sync_threads()
 
 
 
@@ -1952,12 +1752,30 @@ def _accumulate_pv_groups_from_p_frag_staged(
     o_frag2: cute.Tensor,
     o_frag3: cute.Tensor,
     p_frag: cute.Tensor,
+    kv_rows_u32: cute.Tensor,
+    sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
-    kv_nope_base_addr: Int32,
+    kv_base_addr: Int32,
+    num_kv: Int32,
     lane: Int32,
 ):
+    # Stream one nope group at a time into the single KV stage buffer
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
+        _stage_kv_u32_block_async(
+            kv_rows_u32,
+            sTokenIdx,
+            Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+            Int32(_MLA_NOPE_GROUP_KV_VECS),
+            kv_base_addr,
+            num_kv,
+            lane,
+        )
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
         scale_base = group_idx * Int32(_MLA_TOKEN_TILE)
         tile_output_scale = _warp_allreduce_max(Float32(sScale[scale_base + lane]))
         tile_pv_scale = (
@@ -1965,23 +1783,23 @@ def _accumulate_pv_groups_from_p_frag_staged(
             if tile_output_scale == Float32(0.0)
             else cute.arch.rcp_approx(tile_output_scale)
         )
-        group_base_addr = kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES)
         if cutlass.const_expr(block_offset == 0):
             _run_staged_pv_group_into_target(
-                o_frag0, p_frag, sScale, group_base_addr, scale_base, tile_pv_scale, lane
+                o_frag0, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
             )
         elif cutlass.const_expr(block_offset == 1):
             _run_staged_pv_group_into_target(
-                o_frag1, p_frag, sScale, group_base_addr, scale_base, tile_pv_scale, lane
+                o_frag1, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
             )
         elif cutlass.const_expr(block_offset == 2):
             _run_staged_pv_group_into_target(
-                o_frag2, p_frag, sScale, group_base_addr, scale_base, tile_pv_scale, lane
+                o_frag2, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
             )
         else:
             _run_staged_pv_group_into_target(
-                o_frag3, p_frag, sScale, group_base_addr, scale_base, tile_pv_scale, lane
+                o_frag3, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane
             )
+        cute.arch.sync_threads()
 
 
 @cute.jit
@@ -2099,6 +1917,7 @@ def _run_one_pass_sparse_mla_tile(
     sScale: cute.Tensor,
     q_base_addr: Int32,
     kv_base_addr: Int32,
+    kv_stage_b_addr: Int32,
     q_idx: Int32,
     head_tile_start: Int32,
     token_start: Int32,
@@ -2163,7 +1982,6 @@ def _run_one_pass_sparse_mla_tile(
                 sScale,
                 q_base_addr,
                 kv_base_addr,
-                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
                 q_idx,
                 head_tile_start,
                 token_start,
@@ -2195,21 +2013,19 @@ def _run_one_pass_sparse_mla_tile(
                 o_frag2,
                 o_frag3,
                 p_frag,
+                kv_rows_u32,
+                sTokenIdx,
                 sScale,
                 kv_base_addr,
+                Int32(kv_rows_u32.shape[0]),
                 lane,
             )
     else:
-        # Multi-tile: serial K/V staging (single buffer, saves ~21KB smem for 2x occupancy)
+        # Multi-tile: per-group Q+KV co-streaming (~9KB smem, ~11 CTAs/SM)
         num_heads = Int32(q_u32.shape[1])
         num_kv = Int32(kv_rows_u32.shape[0])
-
-        # Prologue: stage Q into smem once (Q is the same for all tiles)
-        _pipeline_stage_q_async(
-            q_u32, q_base_addr, q_idx, head_tile_start, lane,
-        )
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+        lane_group = lane // Int32(4)
+        lane_pair_base = Int32(2) * (lane % Int32(4))
 
         token_base = token_start
 
@@ -2219,39 +2035,198 @@ def _run_one_pass_sparse_mla_tile(
                 token_base + Int32(_MLA_TOKEN_TILE),
                 token_end,
             )
+            tile_tokens = tile_end - token_base
 
-            # Stage K/V for this tile into kv_stage_a
-            _pipeline_stage_kv_async(
-                kv_rows_u32, kv_scales, page_table_1,
-                sTokenIdx, sScale,
-                kv_base_addr,
-                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
-                q_idx, token_base, tile_end, num_kv, lane,
-            )
-            cute.arch.cp_async_wait_group(0)
+            # Stage token indices + scales
+            _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, tile_end, lane)
             cute.arch.sync_threads()
+            _stage_all_token_scales(kv_scales, sTokenIdx, sScale, num_kv, lane)
 
-            # Compute QK on current tile (reads q_stage + kv_stage_a)
+            # Per-group QK: double-buffered KV to overlap load with compute
             score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-            _qk_compute_from_staged_data(
-                score_frag,
-                q_base_addr,
-                kv_base_addr,
-                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
-                sScale,
-                sTokenIdx,
+            _zero_score_frag(score_frag)
+
+            # Group 0: load Q0 + KV0 into (q_group_stage, kv_stage_a)
+            _stage_q_u32_block_async(
+                q_u32,
+                q_idx,
                 head_tile_start,
-                tile_end - token_base,
-                sm_scale_log2,
-                num_heads,
+                Int32(0),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                q_base_addr,
+                lane,
+            )
+            _stage_kv_u32_block_async(
+                kv_rows_u32,
+                sTokenIdx,
+                Int32(_MLA_NOPE_U32_OFFSET),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                kv_base_addr,
                 num_kv,
                 lane,
             )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
 
-            # Softmax + O rescale + P norm + PV
+            # Group 0 compute + prefetch KV1 into kv_stage_b
+            frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
+            _zero_score_frag(frag_tmp)
+            _literal_qk_mma_into_sfrag_mxfp8_raw(
+                frag_tmp,
+                q_base_addr,
+                kv_base_addr,
+                lane,
+                Int32(0),
+                Int32(1),
+                Int32(_MLA_NUM_MMA_KV),
+                Int32(_MLA_NOPE_QK_NUM_MMA_D),
+                Int32(_MLA_NOPE_GROUP_Q_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+            )
+            _stage_kv_u32_block_async(
+                kv_rows_u32,
+                sTokenIdx,
+                Int32(_MLA_NOPE_U32_OFFSET) + Int32(_MLA_NOPE_GROUP_KV_U32),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                kv_stage_b_addr,
+                num_kv,
+                lane,
+            )
+            cute.arch.cp_async_commit_group()
+            _accumulate_scaled_score_frag(
+                score_frag, frag_tmp, sScale, Int32(0), lane,
+            )
+
+            # Groups 1-3: double-buffered (alternate kv_stage_a / kv_stage_b)
+            for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS - 1):
+                group_idx = Int32(block_offset + 1)
+                kv_compute_addr = kv_stage_b_addr if block_offset % 2 == 0 else kv_base_addr
+                kv_prefetch_addr = kv_base_addr if block_offset % 2 == 0 else kv_stage_b_addr
+
+                _stage_q_u32_block_async(
+                    q_u32,
+                    q_idx,
+                    head_tile_start,
+                    group_idx * Int32(_MLA_NOPE_GROUP_Q_U32),
+                    Int32(_MLA_NOPE_GROUP_Q_VECS),
+                    Int32(_MLA_NOPE_GROUP_Q_VECS),
+                    q_base_addr,
+                    lane,
+                )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+
+                frag_tmp = cute.make_rmem_tensor(frag_layout, Float32)
+                _zero_score_frag(frag_tmp)
+                _literal_qk_mma_into_sfrag_mxfp8_raw(
+                    frag_tmp,
+                    q_base_addr,
+                    kv_compute_addr,
+                    lane,
+                    Int32(0),
+                    Int32(1),
+                    Int32(_MLA_NUM_MMA_KV),
+                    Int32(_MLA_NOPE_QK_NUM_MMA_D),
+                    Int32(_MLA_NOPE_GROUP_Q_VECS),
+                    Int32(_MLA_NOPE_GROUP_KV_VECS),
+                )
+                if block_offset < _MLA_SCALE_GROUPS - 2:
+                    next_group_idx = group_idx + Int32(1)
+                    _stage_kv_u32_block_async(
+                        kv_rows_u32,
+                        sTokenIdx,
+                        Int32(_MLA_NOPE_U32_OFFSET) + next_group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+                        Int32(_MLA_NOPE_GROUP_KV_VECS),
+                        Int32(_MLA_NOPE_GROUP_KV_VECS),
+                        kv_prefetch_addr,
+                        num_kv,
+                        lane,
+                    )
+                    cute.arch.cp_async_commit_group()
+                _accumulate_scaled_score_frag(
+                    score_frag, frag_tmp, sScale, group_idx * Int32(_MLA_TOKEN_TILE), lane,
+                )
+
+            # Rope QK: co-stream Q rope + KV rope
+            _stage_q_u32_block_async(
+                q_u32,
+                q_idx,
+                head_tile_start,
+                Int32(_MLA_NOPE_DIM // 2),
+                Int32(_MLA_ROPE_VECS),
+                Int32(_MLA_ROPE_VECS),
+                q_base_addr,
+                lane,
+            )
+            _stage_kv_u32_block_async(
+                kv_rows_u32,
+                sTokenIdx,
+                Int32(_MLA_ROPE_U32_OFFSET),
+                Int32(_MLA_ROPE_VECS),
+                Int32(_MLA_ROPE_VECS),
+                kv_base_addr,
+                num_kv,
+                lane,
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+
+            frag_rope = cute.make_rmem_tensor(frag_layout, Float32)
+            _zero_score_frag(frag_rope)
+            _literal_qk_mma_into_sfrag_bf16(
+                frag_rope,
+                q_base_addr,
+                kv_base_addr,
+                lane,
+                Int32(0),
+                Int32(1),
+                Int32(_MLA_NUM_MMA_KV),
+                Int32(_MLA_QK_NUM_MMA_D),
+                Int32(_MLA_ROPE_VECS),
+                Int32(_MLA_ROPE_VECS),
+            )
+            for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+                for reg_id in cutlass.range_constexpr(8):
+                    score_frag[0, mma_kv, reg_id] = Float32(
+                        score_frag[0, mma_kv, reg_id] + frag_rope[0, mma_kv, reg_id]
+                    )
+
+            # Validity masking + sm_scale
+            for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+                for reg_id in cutlass.range_constexpr(8):
+                    row_slot = (reg_id % 4) // 2
+                    head_local = lane_group + Int32(8) * row_slot
+                    head_idx = head_tile_start + head_local
+                    token_local = (
+                        mma_kv * 16
+                        + lane_pair_base
+                        + Int32(8) * (reg_id // 4)
+                        + Int32(reg_id % 2)
+                    )
+                    token_idx = Int32(sTokenIdx[token_local])
+                    valid = token_local < tile_tokens
+                    if valid:
+                        valid = valid and token_idx >= Int32(0)
+                    if valid:
+                        valid = valid and token_idx < num_kv
+                    if valid:
+                        valid = valid and head_idx < num_heads
+                    score_frag[0, mma_kv, reg_id] = (
+                        Float32(score_frag[0, mma_kv, reg_id] * sm_scale_log2)
+                        if valid
+                        else Float32(-Float32.inf)
+                    )
+            cute.arch.sync_threads()
+
+            # Softmax + O rescale + P norm
             _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
 
-            # Rescale O accumulator: O *= exp2(m_prev - m_new) for each row_slot
             for row_slot in cutlass.range_constexpr(2):
                 rs = Float32(o_rescale_frag[0, row_slot])
                 for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
@@ -2275,10 +2250,98 @@ def _run_one_pass_sparse_mla_tile(
 
             p_frag = cute.make_rmem_tensor(p_layout, Uint32)
             _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
-            _accumulate_pv_groups_from_p_frag_staged(
-                o_frag0, o_frag1, o_frag2, o_frag3,
-                p_frag, sScale, kv_base_addr, lane,
+
+            # Per-group PV: double-buffered — overlap next group KV load with current group compute
+            # Initial: load group 0 into stage_a
+            _stage_kv_u32_block_async(
+                kv_rows_u32,
+                sTokenIdx,
+                Int32(_MLA_NOPE_U32_OFFSET),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                kv_base_addr,
+                num_kv,
+                lane,
             )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+
+            # Compute group 0 from stage_a + issue group 1 load into stage_b
+            _stage_kv_u32_block_async(
+                kv_rows_u32,
+                sTokenIdx,
+                Int32(_MLA_NOPE_U32_OFFSET) + Int32(_MLA_NOPE_GROUP_KV_U32),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                Int32(_MLA_NOPE_GROUP_KV_VECS),
+                kv_stage_b_addr,
+                num_kv,
+                lane,
+            )
+            cute.arch.cp_async_commit_group()
+            scale_base = Int32(0)
+            tile_output_scale = _warp_allreduce_max(Float32(sScale[scale_base + lane]))
+            tile_pv_scale = (
+                Float32(0.0)
+                if tile_output_scale == Float32(0.0)
+                else cute.arch.rcp_approx(tile_output_scale)
+            )
+            _run_staged_pv_group_into_target(
+                o_frag0, p_frag, sScale, kv_base_addr, scale_base, tile_pv_scale, lane,
+            )
+            cute.arch.sync_threads()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+
+            # Groups 1-2: double-buffered (stage_b → stage_a → stage_b)
+            for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS - 2):
+                group_idx = Int32(block_offset + 1)
+                # Alternate stages: block_offset 0→stage_b(compute)+prefetch stage_a, 1→stage_a(compute)+prefetch stage_b
+                compute_addr = kv_stage_b_addr if block_offset % 2 == 0 else kv_base_addr
+                prefetch_addr = kv_base_addr if block_offset % 2 == 0 else kv_stage_b_addr
+
+                # Issue next group load into the opposite stage
+                next_group_idx = group_idx + Int32(1)
+                _stage_kv_u32_block_async(
+                    kv_rows_u32,
+                    sTokenIdx,
+                    Int32(_MLA_NOPE_U32_OFFSET) + next_group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+                    Int32(_MLA_NOPE_GROUP_KV_VECS),
+                    Int32(_MLA_NOPE_GROUP_KV_VECS),
+                    prefetch_addr,
+                    num_kv,
+                    lane,
+                )
+                cute.arch.cp_async_commit_group()
+
+                scale_base = group_idx * Int32(_MLA_TOKEN_TILE)
+                tile_output_scale = _warp_allreduce_max(Float32(sScale[scale_base + lane]))
+                tile_pv_scale = (
+                    Float32(0.0)
+                    if tile_output_scale == Float32(0.0)
+                    else cute.arch.rcp_approx(tile_output_scale)
+                )
+                _run_staged_pv_group_into_target(
+                    o_frag1 if block_offset == 0 else o_frag2,
+                    p_frag, sScale, compute_addr, scale_base, tile_pv_scale, lane,
+                )
+                cute.arch.sync_threads()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+
+            # Group 3: compute from last used stage (no prefetch needed)
+            last_compute_addr = kv_stage_b_addr if (_MLA_SCALE_GROUPS - 2) % 2 == 0 else kv_base_addr
+            scale_base = Int32(3) * Int32(_MLA_TOKEN_TILE)
+            tile_output_scale = _warp_allreduce_max(Float32(sScale[scale_base + lane]))
+            tile_pv_scale = (
+                Float32(0.0)
+                if tile_output_scale == Float32(0.0)
+                else cute.arch.rcp_approx(tile_output_scale)
+            )
+            _run_staged_pv_group_into_target(
+                o_frag3, p_frag, sScale, last_compute_addr, scale_base, tile_pv_scale, lane,
+            )
+            cute.arch.sync_threads()
 
             token_base = tile_end
     if cutlass.const_expr(lse_tensor is None):
@@ -2321,11 +2384,15 @@ def get_sparse_mla_shared_storage_cls():
         pass
 
     SharedStorage.__annotations__ = {
-        "q_stage": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(_MLA_Q_STAGE_BYTES)],
+        "q_group_stage": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(_MLA_Q_GROUP_STAGE_BYTES)],
             128,
         ],
         "kv_stage_a": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
+            128,
+        ],
+        "kv_stage_b": cute.struct.Align[
             cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
             128,
         ],
@@ -2396,8 +2463,9 @@ class SparseMLAKernel:
         sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
         sScale = storage.token_scale_a.get_tensor(
             cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,)))
-        q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
+        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
         kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+        kv_stage_b_addr = shared_ptr_to_u32(storage.kv_stage_b.data_ptr())
 
         _run_one_pass_sparse_mla_tile(
             q_u32,
@@ -2408,6 +2476,7 @@ class SparseMLAKernel:
             sScale,
             q_base_addr,
             kv_base_addr,
+            kv_stage_b_addr,
             q_idx,
             head_tile_start,
             Int32(0),

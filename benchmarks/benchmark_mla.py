@@ -35,6 +35,12 @@ from b12x.integration.mla import (
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
+from b12x.attention.nsa_indexer.extend_kernel import (
+    _PREFILL512_BLOCK_K,
+    _PREFILL512_BLOCK_Q,
+    _PREFILL_BLOCK_Q,
+)
+from b12x.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
 from b12x.integration.nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
@@ -44,6 +50,7 @@ from b12x.integration.nsa_indexer import (
     resolve_sparse_nsa_extend_prefill_block_k,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    sparse_nsa_index_extend_tiled_topk,
     uses_paged_mqa_schedule_metadata,
 )
 
@@ -189,6 +196,7 @@ class CaseReport:
     chunk_size: int = 0
     num_chunks: int = 0
     indexer_logits_fill: bool = True
+    indexer_tiled_topk: bool = False
     indexer_prefill_block_k: int | None = None
     mla_sanity: SanityMetrics = field(
         default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
@@ -1154,6 +1162,7 @@ def _run_prefill_or_verify_case(
     graph_width: int,
     l2_flush,
     skip_indexer_logits_fill: bool,
+    use_tiled_topk: bool,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -1371,19 +1380,76 @@ def _run_prefill_or_verify_case(
         )
         preinitialize_indexer_logits = not skip_indexer_logits_fill
 
+        _prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=case.total_q,
+            k_rows=int(extend_kv_fp8[0].shape[0]),
+            num_heads=cfg.index_n_heads,
+        )
+        _use_tiled_output = use_tiled_topk
+        if _use_tiled_output and _prefill_block_k is None:
+            raise BenchmarkFailure(case, "tiled topk requires the prefill indexer path")
+        _block_q = _PREFILL512_BLOCK_Q if _prefill_block_k == _PREFILL512_BLOCK_K else _PREFILL_BLOCK_Q
+
+        _tiled_tile_logits = [None]  # mutable holder for the tiled output
+        if _use_tiled_output:
+            num_q_tiles = (case.total_q + _block_q - 1) // _block_q
+            num_k_tiles = (int(extend_kv_fp8[0].shape[0]) + _prefill_block_k - 1) // _prefill_block_k
+            tile_size = _block_q * _prefill_block_k
+            _tiled_tile_logits[0] = torch.empty(
+                (num_q_tiles * num_k_tiles * tile_size,),
+                dtype=torch.float32,
+                device=device,
+            )
+
         def run_indexer_logits():
-            return sparse_nsa_index_extend_logits(
+            result = sparse_nsa_index_extend_logits(
                 q_fp8=q_fp8,
                 weights=weights,
                 kv_fp8=extend_kv_fp8,
                 metadata=extend_indexer_metadata,
                 preinitialize_invalid_logits=preinitialize_indexer_logits,
+                tile_logits=_tiled_tile_logits[0] if _use_tiled_output else None,
             )
+            if _use_tiled_output:
+                _tiled_tile_logits[0] = result
+            return result
+
+        def _run_tiled_topk(tile_logits_result=None):
+            tl = tile_logits_result if tile_logits_result is not None else _tiled_tile_logits[0]
+            topk_val = min(case.topk, case.cache_len)
+            _, topk_indices = run_tiled_supertile_topk(
+                tile_logits=tl,
+                k_start=graph_extend_k_start,
+                k_end=graph_extend_k_start + graph_extend_lengths,
+                topk=topk_val,
+                block_q=_block_q,
+                block_k=_prefill_block_k,
+            )
+            return topk_indices
+
+        def run_indexer_topk():
+            if _use_tiled_output:
+                return _run_tiled_topk(logits_for_topk)
+            else:
+                return _select_ragged_topk_from_logits(
+                    logits=logits_for_topk,
+                    k_start=graph_extend_k_start,
+                    lengths=graph_extend_lengths,
+                    topk=case.topk,
+                )
 
         def run_indexer():
-            logits = run_indexer_logits()
+            if _use_tiled_output:
+                return sparse_nsa_index_extend_tiled_topk(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    kv_fp8=extend_kv_fp8,
+                    metadata=extend_indexer_metadata,
+                    topk=case.topk,
+                )
+            result = run_indexer_logits()
             return _select_ragged_topk_from_logits(
-                logits=logits,
+                logits=result,
                 k_start=graph_extend_k_start,
                 lengths=graph_extend_lengths,
                 topk=case.topk,
@@ -1392,7 +1458,8 @@ def _run_prefill_or_verify_case(
         clear_nsa_indexer_caches()
         actual_topk = run_indexer()
         logits_for_topk = run_indexer_logits()
-        if skip_indexer_logits_fill:
+        if skip_indexer_logits_fill and not _use_tiled_output:
+            # In tiled mode, there's no -inf scatter matrix to validate
             torch.cuda.synchronize()
             sample_rows = sorted({0, logits_for_topk.shape[0] // 2, logits_for_topk.shape[0] - 1})
             for sample_row in sample_rows:
@@ -1561,6 +1628,9 @@ def _run_prefill_or_verify_case(
                 cu_seqlens_q=cu_seqlens_q,
                 query_row_to_batch=query_row_to_batch,
             )
+    elif _use_tiled_output:
+        def run_indexer_topk():
+            return _run_tiled_topk()
     else:
         def run_indexer_topk():
             return _select_ragged_topk_from_logits(
@@ -1699,6 +1769,7 @@ def _run_prefill_or_verify_case(
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
         indexer_logits_fill=True if case.mode == "verify" else not skip_indexer_logits_fill,
+        indexer_tiled_topk=_use_tiled_output if case.mode == "prefill" else False,
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
     )
@@ -1751,6 +1822,7 @@ def collect_case_reports(
                 graph_width=args.graph_width,
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
+                use_tiled_topk=args.use_tiled_topk,
             )
         )
         case_seed += 17
@@ -1760,6 +1832,7 @@ def collect_case_reports(
 def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
     fill_flag = "fill" if report.indexer_logits_fill else "skipfill"
+    topk_path = "tiled" if report.indexer_tiled_topk else "scatter"
     if report.indexer_prefill_block_k is not None:
         idx_bk = str(report.indexer_prefill_block_k)
     else:
@@ -1785,7 +1858,8 @@ def _render_case_line(report: CaseReport) -> str:
         f"mla_fwd={report.mla_forward_us:8.2f} us | "
         f"mla_merge={report.mla_merge_us:8.2f} us | "
         f"idx_bk={idx_bk} "
-        f"idx_init={fill_flag}"
+        f"idx_init={fill_flag} "
+        f"idx_topk_path={topk_path}"
     )
 
 
@@ -1892,6 +1966,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         dest="skip_indexer_logits_fill",
         help="preserve the legacy prefill NSA logits -inf initialization.",
+    )
+    parser.add_argument(
+        "--use-tiled-topk",
+        action="store_true",
+        help="benchmark prefill with tiled indexer output consumed directly by the CuTe topk kernel.",
     )
     parser.add_argument(
         "--nsa-prefill-block-k",

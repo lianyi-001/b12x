@@ -229,6 +229,7 @@ def _run_sparse_mla(
         active_token_counts=active_token_counts,
         output_dtype=q_all.dtype,
         v_head_dim=v_head_dim,
+        max_chunks=workspace.max_chunks_per_row,
     )
     if (
         force_split
@@ -254,10 +255,14 @@ def _run_sparse_mla(
                     forced_width,
                     max(0, int(active_token_counts.max().item())),
                 )
-        split_cfg = forced_sparse_mla_split_decode_config_for_width(forced_width)
+        split_cfg = forced_sparse_mla_split_decode_config_for_width(
+            forced_width,
+            max_chunks=workspace.max_chunks_per_row,
+        )
     if graph_stable_split and split_cfg is not None:
         split_cfg = forced_sparse_mla_split_decode_config_for_width(
-            int(selected_indices.shape[1])
+            int(selected_indices.shape[1]),
+            max_chunks=workspace.max_chunks_per_row,
         )
     split_cfg = _apply_mla_prefill_strategy(
         split_cfg=split_cfg,
