@@ -630,6 +630,109 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
+def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int32:
+    """Shared-memory int32 atomic add (CTA-scope). Returns old value.
+
+    Uses ``atom.shared.add.s32`` with a 32-bit shared-memory address
+    (the native address width for smem on NVIDIA GPUs).
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.shared.add.s32 $0, [$1], $2;",
+            "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def red_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None):
+    """No-return shared-memory int32 add.
+
+    Use this when the old value is not needed. NVCC lowers equivalent C++
+    histogram increments to cheaper no-return shared atomics.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.shared.add.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_shared_i32(addr: Int32, *, loc=None, ip=None) -> Int32:
+    """Volatile-style load int32 from shared memory at a 32-bit byte address."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.s32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_shared_i32_relaxed(addr: Int32, *, loc=None, ip=None) -> Int32:
+    """Load int32 from shared memory when ordinary scheduling/CSE is safe."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.s32 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None):
+    """Store int32 to shared memory at a 32-bit byte address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.s32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
     """Store int32 to global memory."""
     llvm.inline_asm(

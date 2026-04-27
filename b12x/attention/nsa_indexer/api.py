@@ -16,6 +16,10 @@ from .kernel import (
     supports_sparse_nsa_paged_logits_kernel,
 )
 from .extend_kernel import (
+    _PREFILL512_BLOCK_K,
+    _PREFILL512_BLOCK_Q,
+    _PREFILL_BLOCK_K,
+    _PREFILL_BLOCK_Q,
     resolve_sparse_nsa_extend_prefill_block_k,
     run_sparse_nsa_extend_logits_kernel,
     supports_sparse_nsa_extend_logits_kernel,
@@ -24,6 +28,12 @@ from .reference import sparse_nsa_extend_logits_reference, sparse_nsa_paged_logi
 from .schedule_metadata import (
     build_paged_mqa_schedule_metadata_torch,
     build_paged_mqa_schedule_metadata_triton,
+)
+from .tiled_topk import (
+    _resolve_supertile_k,
+    clear_tiled_topk_kernel_cache,
+    merge_tiled_topk_candidates,
+    run_tiled_topk,
 )
 
 
@@ -135,6 +145,7 @@ def get_paged_mqa_logits_metadata(
 def clear_nsa_indexer_caches() -> None:
     """Clear any cached NSA indexer runtime state."""
     clear_sparse_nsa_indexer_kernel_cache()
+    clear_tiled_topk_kernel_cache()
     _cached_width_cap_tensor.cache_clear()
 
 
@@ -439,6 +450,7 @@ def sparse_nsa_index_extend_logits(
     contract_phantoms: dict[str, torch.Tensor] | None = None,
     workspace=None,
     preinitialize_invalid_logits: bool = True,
+    tile_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_start = metadata.k_start
     k_end = metadata.k_end
@@ -468,7 +480,7 @@ def sparse_nsa_index_extend_logits(
         k_start=k_start,
         k_end=k_end,
     ):
-        return run_sparse_nsa_extend_logits_kernel(
+        result = run_sparse_nsa_extend_logits_kernel(
             q_fp8=q_fp8,
             weights=weights_f,
             k_quant=k_quant,
@@ -478,7 +490,9 @@ def sparse_nsa_index_extend_logits(
             contract_phantoms=contract_phantoms,
             workspace=workspace,
             preinitialize_invalid_logits=preinitialize_invalid_logits,
+            tile_logits=tile_logits,
         )
+        return result
 
     return sparse_nsa_extend_logits_reference(
         q_fp8=q_fp8,
@@ -487,3 +501,202 @@ def sparse_nsa_index_extend_logits(
         k_start=k_start,
         k_end=k_end,
     )
+
+
+def sparse_nsa_index_extend_tiled_topk(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    metadata: NSAIndexerExtendLogitsMetadata,
+    topk: int,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
+    tile_logits: torch.Tensor | None = None,
+    lengths: torch.Tensor | None = None,
+    output_values: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+    candidate_values: torch.Tensor | None = None,
+    candidate_indices: torch.Tensor | None = None,
+    supertile_k: int | None = None,
+) -> torch.Tensor:
+    """Run the prefill NSA scorer in K-supertiles and consume each tile with tiled topk."""
+
+    k_start = metadata.k_start
+    k_end = metadata.k_end
+    if q_fp8.ndim != 3:
+        raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
+    if k_start.ndim != 1 or k_end.ndim != 1 or k_start.shape != k_end.shape:
+        raise ValueError("tiled topk requires matching rank-1 k_start and k_end tensors")
+    weights_f = _normalize_weights(weights, q_rows=q_fp8.shape[0], num_heads=q_fp8.shape[1])
+    k_quant, k_scale = kv_fp8
+    if not supports_sparse_nsa_extend_logits_kernel(
+        q_fp8=q_fp8,
+        weights=weights_f,
+        k_quant=k_quant,
+        k_scale=k_scale,
+        k_start=k_start,
+        k_end=k_end,
+    ):
+        raise ValueError("tiled topk requires the CUDA sparse NSA extend logits kernel")
+    prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+        valid_q_rows=int(k_start.shape[0]),
+        k_rows=int(k_quant.shape[0]),
+        num_heads=int(q_fp8.shape[1]),
+    )
+    if prefill_block_k is None:
+        # This API explicitly requests tiled logits for immediate tiled top-k.
+        # The decode scorer does not produce that layout, so force the standard
+        # prefill scorer for small q batches instead of failing.
+        prefill_block_k = _PREFILL_BLOCK_K
+    block_q = _PREFILL512_BLOCK_Q if prefill_block_k == _PREFILL512_BLOCK_K else _PREFILL_BLOCK_Q
+
+    num_q_rows = int(k_start.shape[0])
+    num_q_tiles = (num_q_rows + block_q - 1) // block_q
+    num_k_tiles = (int(k_quant.shape[0]) + prefill_block_k - 1) // prefill_block_k
+    tile_size = block_q * prefill_block_k
+    resolved_supertile_k = _resolve_supertile_k(supertile_k, block_k=prefill_block_k)
+    supertile_tiles = max(1, resolved_supertile_k // prefill_block_k)
+    num_chunks = (num_k_tiles + supertile_tiles - 1) // supertile_tiles
+    max_chunk_tiles = min(supertile_tiles, num_k_tiles)
+    chunk_tile_elements = num_q_tiles * max_chunk_tiles * tile_size
+    if tile_logits is None:
+        tile_logits = torch.empty(
+            (chunk_tile_elements,),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    elif int(tile_logits.numel()) < chunk_tile_elements:
+        raise ValueError(
+            f"tile_logits has {int(tile_logits.numel())} elements, expected at least "
+            f"{chunk_tile_elements} for the largest K-supertile"
+        )
+
+    if lengths is None:
+        global_lengths = (k_end - k_start).contiguous()
+    else:
+        if lengths.ndim != 1 or lengths.shape[0] < num_q_rows:
+            raise ValueError(
+                f"lengths must have shape at least ({num_q_rows},), got {tuple(lengths.shape)}"
+            )
+        if lengths.dtype != torch.int32:
+            raise ValueError(f"lengths must have dtype torch.int32, got {lengths.dtype}")
+        if lengths.device != q_fp8.device:
+            raise ValueError(f"lengths device {lengths.device} does not match q_fp8 device {q_fp8.device}")
+        if not lengths.is_contiguous():
+            raise ValueError("lengths must be contiguous")
+        global_lengths = lengths[:num_q_rows]
+        torch.sub(k_end, k_start, out=global_lengths)
+    if num_chunks <= 1:
+        run_sparse_nsa_extend_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            k_quant=k_quant,
+            k_scale=k_scale,
+            k_start=k_start,
+            k_end=k_end,
+            contract_phantoms=contract_phantoms,
+            workspace=workspace,
+            preinitialize_invalid_logits=True,
+            tile_logits=tile_logits,
+            tile_k_offset=0,
+            tile_num_k_tiles=num_k_tiles,
+        )
+        _, topk_indices = run_tiled_topk(
+            tile_logits=tile_logits,
+            k_start=k_start,
+            lengths=global_lengths,
+            topk=topk,
+            block_q=block_q,
+            block_k=prefill_block_k,
+            output_values=output_values,
+            output_indices=output_indices,
+            num_k_tiles=num_k_tiles,
+        )
+        return topk_indices
+
+    if (candidate_values is None) != (candidate_indices is None):
+        raise ValueError("candidate_values and candidate_indices must be provided together")
+    if candidate_values is None:
+        candidate_values = torch.empty(
+            (num_chunks, num_q_rows, topk),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+        candidate_indices = torch.empty(
+            (num_chunks, num_q_rows, topk),
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+    else:
+        assert candidate_indices is not None
+        if candidate_values.ndim != 3 or candidate_indices.ndim != 3:
+            raise ValueError(
+                "candidate buffers must have shape at least "
+                f"({num_chunks}, {num_q_rows}, {topk})"
+            )
+        if candidate_values.shape[0] < num_chunks or candidate_values.shape[1] < num_q_rows:
+            raise ValueError(
+                "candidate_values shape "
+                f"{tuple(candidate_values.shape)} is smaller than required "
+                f"({num_chunks}, {num_q_rows}, {topk})"
+            )
+        if candidate_indices.shape[0] < num_chunks or candidate_indices.shape[1] < num_q_rows:
+            raise ValueError(
+                "candidate_indices shape "
+                f"{tuple(candidate_indices.shape)} is smaller than required "
+                f"({num_chunks}, {num_q_rows}, {topk})"
+            )
+        if candidate_values.shape[2] != topk or candidate_indices.shape[2] != topk:
+            raise ValueError(
+                "candidate buffer top-k dimension must match requested topk "
+                f"{topk}, got {candidate_values.shape[2]} and {candidate_indices.shape[2]}"
+            )
+        if candidate_values.dtype != torch.float32:
+            raise ValueError(f"candidate_values must have dtype torch.float32, got {candidate_values.dtype}")
+        if candidate_indices.dtype != torch.int32:
+            raise ValueError(f"candidate_indices must have dtype torch.int32, got {candidate_indices.dtype}")
+        if candidate_values.device != q_fp8.device or candidate_indices.device != q_fp8.device:
+            raise ValueError("candidate buffer devices must match q_fp8")
+        candidate_values = candidate_values[:num_chunks, :num_q_rows, :]
+        candidate_indices = candidate_indices[:num_chunks, :num_q_rows, :]
+    for chunk_idx in range(num_chunks):
+        chunk_tile_begin = chunk_idx * supertile_tiles
+        chunk_tile_end = min(chunk_tile_begin + supertile_tiles, num_k_tiles)
+        chunk_tiles = chunk_tile_end - chunk_tile_begin
+        chunk_start = chunk_tile_begin * prefill_block_k
+        chunk_rows = chunk_tiles * prefill_block_k
+        run_sparse_nsa_extend_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            k_quant=k_quant,
+            k_scale=k_scale,
+            k_start=k_start,
+            k_end=k_end,
+            contract_phantoms=contract_phantoms,
+            workspace=workspace,
+            preinitialize_invalid_logits=True,
+            tile_logits=tile_logits,
+            tile_k_offset=chunk_tile_begin,
+            tile_num_k_tiles=chunk_tiles,
+        )
+        run_tiled_topk(
+            tile_logits=tile_logits,
+            k_start=k_start,
+            lengths=global_lengths,
+            topk=topk,
+            block_q=block_q,
+            block_k=prefill_block_k,
+            output_values=candidate_values[chunk_idx],
+            output_indices=candidate_indices[chunk_idx],
+            num_k_tiles=chunk_tiles,
+            input_index_offset=chunk_start,
+            input_extent=chunk_rows,
+            output_index_offset=chunk_start,
+        )
+    _, topk_indices = merge_tiled_topk_candidates(
+        candidate_values=candidate_values,
+        candidate_indices=candidate_indices,
+        topk=topk,
+    )
+    return topk_indices

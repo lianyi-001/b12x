@@ -20,6 +20,7 @@ from b12x.integration.nsa_indexer import (
     resolve_sparse_nsa_extend_prefill_block_k,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    sparse_nsa_index_extend_tiled_topk,
     uses_paged_mqa_schedule_metadata,
 )
 
@@ -706,6 +707,50 @@ def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_dense_long_pr
     _assert_logits_close(actual, expected)
     # No position should have silently fallen back to -inf.
     assert torch.isfinite(actual).all(), "kernel left finite positions as -inf"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage")
+def test_sparse_nsa_index_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "3072")
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_620)
+
+    q_rows = 256
+    num_heads = 8
+    k_rows = 4096
+    topk = 2048
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
+    metadata = NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end)
+
+    actual = sparse_nsa_index_extend_tiled_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        topk=topk,
+    )
+    logits = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        preinitialize_invalid_logits=False,
+    )
+    expected = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(torch.int32)
+
+    torch.cuda.synchronize(device)
+    assert actual.shape == (q_rows, topk)
+    assert torch.equal(torch.sort(actual, dim=1).values, torch.sort(expected, dim=1).values)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for BK512 prefill coverage")

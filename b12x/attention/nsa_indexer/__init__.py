@@ -7,6 +7,7 @@ from .api import (
     resolve_sparse_nsa_extend_prefill_block_k,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    sparse_nsa_index_extend_tiled_topk,
     uses_paged_mqa_schedule_metadata,
 )
 from .reference import (
@@ -27,6 +28,7 @@ __all__ = [
     "sparse_nsa_extend_logits_reference",
     "sparse_nsa_index_decode_logits_paged",
     "sparse_nsa_index_extend_logits",
+    "sparse_nsa_index_extend_tiled_topk",
     "sparse_nsa_paged_logits_reference",
     "unpack_nsa_index_k_cache_reference",
     "uses_paged_mqa_schedule_metadata",
