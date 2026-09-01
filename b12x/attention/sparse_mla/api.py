@@ -35,6 +35,7 @@ from .pooled_selection import expand_pooled_topk_to_physical_slots
 from ._scratch import (
     B12XSparseMLABinding as _RuntimeBinding,
 )
+from .physical_selection import expand_pooled_topk_to_physical_slots
 from ._policy import SparseMlaConfig, SparseMlaQuery
 from ._scratch import (
     B12XSparseMLAScratch as Scratch,
