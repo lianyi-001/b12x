@@ -792,6 +792,8 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
     assert sparse_mla.ModelType.GLM_NEXT == ModelType.GLM_NEXT
     assert callable(sparse_mla.compile_glm_next_mla_cache_writer)
     assert callable(sparse_mla.concat_and_cache_glm_next_mla)
+    assert callable(sparse_mla.concat_and_cache_glm_next_mla_fp8)
+    assert callable(sparse_mla.concat_and_cache_glm_next_mla_nvfp4)
     with pytest.raises(TypeError, match="binding must be sparse_mla.Binding"):
         sparse_mla.run(binding.runtime)
 
