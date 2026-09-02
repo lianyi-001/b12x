@@ -69,7 +69,11 @@ FP8 KV cache, B12X attention/MoE/linear kernels, and identical source and launch
 arguments in both arms. The control disabled this collective with
 `VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE=0`; the candidate enabled it through
 768 KiB. Each concurrency cell used a 15-second warmup followed by three
-30-second samples. `C8` and `C12` mean 8 and 12 concurrent requests.
+30-second samples. The matched enabled-versus-disabled comparison covers 8 and
+12 concurrent requests (`C8` and `C12`). The enabled arm also measured one and
+24 concurrent requests (`C1` and `C24`) to exercise its supported dispatch
+shapes; no disabled-arm samples were retained for those two cells, so they are
+not performance comparisons.
 
 The qualification host used these GPU identities:
 
@@ -120,10 +124,15 @@ Each sample used this command, with a distinct output path:
 ```bash
 ARM=enabled  # use disabled for the NCCL control
 N=1          # use 1, 2, and 3 for the three recorded samples
+if [[ "$ARM" == enabled ]]; then
+  CONCURRENCY=1,8,12,24
+else
+  CONCURRENCY=8,12
+fi
 mkdir -p "$ARM"
 python /root/llm_decode_bench.py \
   --host 127.0.0.1 --port 5051 --model GLM-5.3-Flash \
-  --contexts 0 --concurrency 1,8,12,24 \
+  --contexts 0 --concurrency "$CONCURRENCY" \
   --duration 30 --decode-warmup-seconds 15 \
   --max-tokens 8192 --temperature 0 --skip-prefill \
   --display-mode plain --no-resume --output "$ARM/decode-run-$N.json"
@@ -147,6 +156,14 @@ the intended NCCL or PCIe two-shot route at the declared boundary.
 | Disabled | 12 | 865.016, 897.032, 900.058 | 341.857, 338.963, 342.022 | 897.032 | 341.857 |
 | Enabled | 12 | 906.205, 909.330, 896.085 | 350.595, 351.172, 348.355 | 906.205 | 350.595 |
 
+The enabled-arm shape and capacity samples excluded from the matched A/B
+calculation were:
+
+| Arm | Concurrency | Output tok/s samples | Verifier steps/s samples | Median output tok/s | Median verifier steps/s |
+|:--|--:|:--|:--|--:|--:|
+| Enabled | 1 | 246.317, 208.170, 219.334 | 85.739, 86.877, 86.634 | 219.334 | 86.634 |
+| Enabled | 24 | 1259.033, 1245.146, 1269.194 | 476.939, 478.546, 477.249 | 1259.033 | 477.249 |
+
 The enabled-minus-disabled median change, calculated as
 `(enabled / disabled - 1) * 100`, was:
 
@@ -154,5 +171,7 @@ The enabled-minus-disabled median change, calculated as
 - C12: **+1.02% output tok/s** and **+2.56% verifier steps/s**.
 
 The conclusion is limited to the declared four-GPU SM120 topology and tensor
-sizes selected by the vLLM integration. Other GPU architectures, world sizes,
-and message sizes are not qualified by this report.
+sizes selected by the vLLM integration. The performance-gain conclusion is
+limited further to the matched C8 and C12 cells. Other GPU architectures,
+world sizes, message sizes, and unmatched concurrency cells are not qualified
+as performance comparisons by this report.
