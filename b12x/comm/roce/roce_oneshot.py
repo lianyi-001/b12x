@@ -11,7 +11,9 @@ Runtime constraints:
 * one all-reduce in flight per runtime (single channel, one stream);
 * all-reduce messages up to ``max_size`` bytes and all-gather shards up to
   ``max_gather_bytes``, both multiples of 16 bytes;
-* every rank of the exchange group must construct the runtime collectively.
+* every rank of the exchange group must construct the runtime collectively;
+* every peer payload is striped across all configured HCAs, with a completion
+  flag per stripe so the GPU consumes the slot only after every HCA delivered.
 """
 
 from __future__ import annotations
@@ -82,7 +84,9 @@ def _env_int(*names: str, default: int) -> int:
 def default_gid_index() -> int:
     """``B12X_ROCE_GID_INDEX``, else NCCL's ``NCCL_IB_GID_INDEX``, else 3."""
 
-    return _env_int("B12X_ROCE_GID_INDEX", "NCCL_IB_GID_INDEX", default=DEFAULT_GID_INDEX)
+    return _env_int(
+        "B12X_ROCE_GID_INDEX", "NCCL_IB_GID_INDEX", default=DEFAULT_GID_INDEX
+    )
 
 
 def discover_hcas(gid_index: Optional[int] = None) -> tuple[str, ...]:
@@ -121,7 +125,9 @@ def is_supported(device: torch.device | int | str | None = None) -> bool:
 
     if not torch.cuda.is_available():
         return False
-    index = torch.cuda.current_device() if device is None else torch.device(device).index
+    index = (
+        torch.cuda.current_device() if device is None else torch.device(device).index
+    )
     props = torch.cuda.get_device_properties(index if index is not None else 0)
     if not getattr(props, "is_integrated", False):
         return False
@@ -226,7 +232,9 @@ class RoceOneshotAllReduce:
             raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
         self.hca_names = names[:2]
 
-        slot_bytes = _align_up(max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT)
+        slot_bytes = _align_up(
+            max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT
+        )
         self._layout = Layout(self.world_size, slot_bytes)
         self._slot_bytes = slot_bytes
 
@@ -249,9 +257,10 @@ class RoceOneshotAllReduce:
         self._send_base = host_ptr + self._layout.send_off
         self._ctrl_base = host_ptr + self._layout.ctrl_off
         # ctrl record (kernel-written): seq, nbytes, error seq, missing peer,
-        # nbytes per slot (the proxy uses these when it has to catch up)
+        # nbytes per slot (the proxy uses these when it has to catch up), and
+        # the missing HCA index for timeout diagnostics.
         self._ctrl_words = self._region[
-            self._layout.ctrl_off : self._layout.ctrl_off + 24
+            self._layout.ctrl_off : self._layout.ctrl_off + 28
         ].view(torch.int32)
         self._error_word = self._ctrl_words[2:3]
         # numpy view of the control words: reading it costs nanoseconds, so the
@@ -278,7 +287,9 @@ class RoceOneshotAllReduce:
         # ranks must agree exactly, and all of them see the same verdict.
         config = {
             "api_version": API_VERSION,
-            "proxy_abi": _load_proxy_library().roce_abi_version() if error is None else None,
+            "proxy_abi": _load_proxy_library().roce_abi_version()
+            if error is None
+            else None,
             "world_size": self.world_size,
             "hca_count": len(self.hca_names),
             "slot_bytes": slot_bytes,
@@ -291,13 +302,21 @@ class RoceOneshotAllReduce:
             "blocks": self._blocks,
         }
         statuses = _exchange((error, blob, config), exchange_group)
-        failures = [f"rank {i}: {s[0]}" for i, s in enumerate(statuses) if s[0] is not None]
+        failures = [
+            f"rank {i}: {s[0]}" for i, s in enumerate(statuses) if s[0] is not None
+        ]
         if not failures:
             reference = statuses[0][2]
             for i, s in enumerate(statuses):
-                differing = {k: (reference[k], s[2].get(k)) for k in reference if s[2].get(k) != reference[k]}
+                differing = {
+                    k: (reference[k], s[2].get(k))
+                    for k in reference
+                    if s[2].get(k) != reference[k]
+                }
                 if differing:
-                    failures.append(f"rank {i} configuration differs from rank 0: {differing}")
+                    failures.append(
+                        f"rank {i} configuration differs from rank 0: {differing}"
+                    )
         if failures:
             self.close()
             raise RuntimeError("RoCE all-reduce setup failed: " + "; ".join(failures))
@@ -410,6 +429,7 @@ class RoceOneshotAllReduce:
             self._threads,
             self._layout.slots,
             self._layout.flag_stride,
+            len(self.hca_names),
             self.device.index,
         )
 
@@ -421,11 +441,15 @@ class RoceOneshotAllReduce:
             self._threads,
             self._layout.slots,
             self._layout.flag_stride,
+            len(self.hca_names),
             self.device.index,
         )
 
     def prepare(
-        self, dtypes: Sequence[torch.dtype] = (torch.bfloat16,), *, padded_gather: bool = False
+        self,
+        dtypes: Sequence[torch.dtype] = (torch.bfloat16,),
+        *,
+        padded_gather: bool = False,
     ) -> None:
         """Compile the launchers for ``dtypes`` and allocate scratch ahead of capture.
 
@@ -444,7 +468,9 @@ class RoceOneshotAllReduce:
             if padded_gather:
                 self._gather_scratch(PACK_BYTES)
 
-    def prepare_graph_all_reduce(self, inp: torch.Tensor, *, stream: object = None) -> None:
+    def prepare_graph_all_reduce(
+        self, inp: torch.Tensor, *, stream: object = None
+    ) -> None:
         """Compile the launcher for ``inp.dtype`` ahead of CUDA graph capture."""
         self.prepare((inp.dtype,))
 
@@ -477,17 +503,23 @@ class RoceOneshotAllReduce:
         with self._lock:
             self.check_health()
             if not self.should_allreduce(inp):
-                raise ValueError("input is not eligible for the RoCE one-shot all-reduce")
+                raise ValueError(
+                    "input is not eligible for the RoCE one-shot all-reduce"
+                )
             if out is not None and (
                 out.shape != inp.shape
                 or out.dtype != inp.dtype
                 or out.device != inp.device
                 or not out.is_contiguous()
             ):
-                raise ValueError("out must be a contiguous tensor on the input's device matching the input")
+                raise ValueError(
+                    "out must be a contiguous tensor on the input's device matching the input"
+                )
             key = self._launcher_key(inp.dtype)
             nbytes = inp.numel() * inp.element_size()
-            context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
             with torch.cuda.device(self.device), context:
                 # Capture state belongs to the target stream, so query it here.
                 capturing = torch.cuda.is_current_stream_capturing()
@@ -502,7 +534,11 @@ class RoceOneshotAllReduce:
                 if inp.data_ptr() % PACK_BYTES != 0:
                     src = self._aligned_scratch(0, inp)
                     src.copy_(inp)
-                dst = out if out.data_ptr() % PACK_BYTES == 0 else self._aligned_scratch(1, out)
+                dst = (
+                    out
+                    if out.data_ptr() % PACK_BYTES == 0
+                    else self._aligned_scratch(1, out)
+                )
                 self._order_stream(capturing)
                 launcher(
                     src.data_ptr(),
@@ -562,7 +598,9 @@ class RoceOneshotAllReduce:
                 self._capture_id = capture_id
                 self._capture_stream = current
             elif current != self._capture_stream:
-                raise RuntimeError("RoCE collectives must all be captured on one stream")
+                raise RuntimeError(
+                    "RoCE collectives must all be captured on one stream"
+                )
             return
         if self._last_stream is not None and current != self._last_stream:
             current.wait_event(self._stream_event)
@@ -588,18 +626,21 @@ class RoceOneshotAllReduce:
         failed_seq = int(self._ctrl_np[2])
         if failed_seq != 0:
             peer = int(self._ctrl_np[3])
+            hca = int(self._ctrl_np[6])
             raise RuntimeError(
-                f"RoCE collective on rank {self.rank} timed out waiting for rank {peer} "
-                f"at sequence {failed_seq}; the runtime is poisoned (its epoch stopped at "
-                f"{failed_seq - 1}, later launches do nothing) and rank data is no "
-                "longer trustworthy"
+                f"RoCE collective on rank {self.rank} timed out waiting for rank "
+                f"{peer}, HCA {hca}, at sequence {failed_seq}; the runtime is "
+                f"poisoned (its epoch stopped at {failed_seq - 1}, later launches "
+                "do nothing) and rank data is no longer trustworthy"
             )
 
     @property
     def poisoned(self) -> bool:
         """True once a wait timed out or the proxy failed; the runtime cannot be reused."""
 
-        return (self._proxy is not None and self._proxy.failed()) or int(self._ctrl_np[2]) != 0
+        return (self._proxy is not None and self._proxy.failed()) or int(
+            self._ctrl_np[2]
+        ) != 0
 
     # -- all-gather ---------------------------------------------------------------
 
@@ -668,8 +709,12 @@ class RoceOneshotAllReduce:
                 or out.device != inp.device
                 or not out.is_contiguous()
             ):
-                raise ValueError("out must be a contiguous tensor on the input's device of the gathered shape")
-            context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+                raise ValueError(
+                    "out must be a contiguous tensor on the input's device of the gathered shape"
+                )
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
             with torch.cuda.device(self.device), context:
                 capturing = torch.cuda.is_current_stream_capturing()
                 # Both paths stage the shard contiguously and only the reader is
@@ -687,7 +732,9 @@ class RoceOneshotAllReduce:
                         else (inp.shape[-1] * inp.element_size()) // PACK_BYTES
                     )
                     self._order_stream(capturing)
-                    self._launch_gather(inp.data_ptr(), out.data_ptr(), nbytes, row_packs)
+                    self._launch_gather(
+                        inp.data_ptr(), out.data_ptr(), nbytes, row_packs
+                    )
                     self._mark_stream(capturing)
                     return out
                 # Padded path: pad each shard to a whole number of packs, gather
@@ -731,12 +778,16 @@ class RoceOneshotAllReduce:
             capacity = _align_up(self.max_gather_bytes, PACK_BYTES)
             self._gather_buffers = (
                 torch.empty(capacity, dtype=torch.uint8, device=self.device),
-                torch.empty(self.world_size * capacity, dtype=torch.uint8, device=self.device),
+                torch.empty(
+                    self.world_size * capacity, dtype=torch.uint8, device=self.device
+                ),
             )
         staged, gathered = self._gather_buffers
         return staged[:padded], gathered[: self.world_size * padded]
 
-    def _launch_gather(self, input_address: int, output_address: int, nbytes: int, row_packs: int) -> None:
+    def _launch_gather(
+        self, input_address: int, output_address: int, nbytes: int, row_packs: int
+    ) -> None:
         """Launch the all-gather kernel for ``nbytes`` per rank with ``row_packs`` 16-byte packs per row."""
         key = self._gather_launcher_key()
         capturing = torch.cuda.is_current_stream_capturing()
@@ -797,16 +848,13 @@ class RoceOneshotAllReduce:
             "epoch": int(self._counters[0].item()),
             "error_seq": int(self._error_word.item()),
             "error_peer": int(self._ctrl_words[3].item()),
+            "error_hca": int(self._ctrl_words[6].item()),
             "ctrl_seq": int(self._ctrl_words[0].item()),
             "spin_limit": self.spin_limit,
+            "stripe_hcas": list(range(len(self.hca_names))),
         }
         if self._proxy is not None:
             info.update(self._proxy.stats())
-            info["peer_hca"] = {
-                peer: self._proxy.peer_hca(peer)
-                for peer in range(self.world_size)
-                if peer != self.rank
-            }
         return info
 
     def close(self) -> None:
