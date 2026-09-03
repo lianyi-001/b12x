@@ -42,7 +42,10 @@
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 256
 #define ROCE_ABI_VERSION 3
-#define ROCE_IDLE_SPINS 200000
+// Model graphs leave sub-millisecond gaps between collectives.  Keep the
+// proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+// every collective on the graph's critical path.
+#define ROCE_IDLE_SPINS 20000000
 
 typedef struct {
     uint64_t region_addr;

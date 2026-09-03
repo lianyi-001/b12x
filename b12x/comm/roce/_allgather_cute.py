@@ -10,8 +10,7 @@ replaced by a strided copy that writes the concatenated output directly:
   separate reshape/copy is needed after the collective.
 
 The local shard is copied from the input; peer shards are read in place from
-the NIC-written slots with system-scope loads.  Every launch of one runtime
-uses the same grid (shared counters with the all-reduce kernel).
+the NIC-written slots with system-scope loads.
 """
 
 from __future__ import annotations
@@ -85,6 +84,9 @@ class _RoceAllGatherLaunch:
         ctrl_base: Int64,
         slot_bytes: Int64,
         epoch_ptr: Int64,
+        stage_counter_ptr: Int64,
+        tail_counter_ptr: Int64,
+        poison_ptr: Int64,
         spin_limit: Uint32,
         grid_x: Int32,
         stream: cuda.CUstream,
@@ -102,6 +104,9 @@ class _RoceAllGatherLaunch:
             ctrl_base,
             slot_bytes,
             epoch_ptr,
+            stage_counter_ptr,
+            tail_counter_ptr,
+            poison_ptr,
             spin_limit,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -124,6 +129,9 @@ class _RoceAllGatherLaunch:
         ctrl_base: Int64,
         slot_bytes: Int64,
         epoch_ptr: Int64,
+        stage_counter_ptr: Int64,
+        tail_counter_ptr: Int64,
+        poison_ptr: Int64,
         spin_limit: Uint32,
     ) -> None:
         """Device kernel: stage, doorbell, wait for peer flags, strided copy, advance the epoch."""
@@ -132,9 +140,6 @@ class _RoceAllGatherLaunch:
         gdim, _, _ = cute.arch.grid_dim()
         input_base = Int64(input_ptr.toint())
         output_base = Int64(output_ptr.toint())
-        stage_counter_ptr = epoch_ptr + Int64(4)
-        tail_counter_ptr = epoch_ptr + Int64(8)
-
         epoch = ld_relaxed_gpu_u32(epoch_ptr)
         seq = epoch + Uint32(1)
         slot = Int64(seq & Uint32(1))
@@ -148,7 +153,6 @@ class _RoceAllGatherLaunch:
         # The device poison word (fourth counter) is written by the same waiting
         # threads that write the host error word and only ever goes from 0 to
         # the failed sequence, so a cheap GPU-scope load is enough here.
-        poison_ptr = epoch_ptr + Int64(12)
         poisoned = ld_relaxed_gpu_u32(poison_ptr)
         if poisoned == Uint32(0):
             # 1. stage the local shard into the pinned send slot
@@ -315,10 +319,13 @@ def get_launcher(
         16,
         4096,
         16,
+        16,
+        16,
+        16,
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 2, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 3, cache_key),
     )
 
     def run(
@@ -333,6 +340,9 @@ def get_launcher(
         ctrl_base: int,
         slot_bytes: int,
         epoch_address: int,
+        stage_counter_address: int,
+        tail_counter_address: int,
+        poison_address: int,
         spin_limit: int,
         grid_x: int,
     ) -> None:
@@ -353,6 +363,9 @@ def get_launcher(
             int(ctrl_base),
             int(slot_bytes),
             int(epoch_address),
+            int(stage_counter_address),
+            int(tail_counter_address),
+            int(poison_address),
             int(spin_limit),
             int(grid_x),
             current_cuda_stream(),

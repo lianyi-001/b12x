@@ -169,6 +169,13 @@ def _align_up(value: int, alignment: int) -> int:
     return (int(value) + alignment - 1) // alignment * alignment
 
 
+def _grid_blocks(size_packs: int, threads: int, max_blocks: int) -> int:
+    """Choose a power-of-two grid with about two 16-byte packs per thread."""
+    packs_per_block = 2 * int(threads)
+    required = max(1, (int(size_packs) + packs_per_block - 1) // packs_per_block)
+    return min(1 << (required - 1).bit_length(), int(max_blocks))
+
+
 def _exchange(local: object, group: ProcessGroup) -> list[object]:
     """All-gather one picklable object from every rank of ``group``."""
     gathered: list[object] = [None] * dist.get_world_size(group=group)
@@ -225,6 +232,7 @@ class RoceOneshotAllReduce:
         self.max_gather_bytes = int(max_gather_bytes)
         self._threads = int(threads)
         self._blocks = int(blocks)
+        self._counter_classes = self._blocks.bit_length()
         self.gid_index = default_gid_index() if gid_index is None else int(gid_index)
         self.spin_limit = _env_int("B12X_ROCE_SPIN_LIMIT", default=DEFAULT_SPIN_LIMIT)
         names = tuple(hca_names) if hca_names else discover_hcas(self.gid_index)
@@ -244,7 +252,14 @@ class RoceOneshotAllReduce:
             self._region = torch.zeros(
                 self._layout.total_bytes, dtype=torch.uint8, pin_memory=True
             )
-            self._counters = torch.zeros(4, dtype=torch.int32, device=self.device)
+            # Epoch and poison are global. Stage and tail arrivals are separate
+            # for every power-of-two grid size because their free-running
+            # counters use the launch grid as their modulus.
+            self._counters = torch.zeros(
+                2 + 2 * self._counter_classes,
+                dtype=torch.int32,
+                device=self.device,
+            )
         host_ptr = self._region.data_ptr()
         device_ptr = self._device_pointer(host_ptr)
         if device_ptr != host_ptr:
@@ -267,6 +282,7 @@ class RoceOneshotAllReduce:
         # health check before and after every launch stays off the profile.
         self._ctrl_np = self._ctrl_words.numpy()
         self._epoch_address = self._counters.data_ptr()
+        self._poison_address = self._epoch_address + 4 * (1 + 2 * self._counter_classes)
 
         error: Optional[str] = None
         try:
@@ -445,6 +461,13 @@ class RoceOneshotAllReduce:
             self.device.index,
         )
 
+    def _counter_addresses(self, blocks: int) -> tuple[int, int]:
+        """Stage and tail counter addresses for one power-of-two grid size."""
+        counter_class = int(blocks).bit_length() - 1
+        stage = self._epoch_address + 4 * (1 + counter_class)
+        tail = self._epoch_address + 4 * (1 + self._counter_classes + counter_class)
+        return stage, tail
+
     def prepare(
         self,
         dtypes: Sequence[torch.dtype] = (torch.bfloat16,),
@@ -539,6 +562,10 @@ class RoceOneshotAllReduce:
                     if out.data_ptr() % PACK_BYTES == 0
                     else self._aligned_scratch(1, out)
                 )
+                grid_blocks = _grid_blocks(
+                    nbytes // PACK_BYTES, self._threads, self._blocks
+                )
+                stage_counter, tail_counter = self._counter_addresses(grid_blocks)
                 self._order_stream(capturing)
                 launcher(
                     src.data_ptr(),
@@ -551,8 +578,11 @@ class RoceOneshotAllReduce:
                     self._ctrl_base,
                     self._slot_bytes,
                     self._epoch_address,
+                    stage_counter,
+                    tail_counter,
+                    self._poison_address,
                     self.spin_limit,
-                    self._blocks,
+                    grid_blocks,
                 )
                 if dst is not out:
                     out.copy_(dst)
@@ -796,6 +826,7 @@ class RoceOneshotAllReduce:
                 "RoCE all-gather launcher must be prepared before CUDA graph capture"
             )
         launcher = _allgather_cute.get_launcher(*key)
+        stage_counter, tail_counter = self._counter_addresses(self._blocks)
         launcher(
             input_address,
             output_address,
@@ -808,6 +839,9 @@ class RoceOneshotAllReduce:
             self._ctrl_base,
             self._slot_bytes,
             self._epoch_address,
+            stage_counter,
+            tail_counter,
+            self._poison_address,
             self.spin_limit,
             self._blocks,
         )

@@ -208,6 +208,45 @@ def test_cuda_graph_replay(runtime):
         )
 
 
+def test_cuda_graph_replay_with_alternating_grid_sizes(runtime):
+    """Small and MTP-sized reductions may alternate without sharing arrivals."""
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    small = torch.zeros(4096, dtype=torch.bfloat16, device=runtime.device)
+    mtp = torch.zeros(32768, dtype=torch.bfloat16, device=runtime.device)
+    small_out = torch.empty_like(small)
+    mtp_out = torch.empty_like(mtp)
+    stream = torch.cuda.Stream(device=runtime.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runtime.all_reduce(small, out=small_out)
+        runtime.all_reduce(mtp, out=mtp_out)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), runtime.capture(stream=stream):
+        runtime.all_reduce(small, out=small_out)
+        runtime.all_reduce(mtp, out=mtp_out)
+        runtime.all_reduce(small, out=small_out)
+    torch.cuda.synchronize()
+    dist.barrier()
+    rtol, atol = _tolerance(torch.bfloat16, world)
+    for replay in range(24):
+        torch.manual_seed(101 * replay + rank)
+        small.copy_(torch.randn_like(small))
+        mtp.copy_(torch.randn_like(mtp))
+        expected_small = small.clone()
+        expected_mtp = mtp.clone()
+        dist.all_reduce(expected_small)
+        dist.all_reduce(expected_mtp)
+        graph.replay()
+        torch.cuda.synchronize()
+        runtime.check_health()
+        torch.testing.assert_close(small_out, expected_small, rtol=rtol, atol=atol)
+        torch.testing.assert_close(mtp_out, expected_mtp, rtol=rtol, atol=atol)
+
+
 def test_proxy_catches_up_after_missed_doorbell(runtime):
     """A proxy that was descheduled across two doorbells must post both ops.
 

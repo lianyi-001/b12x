@@ -23,8 +23,8 @@ stages nothing can pass the peer wait (peers do not depend on our doorbell)
 and reach the tail before a slower block has staged, so one shared counter
 would ring the doorbell early and publish stale bytes.
 
-Every launch of one runtime uses the same grid, which both counters' moduli
-rely on.  Message size is a runtime scalar.
+Each power-of-two grid size has separate staging and tail counters, so message
+size and launch grid remain runtime scalars and may vary across graph launches.
 """
 
 from __future__ import annotations
@@ -158,6 +158,9 @@ class _RoceOneshotLaunch:
         ctrl_base: Int64,
         slot_bytes: Int64,
         epoch_ptr: Int64,
+        stage_counter_ptr: Int64,
+        tail_counter_ptr: Int64,
+        poison_ptr: Int64,
         spin_limit: Uint32,
         grid_x: Int32,
         stream: cuda.CUstream,
@@ -174,6 +177,9 @@ class _RoceOneshotLaunch:
             ctrl_base,
             slot_bytes,
             epoch_ptr,
+            stage_counter_ptr,
+            tail_counter_ptr,
+            poison_ptr,
             spin_limit,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -195,6 +201,9 @@ class _RoceOneshotLaunch:
         ctrl_base: Int64,
         slot_bytes: Int64,
         epoch_ptr: Int64,
+        stage_counter_ptr: Int64,
+        tail_counter_ptr: Int64,
+        poison_ptr: Int64,
         spin_limit: Uint32,
     ) -> None:
         """Device kernel: stage, doorbell, wait for peer flags, reduce, advance the epoch."""
@@ -203,9 +212,6 @@ class _RoceOneshotLaunch:
         gdim, _, _ = cute.arch.grid_dim()
         input_base = Int64(input_ptr.toint())
         output_base = Int64(output_ptr.toint())
-        stage_counter_ptr = epoch_ptr + Int64(4)
-        tail_counter_ptr = epoch_ptr + Int64(8)
-
         # Every block reads the epoch before any block can advance it: the
         # advance happens only after all blocks arrived at the tail counter.
         epoch = ld_relaxed_gpu_u32(epoch_ptr)
@@ -221,7 +227,6 @@ class _RoceOneshotLaunch:
         # The device poison word (fourth counter) is written by the same waiting
         # threads that write the host error word and only ever goes from 0 to
         # the failed sequence, so a cheap GPU-scope load is enough here.
-        poison_ptr = epoch_ptr + Int64(12)
         poisoned = ld_relaxed_gpu_u32(poison_ptr)
         if poisoned == Uint32(0):
             # 1. stage the input into the pinned send slot
@@ -238,11 +243,11 @@ class _RoceOneshotLaunch:
                     words[3],
                 )
                 stage_index += stride
-            fence_sc_sys()
             cute.arch.sync_threads()
 
             # 2. the last block to finish staging rings the proxy doorbell
             if Int32(tidx) == Int32(0):
+                fence_sc_sys()
                 prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
                 if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
                     st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
@@ -392,10 +397,13 @@ def get_launcher(
         16,
         4096,
         16,
+        16,
+        16,
+        16,
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 2, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 5, cache_key),
     )
 
     def run(
@@ -409,6 +417,9 @@ def get_launcher(
         ctrl_base: int,
         slot_bytes: int,
         epoch_address: int,
+        stage_counter_address: int,
+        tail_counter_address: int,
+        poison_address: int,
         spin_limit: int,
         grid_x: int,
     ) -> None:
@@ -428,6 +439,9 @@ def get_launcher(
             int(ctrl_base),
             int(slot_bytes),
             int(epoch_address),
+            int(stage_counter_address),
+            int(tail_counter_address),
+            int(poison_address),
             int(spin_limit),
             int(grid_x),
             current_cuda_stream(),
