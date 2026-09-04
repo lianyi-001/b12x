@@ -68,8 +68,7 @@ class _TwoShotBf16Layout:
 def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16Layout:
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
-            "PCIeTwoShotBF16 supports only world size 4, "
-            f"got {world_size}"
+            f"PCIeTwoShotBF16 supports only world size 4, got {world_size}"
         )
     if max_rows <= 0 or max_rows % world_size != 0:
         raise ValueError("max_rows must be positive and divisible by world size")
@@ -188,8 +187,7 @@ class PCIeTwoShotBF16:
             normalized_row_elems = int(row_elems)
             if world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(
-                    "PCIeTwoShotBF16 supports only world size 4, "
-                    f"got {world_size}"
+                    f"PCIeTwoShotBF16 supports only world size 4, got {world_size}"
                 )
             if device_obj.type != "cuda":
                 raise ValueError("PCIe twoshot requires a CUDA device")

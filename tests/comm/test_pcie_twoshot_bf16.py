@@ -172,8 +172,7 @@ def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             assert (
-                pool.all_reduce(all_reduce_input, out=all_reduce_out)
-                is all_reduce_out
+                pool.all_reduce(all_reduce_input, out=all_reduce_out) is all_reduce_out
             )
             assert (
                 pool.reduce_scatter(
