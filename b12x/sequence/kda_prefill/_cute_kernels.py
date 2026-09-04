@@ -2163,10 +2163,11 @@ def run_prefill(
     """Launch the window pipeline: prologue, then prepare and recurrence per window.
 
     Prepare launches run on a per-device side stream, recurrence launches on
-    the current stream. A window's recurrence overlaps its own prepare through
-    the ready flags; prepare of window ``w`` waits for the recurrence of window
-    ``w - 2`` before reusing that workspace ring slot. Under stream capture the
-    fork and join are recorded as graph dependencies.
+    the current stream. Recurrence waits for its window's prepare, while the
+    next prepare can overlap the previous recurrence. Prepare of window ``w``
+    waits for the recurrence of window ``w - 2`` before reusing that workspace
+    ring slot. Under stream capture the fork and join are recorded as graph
+    dependencies.
     """
     device = binding.output.device
     plan = binding.plan
@@ -2191,6 +2192,7 @@ def run_prefill(
                     side.wait_event(consumed[window - 2])
                 run_prepare(binding, lower_bound=lower_bound, scale=scale, eps=eps, window=window)
                 prepared[window].record(side)
+            main.wait_event(prepared[window])
             run_recurrence(binding, window=window)
             consumed[window].record(main)
         main.wait_event(prepared[launched - 1])
