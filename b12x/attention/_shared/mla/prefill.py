@@ -106,11 +106,12 @@ _TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112})
 def _topk_container(model_type: int, topk: int) -> int:
     """Return the DSV4 MG container width for a runtime top-k row.
 
-    GLM sparse-MLA plans bind caller-owned index workspaces whose row width is
-    part of the plan contract. Replacing those rows with an allocating padded
-    tensor after binding can invalidate a captured GLM plan, so GLM row widths
-    remain unchanged. DSV4 accepts the padded fixed-container representation
-    and is the model family that requires sub-container widening.
+    GLM sparse-MLA plans require the caller-owned index row to match the planned
+    width. Live valid counts are runtime metadata, so the dispatcher must not
+    replace a bound GLM row with an allocating padded tensor. Unsupported GLM
+    widths remain unchanged here and fail the model-specific dispatch gate.
+    DSV4 accepts the padded fixed-container representation and is the model
+    family that requires sub-container widening.
     """
     if model_type != ModelType.DSV4:
         return topk
@@ -263,10 +264,10 @@ def run_unified_prefill(
 
     container = _topk_container(model_type, topk)
     if container != topk:
-        # A short sequence clamps the runtime top-k below the model's
-        # index_topk (e.g. 192 for a 192-token prefill). The MG kernels take
-        # fixed containers; widen the index rows with the invalid sentinel and
-        # keep the per-token valid length, exactly like GLM_NEXT's 2112/2051.
+        # DSV4 short sequences can clamp runtime top-k below index_topk (for
+        # example, 192 for a 192-token prefill). Its MG kernels take fixed
+        # containers, so widen the row with the invalid sentinel while retaining
+        # the per-token valid length.
         topk_indices = torch.nn.functional.pad(
             topk_indices, (0, container - topk), value=-1
         )
