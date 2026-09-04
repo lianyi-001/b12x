@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import ContextManager, Protocol, cast
@@ -220,6 +220,7 @@ class DiscreteSweepGenerator:
         coverage: Mapping[str, object],
         candidate_contract_version: int = 1,
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
+        candidate_tie_breaker: Callable[[SweepCandidate], int | str] | None = None,
     ) -> None:
         self.component_id = component_id
         self.query_schema_version = int(query_schema_version)
@@ -231,6 +232,7 @@ class DiscreteSweepGenerator:
         self._coverage = FrozenMapping(coverage)
         self._candidate_contract_version = int(candidate_contract_version)
         self._nearest_range_bounds = dict(nearest_range_bounds or {})
+        self._candidate_tie_breaker = candidate_tie_breaker
         if not self._cases:
             raise ValueError(f"{component_id} requires at least one sweep case")
         if not self._query_fields or len(self._query_fields) != len(
@@ -593,7 +595,14 @@ class DiscreteSweepGenerator:
                 )
             _, winner = min(
                 robust,
-                key=lambda item: (item[0], item[1].candidate_id),
+                key=lambda item: (
+                    item[0],
+                    (
+                        self._candidate_tie_breaker(item[1])
+                        if self._candidate_tie_breaker is not None
+                        else item[1].candidate_id
+                    ),
+                ),
             )
             records.append(
                 DecisionRecord(
