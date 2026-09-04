@@ -183,9 +183,7 @@ def io_issue_gather(
             _ROPE = Int32(0)
             _ROPE_SRC = Int64(_GLM_NEXT_NVFP4_GMEM_STRIDE)
     else:
-        _IOS = Int64(
-            _GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE
-        )
+        _IOS = Int64(_GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE)
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)  # 528 nope+inline-fp32 -> kv_fp8
         _ROPE = Int32(_GLM_ROPE_BYTES if rope_smem_stride else 0)
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales

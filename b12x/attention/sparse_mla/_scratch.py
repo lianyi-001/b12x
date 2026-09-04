@@ -79,9 +79,6 @@ class B12XSparseMLAScratchCaps:
     latent_scale: float = 1.0
     return_lse: bool = False
     lse_scale: Literal["base2", "natural"] = "base2"
-    scale_format: int | None = None
-    fp8_rope: bool | None = None
-    latent_scale_per_token: bool = False
     has_attention_sink: bool = False
 
     def __post_init__(self) -> None:
@@ -175,16 +172,8 @@ class B12XSparseMLAScratchCaps:
         object.__setattr__(self, "return_lse", bool(self.return_lse))
         if self.lse_scale not in ("base2", "natural"):
             raise ValueError(
-                "lse_scale must be 'base2' or 'natural', "
-                f"got {self.lse_scale!r}"
+                f"lse_scale must be 'base2' or 'natural', got {self.lse_scale!r}"
             )
-        if self.scale_format is not None:
-            object.__setattr__(self, "scale_format", int(self.scale_format))
-        if self.fp8_rope is not None:
-            object.__setattr__(self, "fp8_rope", bool(self.fp8_rope))
-        object.__setattr__(
-            self, "latent_scale_per_token", bool(self.latent_scale_per_token)
-        )
         object.__setattr__(self, "has_attention_sink", bool(self.has_attention_sink))
 
 
@@ -399,9 +388,7 @@ def build_sparse_mla_binding(
     )
     if kv_cache is not None:
         if kv_cache.ndim != 3:
-            raise ValueError(
-                f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}"
-            )
+            raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
         _validate_device(kv_cache, scratch=scratch, name="kv_cache")
         if kv_cache.dtype != scratch.kv_dtype:
             raise TypeError(
@@ -413,7 +400,12 @@ def build_sparse_mla_binding(
                 f"got {int(kv_cache.shape[-1])}, expected "
                 f"{int(scratch.cache_record_bytes)}"
             )
-        if int(kv_cache.shape[1]) != int(scratch.page_size):
+        # Contiguous caches are flat record storage; their first two dimensions
+        # may be reshaped without changing the address contract. A strided cache
+        # encodes physical page boundaries and must match the planned page size.
+        if not kv_cache.is_contiguous() and int(kv_cache.shape[1]) != int(
+            scratch.page_size
+        ):
             raise ValueError(
                 "kv_cache page size does not match the sparse MLA plan: "
                 f"got {int(kv_cache.shape[1])}, expected {int(scratch.page_size)}"
@@ -428,9 +420,7 @@ def build_sparse_mla_binding(
         scale_format=getattr(scratch, "scale_format", None),
         cache_record_bytes=getattr(scratch, "cache_record_bytes", None),
         fp8_rope=getattr(scratch, "fp8_rope", None),
-        latent_scale_per_token=getattr(
-            scratch, "latent_scale_per_token", None
-        ),
+        latent_scale_per_token=getattr(scratch, "latent_scale_per_token", None),
         cache_traits=getattr(scratch, "cache_traits", None),
         kv_cache=kv_cache,
     )

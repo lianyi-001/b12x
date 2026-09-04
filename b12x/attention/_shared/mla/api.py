@@ -908,8 +908,9 @@ def _run_sm120_prefill(
     )
     if not return_lse:
         return output
-    lse = lse_base2 if lse_scale == "base2" else (lse_base2 * _LN2)
-    return output, lse
+    if lse_scale == "natural":
+        lse_base2.mul_(_LN2)
+    return output, lse_base2
 
 
 def _final_lse_from_split_workspace(

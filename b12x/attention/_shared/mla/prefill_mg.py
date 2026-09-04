@@ -4147,9 +4147,7 @@ def run_unified_prefill_mg(
     else:
         if scale_format is None:
             scale_format = (
-                ScaleFormat.ARBITRARY_FP32
-                if is_glm
-                else ScaleFormat.UE8M0_BYTE
+                ScaleFormat.ARBITRARY_FP32 if is_glm else ScaleFormat.UE8M0_BYTE
             )
         scale_format = int(scale_format)
         traits = resolve_unplanned_traits(

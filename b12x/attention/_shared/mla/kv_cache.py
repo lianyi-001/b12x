@@ -292,9 +292,8 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
 
             # --- NoPE: one 16-dim group per thread -> 8 B E2M1 + 1 scale byte.
             if tid < Int32(_NUM_GROUPS):
-                src_elem = (
-                    token.to(Int64) * kv_c_stride
-                    + tid.to(Int64) * Int64(_GROUP_SIZE)
+                src_elem = token.to(Int64) * kv_c_stride + tid.to(Int64) * Int64(
+                    _GROUP_SIZE
                 )
                 vals = cute.make_rmem_tensor((_GROUP_SIZE,), Float32)
                 for i in cutlass.range_constexpr(_GROUP_SIZE // 2):
@@ -550,9 +549,7 @@ class ConcatAndCacheGlmNextMlaKernel:
             )
             if lane == Int32(0):
                 st_global_f32(
-                    dst
-                    + Int64(_GLM_NEXT_SCALE_OFFSET)
-                    + group.to(Int64) * Int64(4),
+                    dst + Int64(_GLM_NEXT_SCALE_OFFSET) + group.to(Int64) * Int64(4),
                     scale,
                 )
 
@@ -695,9 +692,7 @@ def _compile_glm_next_mla_cache_writer(
     with _GLM_NEXT_WRITER_LOCK:
         compiled = _GLM_NEXT_WRITER_COMPILED.get(signature)
     if compiled is None:
-        kernel, args, spec = _glm_next_cache_writer_launch(
-            kv_c, kv_cache, slot_mapping
-        )
+        kernel, args, spec = _glm_next_cache_writer_launch(kv_c, kv_cache, slot_mapping)
         compiled = compile_cute(kernel, *args, compile_spec=spec)
         with _GLM_NEXT_WRITER_LOCK:
             _GLM_NEXT_WRITER_COMPILED[signature] = compiled
@@ -720,9 +715,7 @@ def _concat_and_cache_glm_next_mla_flat_launch(
                 "GLM_NEXT cache-writer compile miss during CUDA graph capture; "
                 "call compile_glm_next_mla_cache_writer before capture"
             )
-        compiled = _compile_glm_next_mla_cache_writer(
-            kv_c, kv_cache, slot_mapping
-        )
+        compiled = _compile_glm_next_mla_cache_writer(kv_c, kv_cache, slot_mapping)
     _, args, _ = _glm_next_cache_writer_launch(kv_c, kv_cache, slot_mapping)
     run_compiled(compiled, args)
 
@@ -908,9 +901,7 @@ def concat_and_cache_glm_next_mla_nvfp4(
             "GLM_NEXT NVFP4 writer requires 304-byte records, got "
             f"{int(kv_cache.shape[-1])}"
         )
-    torch.ops.b12x.concat_and_cache_glm_next_nvfp4_mla(
-        kv_c, kv_cache, slot_mapping
-    )
+    torch.ops.b12x.concat_and_cache_glm_next_nvfp4_mla(kv_c, kv_cache, slot_mapping)
 
 
 def _nvfp4_mla_writer_signature(

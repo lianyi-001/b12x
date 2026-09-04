@@ -458,13 +458,15 @@ class UnifiedDecodeKernel:
             and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
             and not self.native_glm_h8
         )
-        self.packed_io = self.native_h8 or self.packed_glm_next or self.packed_glm_generic
+        self.packed_io = (
+            self.native_h8 or self.packed_glm_next or self.packed_glm_generic
+        )
         # First-chunk copies may be issued before the per-token length is
         # known only when the first active chunk is fixed (no extra section).
         self.speculative_first_chunk = self.packed_io and not bool(has_extra)
         # Global bytes per candidate record copied by the packed producer.
         if self.packed_glm_next:
-            self.packed_record_bytes = _GLM_NEXT_KV_GMEM_STRIDE
+            self.packed_record_bytes = int(traits.kv_gmem_stride)
         elif self.native_glm_h8 or self.packed_glm_generic:
             self.packed_record_bytes = _GLM_KV_GMEM_STRIDE
         else:
@@ -1055,7 +1057,9 @@ class UnifiedDecodeKernel:
                 main_cap = Int32(self.topk if self.topk > 0 else 1)
                 if cutlass.const_expr(has_extra):
                     if pre_ci >= num_main_chunks:
-                        pc = (pre_ci - num_main_chunks) * Int32(_CAND_WINDOW) + io_lane_pre
+                        pc = (pre_ci - num_main_chunks) * Int32(
+                            _CAND_WINDOW
+                        ) + io_lane_pre
                         if pc < Int32(self.extra_topk):
                             pre_idx0 = Int32(extra_row[pc])
                         if pc + Int32(32) < Int32(self.extra_topk):
@@ -1084,11 +1088,15 @@ class UnifiedDecodeKernel:
                     # burn bandwidth. An empty split still waits on the stage
                     # before it exits, which completes at once with no copies
                     # in flight.
-                    spec_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
-                        _CAND_WINDOW
-                    )
-                    if spec_valid_chunks > Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW):
-                        spec_valid_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
+                    spec_valid_chunks = (
+                        section_len + Int32(_CAND_WINDOW - 1)
+                    ) // Int32(_CAND_WINDOW)
+                    if spec_valid_chunks > Int32(
+                        (self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+                    ):
+                        spec_valid_chunks = Int32(
+                            (self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+                        )
                     if pre_ci < spec_valid_chunks:
                         io_issue_packed_payload(
                             kv_cache_u8,
@@ -1669,7 +1677,9 @@ class UnifiedDecodeKernel:
                         q_rope_stride=L.q_rope_stride,
                         fp8_rope=t.fp8_rope,
                         kv_rope_stride_bytes=(
-                            staged_kv_stride if self.packed_glm_generic else t.d_rope * 2
+                            staged_kv_stride
+                            if self.packed_glm_generic
+                            else t.d_rope * 2
                         ),
                     )
 
@@ -2840,21 +2850,20 @@ def run_unified_decode(
         _final_lse_from_split_workspace,
     )
 
-    lse_natural = _final_lse_from_split_workspace(
+    lse = _final_lse_from_split_workspace(
         workspace=workspace,
         q_rows=rows,
         num_heads=heads,
         launch_num_chunks=num_splits,
-        scale="natural",
+        scale=("natural" if attn_sink is not None else lse_scale),
     )
     if attn_sink is not None:
         # Fold the per-head sink into the LSE in the natural-log domain (the merge
         # already folded it into O): lse' = log(exp(lse) + exp(sink)).
-        sink = attn_sink.float().view(1, heads)
-        lse_natural = torch.logaddexp(lse_natural.float(), sink)
-    if lse_scale == "base2":
-        return output, (lse_natural / _LN2)
-    return output, lse_natural
+        torch.logaddexp(lse, attn_sink.view(1, heads), out=lse)
+        if lse_scale == "base2":
+            lse.div_(_LN2)
+    return output, lse
 
 
 def run_unified_prefill(*args, **kwargs):

@@ -35,7 +35,6 @@ from .pooled_selection import expand_pooled_topk_to_physical_slots
 from ._scratch import (
     B12XSparseMLABinding as _RuntimeBinding,
 )
-from .physical_selection import expand_pooled_topk_to_physical_slots
 from ._policy import SparseMlaConfig, SparseMlaQuery
 from ._scratch import (
     B12XSparseMLAScratch as Scratch,
@@ -91,9 +90,7 @@ def bind(
     if kv_cache.ndim != 3:
         raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
     if kv_cache.device != caps.device:
-        raise ValueError(
-            f"kv_cache must be on {caps.device}, got {kv_cache.device}"
-        )
+        raise ValueError(f"kv_cache must be on {caps.device}, got {kv_cache.device}")
     if kv_cache.dtype != caps.kv_dtype:
         raise TypeError(
             f"kv_cache must have dtype {caps.kv_dtype}, got {kv_cache.dtype}"
@@ -116,15 +113,14 @@ def bind(
                 f"{attention_sink.dtype}"
             )
         if attention_sink.device != caps.device or not attention_sink.is_contiguous():
-            raise ValueError(
-                f"attention_sink must be contiguous on {caps.device}"
-            )
+            raise ValueError(f"attention_sink must be contiguous on {caps.device}")
     runtime = plan.bind(
         scratch=scratch,
         q=q,
         selected_indices=selected_indices,
         cache_seqlens_int32=cache_lengths,
         nsa_cache_seqlens_int32=selected_lengths,
+        kv_cache=kv_cache,
     )
     return Binding(
         plan=plan,
@@ -142,16 +138,11 @@ def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     caps = binding.plan.caps
     kwargs = dict(
         binding=binding.runtime,
-        kv_cache=binding.kv_cache,
         sm_scale=caps.softmax_scale,
         latent_scale=caps.latent_scale,
         v_head_dim=caps.v_head_dim,
         return_lse=caps.return_lse,
         lse_scale=caps.lse_scale,
-        scale_format=caps.scale_format,
-        model_type=caps.model_type,
-        fp8_rope=caps.fp8_rope,
-        latent_scale_per_token=caps.latent_scale_per_token,
     )
     if caps.mode == "decode":
         return _run_decode(attn_sink=binding.attention_sink, **kwargs)
