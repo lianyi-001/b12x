@@ -65,8 +65,7 @@ class QsaConfig:
     def from_profile(cls, payload: FrozenMapping) -> "QsaConfig":
         if set(payload) != {"backend", "sparse_gqa_direct_kv_warps"}:
             raise ValueError(
-                "QSA profiles require exactly backend and "
-                "sparse_gqa_direct_kv_warps"
+                "QSA profiles require exactly backend and sparse_gqa_direct_kv_warps"
             )
         backend = payload["backend"]
         if not isinstance(backend, str):

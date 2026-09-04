@@ -867,9 +867,7 @@ def _manifest_payload(component: str) -> dict[str, object]:
         shared["qsa_context_tokens"] = list(QSA_CONTEXT_TOKENS)
         shared["qsa_page_sizes"] = list(QSA_PAGE_SIZES)
         shared["qsa_position_layouts"] = [list(item) for item in QSA_POSITION_LAYOUTS]
-        shared["qsa_speculative_context_tokens"] = list(
-            QSA_SPECULATIVE_CONTEXT_TOKENS
-        )
+        shared["qsa_speculative_context_tokens"] = list(QSA_SPECULATIVE_CONTEXT_TOKENS)
         shared["qsa_direct_prefill_rows"] = {
             str(context): list(rows)
             for context, rows in QSA_DIRECT_PREFILL_ROWS.items()

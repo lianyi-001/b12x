@@ -283,9 +283,7 @@ class DiscreteSweepGenerator:
         partitions = []
         for group_id in sorted(cases_by_group):
             cases = tuple(cases_by_group[group_id])
-            query_count = len(
-                {_query_key(case, self._query_fields) for case in cases}
-            )
+            query_count = len({_query_key(case, self._query_fields) for case in cases})
             partitions.append(
                 MeasurementPartition(
                     component_id=self.component_id,
@@ -339,10 +337,7 @@ class DiscreteSweepGenerator:
         candidate_ids = [candidate.candidate_id for candidate in candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError(f"candidate IDs are not unique for {case.case_id}")
-        if (
-            cached is not None
-            and cached.candidate_ids == tuple(candidate_ids)
-        ):
+        if cached is not None and cached.candidate_ids == tuple(candidate_ids):
             checkpoints.save(
                 self.component_id,
                 case.case_id,
@@ -409,13 +404,9 @@ class DiscreteSweepGenerator:
             SweepMeasurement.from_dict(item) for item in raw_measurements
         )
         candidate_ids = tuple(raw_candidate_ids)
-        measured_ids = tuple(
-            item.candidate.candidate_id for item in measurements
-        )
+        measured_ids = tuple(item.candidate.candidate_id for item in measurements)
         if measured_ids != candidate_ids:
-            raise ValueError(
-                "sweep checkpoint measurements do not match candidate IDs"
-            )
+            raise ValueError("sweep checkpoint measurements do not match candidate IDs")
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("sweep checkpoint candidate IDs are not unique")
         return _CachedSweepMeasurements(
@@ -429,10 +420,7 @@ class DiscreteSweepGenerator:
         self,
         cached: _CachedSweepMeasurements | None,
     ) -> bool:
-        return (
-            cached is not None
-            and cached.checkpoint_schema_version == 2
-        )
+        return cached is not None and cached.checkpoint_schema_version == 2
 
     def _checkpoint_payload(
         self,
