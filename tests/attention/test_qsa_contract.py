@@ -523,6 +523,10 @@ def test_qsa_plan_is_one_caller_owned_scratch_buffer() -> None:
 
 
 def test_qsa_large_prefill_prewarm_preserves_bound_state() -> None:
+    from b12x.attention.paged import _selected_forward as selected_impl
+    from b12x.attention.qsa._policy import QsaConfig
+    from b12x.policy import PolicyContext, QSA_ATTENTION
+
     device = require_sm120()
     caps = qsa.Caps(
         device=device,
@@ -544,7 +548,14 @@ def test_qsa_large_prefill_prewarm_preserves_bound_state() -> None:
         compress_ratio=4,
         budget=2048,
     )
-    binding = _allocate_binding(caps)
+    policy = PolicyContext.for_device(device).with_override(
+        QSA_ATTENTION,
+        QsaConfig(
+            backend="cutedsl",
+            sparse_gqa_direct_kv_warps=1,
+        ),
+    )
+    binding = _allocate_binding(caps, plan=qsa.plan(caps, policy=policy))
     tracked = (
         binding.main_k_cache,
         binding.main_v_cache,
@@ -561,11 +572,25 @@ def test_qsa_large_prefill_prewarm_preserves_bound_state() -> None:
         tensor.zero_()
     before = tuple(tensor.clone() for tensor in tracked)
 
-    qsa.prewarm(binding)
-    torch.cuda.synchronize(device)
+    selected_impl.clear_caches()
+    try:
+        qsa.prewarm(binding)
+        torch.cuda.synchronize(device)
 
-    for actual, expected in zip(tracked, before, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        specializations = {
+            (int(key[3]), bool(key[8]), int(key[9]))
+            for key in selected_impl._KERNEL_CACHE
+        }
+        assert specializations == {
+            (32, False, 2),
+            (64, False, 2),
+            (32, True, 1),
+            (64, True, 1),
+        }
+        for actual, expected in zip(tracked, before, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    finally:
+        selected_impl.clear_caches()
 
 
 def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> None:

@@ -11,6 +11,7 @@ import torch
 from ..._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from ...policy import PolicyContext, PolicyResolution, get_auto_policy
 from ._policy import QSA_POLICY, QsaConfig, QsaQuery
+from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS
 
 _ALIGN_BYTES = 256
 _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
@@ -1419,6 +1420,7 @@ def _qsa_decode_impl(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_seq_len: int,
     max_speculative_tokens: int,
     compress_ratio: int,
@@ -1871,6 +1873,7 @@ def _qsa_decode_impl(
             softmax_scale=1.0 / math.sqrt(head_dim),
             block_n=block_n,
             splits=splits,
+            direct_kv_warps=int(sparse_gqa_direct_kv_warps),
         )
         launch_poison_failed_rows(output=active_output, state_errors=chunk_errors)
 
@@ -1921,6 +1924,7 @@ def _qsa_decode_op(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_seq_len: int,
     max_speculative_tokens: int,
     compress_ratio: int,
@@ -2005,6 +2009,7 @@ def _qsa_decode_op(
         rope_sin,
         output,
         selected_positions,
+        sparse_gqa_direct_kv_warps,
         max_seq_len,
         max_speculative_tokens,
         compress_ratio,
@@ -2068,6 +2073,7 @@ def _qsa_decode_fake(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_seq_len: int,
     max_speculative_tokens: int,
     compress_ratio: int,
@@ -2195,6 +2201,7 @@ def _qsa_decode_shared_op(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_raw_state_slots: int,
     raw_ring_capacity: int,
     max_seq_len: int,
@@ -2289,6 +2296,7 @@ def _qsa_decode_shared_op(
         rope_sin,
         output,
         selected_positions,
+        sparse_gqa_direct_kv_warps,
         max_seq_len,
         max_speculative_tokens,
         compress_ratio,
@@ -2348,6 +2356,7 @@ def _qsa_decode_shared_fake(
     rope_sin: torch.Tensor,
     output: torch.Tensor,
     selected_positions: torch.Tensor,
+    sparse_gqa_direct_kv_warps: int,
     max_raw_state_slots: int,
     raw_ring_capacity: int,
     max_seq_len: int,
@@ -2552,6 +2561,7 @@ def run(
             binding.rope_sin,
             binding.output,
             binding.selected_positions,
+            int(binding.plan.policy_resolution.config.sparse_gqa_direct_kv_warps),
             int(caps.max_raw_state_slots),
             int(caps.raw_ring_capacity),
             int(caps.max_seq_len),
@@ -2615,6 +2625,7 @@ def run(
         binding.rope_sin,
         binding.output,
         binding.selected_positions,
+        int(binding.plan.policy_resolution.config.sparse_gqa_direct_kv_warps),
         int(caps.max_seq_len),
         int(caps.max_speculative_tokens),
         int(caps.compress_ratio),
@@ -2662,31 +2673,10 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
         raise TypeError("binding must be a qsa.Binding")
 
     caps = binding.plan.caps
-    rows = int(caps.max_q_rows if rows is None else rows)
-    if not 0 < rows <= int(caps.max_q_rows):
+    requested_rows = int(caps.max_q_rows if rows is None else rows)
+    if not 0 < requested_rows <= int(caps.max_q_rows):
         raise ValueError("prewarm rows must be within the planned QSA capacity")
     device = caps.device
-    query = torch.empty(
-        (rows, int(caps.q_heads), int(caps.head_dim)),
-        dtype=caps.dtype,
-        device=device,
-    )
-    index_query = torch.empty(
-        (rows, int(caps.index_heads), int(caps.index_head_dim)),
-        dtype=caps.dtype,
-        device=device,
-    )
-    raw_index_key = torch.empty(
-        (rows, int(caps.index_head_dim)), dtype=caps.dtype, device=device
-    )
-    request_ids = torch.full((rows,), -1, dtype=torch.int32, device=device)
-    query_positions = torch.full((rows,), -1, dtype=torch.int64, device=device)
-    rope_positions = torch.full(
-        (rows, int(caps.position_axes)),
-        -1,
-        dtype=torch.int64,
-        device=device,
-    )
     sequence_lengths = torch.zeros(
         int(caps.max_batch), dtype=torch.int32, device=device
     )
@@ -2697,19 +2687,55 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
         int(caps.max_batch), dtype=torch.int32, device=device
     )
     is_prefilling = torch.ones(int(caps.max_batch), dtype=torch.bool, device=device)
-    run(
-        binding,
-        query=query,
-        index_query=index_query,
-        raw_index_key=raw_index_key,
-        request_ids=request_ids,
-        query_positions=query_positions,
-        rope_positions=rope_positions,
-        sequence_lengths=sequence_lengths,
-        query_start_loc=query_start_loc,
-        num_accepted_tokens=num_accepted_tokens,
-        is_prefilling=is_prefilling,
-    )
+    warm_rows = {requested_rows}
+    if int(caps.max_q_rows) > _MAX_SPLIT_ROWS:
+        warm_rows.add(min(_MAX_SPLIT_ROWS, int(caps.max_q_rows)))
+        warm_rows.add(_MAX_SPLIT_ROWS + 1)
+    for warm_row_count in sorted(warm_rows):
+        query = torch.empty(
+            (warm_row_count, int(caps.q_heads), int(caps.head_dim)),
+            dtype=caps.dtype,
+            device=device,
+        )
+        index_query = torch.empty(
+            (warm_row_count, int(caps.index_heads), int(caps.index_head_dim)),
+            dtype=caps.dtype,
+            device=device,
+        )
+        raw_index_key = torch.empty(
+            (warm_row_count, int(caps.index_head_dim)),
+            dtype=caps.dtype,
+            device=device,
+        )
+        query_positions = torch.full(
+            (warm_row_count,), -1, dtype=torch.int64, device=device
+        )
+        rope_positions = torch.full(
+            (warm_row_count, int(caps.position_axes)),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        for request_id_dtype in (torch.int32, torch.int64):
+            request_ids = torch.full(
+                (warm_row_count,),
+                -1,
+                dtype=request_id_dtype,
+                device=device,
+            )
+            run(
+                binding,
+                query=query,
+                index_query=index_query,
+                raw_index_key=raw_index_key,
+                request_ids=request_ids,
+                query_positions=query_positions,
+                rope_positions=rope_positions,
+                sequence_lengths=sequence_lengths,
+                query_start_loc=query_start_loc,
+                num_accepted_tokens=num_accepted_tokens,
+                is_prefilling=is_prefilling,
+            )
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:

@@ -4,9 +4,9 @@ QSA keeps exact, original-token BF16 or globally scaled FP8 E4M3 GQA K/V and
 uses a second compressed BF16 key cache only to select groups of logical token
 positions. The public lifecycle is ``Caps -> plan -> bind -> prewarm -> run``.
 Planning owns split and scratch policy; binding validates tensors and creates
-references without allocating. ``prewarm`` compiles large-prefill sparse GQA
-without reading or mutating cache state and may be omitted when first-use JIT
-latency is acceptable.
+references without allocating. ``prewarm`` compiles both request-ID widths and
+both sparse-GQA row regimes without reading or mutating cache state and may be
+omitted when first-use JIT latency is acceptable.
 
 ``run`` executes the decode transaction behind one opaque mutating dispatcher
 boundary and never dispatches the slow functions in
@@ -94,10 +94,10 @@ META = OpMeta(
     since="1.3.0",
     notes=(
         "The Qwen sparse-GQA layout uses split CuTeDSL kernels for at most "
-        "64 query rows and a direct paged Triton kernel for larger prefill "
-        "batches. Unsupported geometry fails closed. Main K/V cache writes "
-        "are unsupported. Page- and state-slot-scaled addressing uses signed "
-        "64-bit arithmetic."
+        "64 query rows. Larger prefills use the selected-position specialization "
+        "of the CuTe paged-forward engine. "
+        "Unsupported geometry fails closed. Main K/V cache writes are unsupported. "
+        "Page- and state-slot-scaled addressing uses signed 64-bit arithmetic."
     ),
 )
 
