@@ -1,4 +1,4 @@
-"""Lossless BF16 PCIe two-shot all-reduce runtime (reduce_scatter + all_gather).
+"""Single-rounding BF16 PCIe two-shot collective runtime.
 
 Host-side twin of :mod:`pcie_twoshot` without the fp8 wire codec: payloads
 travel as bf16 packs, are accumulated in fp32 in a fixed rank order and
@@ -6,8 +6,9 @@ rounded once.  Intended for TP decode all-reduces above the one-shot
 ceiling (tens of KB) and below the DMA ring floor (MB), where NCCL ring is
 the incumbent.  Graph capture follows the two-shot contract: enter
 ``runtime.capture()`` around ``torch.cuda.graph``. All eager launches and graph
-replays from one instance must be serialized, and callers must stop submitting
-work before closing that instance.
+replays from one instance must be serialized. CUDA graph capture requires a
+caller-owned preallocated output for every operation. Callers must stop
+submitting work before closing that instance.
 """
 
 from __future__ import annotations
@@ -45,7 +46,6 @@ from .pcie_oneshot import (
     _run_collective_preallocation_setup,
 )
 from .pcie_twoshot import (
-    SUPPORTED_WORLD_SIZES,
     TWOSHOT_REQUIRED_SMS,
     _MAX_BLOCKS,
     _SIGNAL_BYTES,
@@ -53,6 +53,7 @@ from .pcie_twoshot import (
 )
 
 _PACK_ELEMS = 8
+SUPPORTED_WORLD_SIZES = (4,)
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,10 @@ class _TwoShotBf16Layout:
 
 def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16Layout:
     if world_size not in SUPPORTED_WORLD_SIZES:
-        raise ValueError(f"unsupported world size {world_size}")
+        raise ValueError(
+            "PCIeTwoShotBF16 supports only world size 4, "
+            f"got {world_size}"
+        )
     if max_rows <= 0 or max_rows % world_size != 0:
         raise ValueError("max_rows must be positive and divisible by world size")
     if row_elems <= 0 or row_elems % _PACK_ELEMS != 0:
@@ -111,7 +115,7 @@ def _require_disjoint(
 
 
 class PCIeTwoShotBF16:
-    """Serialized lossless BF16 reduce-scatter/all-gather/all-reduce runtime."""
+    """Serialized single-rounding BF16 collective runtime for world size 4."""
 
     def __init__(self, *args, **kwargs) -> None:
         raise RuntimeError("use PCIeTwoShotBF16.from_exchange_group()")
@@ -183,7 +187,10 @@ class PCIeTwoShotBF16:
             normalized_max_rows = int(max_rows)
             normalized_row_elems = int(row_elems)
             if world_size not in SUPPORTED_WORLD_SIZES:
-                raise ValueError(f"unsupported world size {world_size}")
+                raise ValueError(
+                    "PCIeTwoShotBF16 supports only world size 4, "
+                    f"got {world_size}"
+                )
             if device_obj.type != "cuda":
                 raise ValueError("PCIe twoshot requires a CUDA device")
             if normalized_max_rows <= 0:
@@ -533,6 +540,11 @@ class PCIeTwoShotBF16:
             if rows % self.world_size != 0:
                 raise ValueError("rows must be divisible by world size")
             if out is None:
+                if _is_current_stream_capturing(self.device):
+                    raise RuntimeError(
+                        "PCIeTwoShotBF16.reduce_scatter CUDA graph capture "
+                        "requires a caller-owned preallocated output"
+                    )
                 out = torch.empty(
                     rows // self.world_size,
                     self.row_elems,
@@ -567,6 +579,11 @@ class PCIeTwoShotBF16:
             rows = payload.shape[0]
             self._check(payload, rows)
             if out is None:
+                if _is_current_stream_capturing(self.device):
+                    raise RuntimeError(
+                        "PCIeTwoShotBF16.all_gather CUDA graph capture requires "
+                        "a caller-owned preallocated output"
+                    )
                 out = torch.empty(
                     rows * self.world_size,
                     self.row_elems,
@@ -634,13 +651,18 @@ class PCIeTwoShotBF16:
         threads: int = 512,
         block_limit: int = 64,
     ) -> torch.Tensor:
-        """Lossless bf16 all-reduce: one pull-based launch (2 barriers)."""
+        """FP32-accumulating BF16 all-reduce with one BF16 rounding."""
         if not self.accepts(inp):
             raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
         rows = inp.numel() // self.row_elems
         payload = inp.view(rows, self.row_elems)
         with _device_guard(self.device):
             if out is None:
+                if _is_current_stream_capturing(self.device):
+                    raise RuntimeError(
+                        "PCIeTwoShotBF16.all_reduce CUDA graph capture requires "
+                        "a caller-owned preallocated output"
+                    )
                 out = torch.empty_like(inp)
             self._check_tensor(
                 out,

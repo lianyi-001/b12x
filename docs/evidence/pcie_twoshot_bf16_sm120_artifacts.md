@@ -1,8 +1,12 @@
 # BF16 PCIe two-shot artifact map
 
-Status: **qualified test artifacts** for the four-rank CUDA-graph and eager
-correctness run documented in
+Status: **qualified historical test artifacts** for B12X commit
+`7edd604a621ddbc3db1545e54d0e7031090bace5` and the four-rank CUDA-graph and
+eager correctness run documented in
 [`pcie_twoshot_bf16_sm120.md`](pcie_twoshot_bf16_sm120.md).
+These artifacts do not qualify source revisions containing the TP4-only gate
+and expanded graph-replay checks; that implementation requires a fresh
+assigned-GPU TP4 run and a new artifact map.
 
 The isolated compile cache contained 36 CUTLASS DSL objects: three collective
 operations, four ranks, and three slot-selection modes per rank. `eager` means
@@ -39,15 +43,24 @@ directory for compiler objects, while
 `B12X_CUTE_COMPILE_CACHE_DIR=/test-cache/cute` recorded the same durable
 location in each manifest's compile environment. After running the four-rank
 correctness command from the qualification document, the following verifier
-checks all 36 indexed manifests and objects. `CACHE_DIR` must name the
-resulting compile-cache directory, and `B12X_ROOT` must name a checkout of the
-source revision above.
+checks the exact source identity plus all 36 indexed manifests and objects.
+`CACHE_DIR` must name the resulting compile-cache directory,
+`B12X_SOURCE_ROOT` must name a checkout of the source revision above, and
+`INDEX_PATH` must name this reviewed artifact-map file. The artifact map need
+not exist in the historical source checkout.
 
 ```bash
 readonly CACHE_DIR=/test-cache/cute
-readonly B12X_ROOT="$(git rev-parse --show-toplevel)"
-python - "$CACHE_DIR" "$B12X_ROOT" \
-  "$B12X_ROOT/docs/evidence/pcie_twoshot_bf16_sm120_artifacts.md" <<'PY'
+readonly B12X_SOURCE_ROOT=/path/to/b12x-at-7edd604a621ddbc3db1545e54d0e7031090bace5
+readonly INDEX_PATH="$(git rev-parse --show-toplevel)/docs/evidence/pcie_twoshot_bf16_sm120_artifacts.md"
+readonly EXPECTED_COMMIT=7edd604a621ddbc3db1545e54d0e7031090bace5
+readonly EXPECTED_REPOSITORY_TREE=19f23a8eeb2dc5f6eadceee791afae9a545f2eaf
+readonly EXPECTED_B12X_TREE=5c13b2d9809025c5bf83c9ddb9071352acb60c0f
+test "$(git -C "$B12X_SOURCE_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
+test "$(git -C "$B12X_SOURCE_ROOT" rev-parse 'HEAD^{tree}')" = "$EXPECTED_REPOSITORY_TREE"
+test "$(git -C "$B12X_SOURCE_ROOT" rev-parse HEAD:b12x)" = "$EXPECTED_B12X_TREE"
+test -f "$INDEX_PATH"
+python - "$CACHE_DIR" "$B12X_SOURCE_ROOT" "$INDEX_PATH" <<'PY'
 import hashlib
 import json
 import sys

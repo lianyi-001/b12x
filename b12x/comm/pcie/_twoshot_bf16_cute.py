@@ -1,4 +1,4 @@
-"""CuTeDSL kernels for lossless BF16 PCIe two-shot collectives.
+"""CuTeDSL kernels for single-rounding BF16 PCIe two-shot collectives.
 
 Structure mirrors :mod:`_twoshot_cute` (the fp8-transport variant): phase one
 pushes this rank's shard into every peer's IPC staging slot (posted PCIe
@@ -50,6 +50,7 @@ from ._twoshot_cute import (
 
 _PREPARED_BF16_LAUNCHERS: set[tuple[object, ...]] = set()
 _PACK_ELEMS = 8  # bf16 values per 16-byte pack
+_SUPPORTED_WORLD_SIZE = 4
 
 
 class _TwoShotBf16Launch:
@@ -514,8 +515,11 @@ def get_twoshot_bf16_launcher(
         device_index,
     )
     del device_index  # part of the process-local cache key
-    if world_size not in (2, 4, 8):
-        raise ValueError(f"unsupported world size {world_size}")
+    if world_size != _SUPPORTED_WORLD_SIZE:
+        raise ValueError(
+            "single-rounding BF16 two-shot launchers require world size 4, "
+            f"got {world_size}"
+        )
     if rank < 0 or rank >= world_size:
         raise ValueError(f"rank {rank} is outside world size {world_size}")
     if threads <= 0 or threads > 512 or threads % 32 != 0:
@@ -638,7 +642,7 @@ def get_twoshot_bf16_launcher(
 
 
 class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
-    """Single-launch lossless bf16 all-reduce built on remote READS only.
+    """Single-launch BF16 all-reduce with one rounding, using remote reads.
 
     The kernel stages this rank's full payload into its own IPC slab using a
     local copy. After the first barrier, every rank pulls its shard (P/world
@@ -905,8 +909,11 @@ def get_twoshot_bf16_allreduce_launcher(
         device_index,
     )
     del device_index
-    if world_size not in (2, 4, 8):
-        raise ValueError(f"unsupported world size {world_size}")
+    if world_size != _SUPPORTED_WORLD_SIZE:
+        raise ValueError(
+            "single-rounding BF16 two-shot launchers require world size 4, "
+            f"got {world_size}"
+        )
     if rank < 0 or rank >= world_size:
         raise ValueError(f"rank {rank} is outside world size {world_size}")
     if threads <= 0 or threads > 512 or threads % 32 != 0:
