@@ -1,16 +1,24 @@
 # Single-rounding BF16 PCIe two-shot collective qualification
 
-Retained evidence status: **qualified** for the exact historical source
-revisions identified below on four-GPU tensor-parallel GLM-5.3-Flash decode
-with NVIDIA RTX PRO 6000 Blackwell GPUs (SM120).
+Implementation status: **qualified** for B12X commit
+`bf3699b87fc1751e4eccf10f18361799d5ef8b86`, repository tree
+`48744e1ae3cff42021df1ca478b2e64f36afea61`, and `b12x/` tree
+`6d6af03e23c7b535aaaa82ae1dddb10f5c216edf`. The TP4-only gate,
+caller-owned graph outputs, and expanded replay checks passed on physical GPUs
+0 through 3 of the qualification host. All four devices are NVIDIA RTX PRO
+6000 Blackwell Max-Q Workstation Edition GPUs.
 
-Implementation status for the TP4-only gate, caller-owned graph outputs, and
-expanded replay checks described by the test in this source tree:
-**implemented; GPU qualification pending**. A fresh four-rank run on assigned
-GPUs is required before that source revision can be called qualified. The
-retained compile artifacts bind B12X commit
-`7edd604a621ddbc3db1545e54d0e7031090bace5`; they do not qualify later source
-trees.
+The qualification used a fresh isolated compile cache. It produced 36 CUTLASS
+DSL manifests and 36 objects: reduce-scatter, all-gather, and pull all-reduce
+for four ranks in eager, graph-slot-0, and graph-slot-1 modes. Every manifest
+and object hash verified, coverage was exact, and every manifest carried
+package fingerprint
+`7171ff95b5efdb9bb27787ef64e788866560c83394cbf665db4df38e7afedbfd`.
+
+The retained serving measurements and indexed artifact table below remain
+historical evidence for commit `7edd604a621ddbc3db1545e54d0e7031090bace5`.
+They do not attribute serving throughput to the qualified implementation
+commit above.
 
 The `PCIeTwoShotBF16` collective transfers BF16 payloads over CUDA peer memory,
 accumulates values in FP32 in a fixed rank order, and rounds the result to BF16
@@ -28,6 +36,25 @@ The distributed qualification test is:
 NCCL_ALGO=Ring CUDA_VISIBLE_DEVICES=4,5,6,7 \
 python -m torch.distributed.run --nproc-per-node=4 \
   tests/comm/test_pcie_twoshot_bf16.py
+```
+
+The implementation qualification used the already selected physical devices
+0 through 3 without changing `CUDA_VISIBLE_DEVICES`:
+
+```bash
+readonly CACHE_DIR=/path/to/fresh/compile-cache
+PYTHONPATH="$PWD" \
+B12X_COMPILE_CACHE_DIR="$CACHE_DIR" \
+B12X_CUTE_COMPILE_CACHE_DIR="$CACHE_DIR" \
+NCCL_ALGO=Ring \
+python -m torch.distributed.run --nproc-per-node=4 \
+  tests/comm/test_pcie_twoshot_bf16.py
+```
+
+The run completed with:
+
+```text
+pcie_twoshot_bf16 correctness OK (4 ranks, all_reduce_rows=(8, 16, 32, 64, 96, 128, 192, 256, 512), workspace_max_rows=512)
 ```
 
 The test in this source tree executes all three public collectives at multiple

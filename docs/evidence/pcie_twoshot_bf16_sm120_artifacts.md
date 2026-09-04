@@ -1,12 +1,18 @@
 # BF16 PCIe two-shot artifact map
 
-Status: **qualified historical test artifacts** for B12X commit
-`7edd604a621ddbc3db1545e54d0e7031090bace5` and the four-rank CUDA-graph and
-eager correctness run documented in
+Current implementation status: **qualified** for B12X commit
+`bf3699b87fc1751e4eccf10f18361799d5ef8b86`. A fresh isolated compile cache
+contained exactly 36 manifests and 36 objects covering three operations, four
+ranks, and eager plus both graph-slot modes. Every object matched the SHA-256
+stored in its manifest, every cache key matched its manifest path, and every
+manifest carried package fingerprint
+`7171ff95b5efdb9bb27787ef64e788866560c83394cbf665db4df38e7afedbfd`.
+The qualification command and exact source trees are recorded in
 [`pcie_twoshot_bf16_sm120.md`](pcie_twoshot_bf16_sm120.md).
-These artifacts do not qualify source revisions containing the TP4-only gate
-and expanded graph-replay checks; that implementation requires a fresh
-assigned-GPU TP4 run and a new artifact map.
+
+The indexed table below is **qualified historical test evidence** for B12X
+commit `7edd604a621ddbc3db1545e54d0e7031090bace5`; its cache keys and hashes are
+not attributed to the qualified implementation commit above.
 
 The isolated compile cache contained 36 CUTLASS DSL objects: three collective
 operations, four ranks, and three slot-selection modes per rank. `eager` means
