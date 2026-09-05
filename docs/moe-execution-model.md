@@ -85,7 +85,46 @@ The current kernel families map onto those axes as follows:
 |---|---|---|---|---|
 | direct micro W4A4 / W4A8-on-NVFP4 | direct top-k | inline | direct | source-native |
 | unified dynamic W4A4/W4A8 | append-only expert rows; direct top-k at tiny M | precomputed, or experimental streaming | atomic queue, persistent grid, fixed arithmetic domain, or ready queue | MMA views; native W4A8 uses N256/K128 QMMA repack |
-| W4A16 tensor-core | sorted/padded; direct at small M | precomputed; inline at small M | persistent grid | MMA-packed |
+| native NVFP4 W4A16 decode | direct top-k | inline | persistent grid | source-native payload and block scales |
+| W4A16 tensor-core | sorted/padded; direct at small M for MMA-packed weights | precomputed; inline at small M | persistent grid | MMA-packed or native ModelOpt payload; separate scale permutation |
+
+## Sharing NVFP4 storage across activation precisions
+
+**Implemented:** the ModelOpt NVFP4 W4A16 decode consumer reads the same packed
+FP4 payload and swizzled E4M3 K/16 block-scale allocations as W4A4. It uses BF16
+activation inputs and raw weight global scales. It does not quantize activation
+operands to FP4 or convert weight scales to an MXFP8 representation.
+
+Create separate activation and execution plans over the same `PackedWeights`
+buffers. Select `WeightPacking.SOURCE_NATIVE` for the A16 weight plan and prewarm
+the A4 and A16 execution plans. Native micro callables are first resolved by bound
+execution; warm each intended decode count before freezing kernel resolution and
+capturing its graph. `PackedWeights` accepts raw weight
+global scales for both modes; A4 preparation derives its runtime alphas from those
+globals and the reciprocal activation scales. A16 preparation supplies unit
+activation scales and retains the raw weight globals for decode.
+
+The direct native decode kernel supports one through eight tokens subject to its
+model-geometry contract. Plan an A16 decode capacity within that range. The
+canonical scratch plan retains the routing policy selected for its capacity; a
+larger capacity can select expert-packed routing even when the bound input has
+one token. A4 prefill can use a separate, larger execution capacity over the same
+weight storage.
+
+Native A16 preparation also builds scale metadata for its tensor-core consumer.
+That metadata is separate from the shared source block scales. The tensor-core
+consumer stages native packed bytes into swizzled shared memory and assembles MMA
+register operands inline. Dedicated A16 prefill/decode can instead select
+`WeightPacking.MMA_PACKED`. MMA-packed preparation takes ownership of its input
+storage and may repack it in place; retain separate input allocations if a
+source-native owner also needs those weights.
+
+`benchmarks/benchmark_w4a16_nvfp4_layouts.py` compares both A16 layouts through
+public planned execution, with checkpoint provenance, pointer and byte-identity
+checks, A16 oracles, frozen-resolution graph capture, fixed scratch, and
+interleaved warm- or cold-cache replay. It separately gates A4 prefill and
+A4/A16 switching against the NVFP4 oracle. Shared storage alone does not imply
+latency parity or qualification of the precision-switching path.
 
 ## Why queue versus grid exists
 

@@ -196,6 +196,39 @@ _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR = 7
 _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR = 8
 
 
+@dsl_user_op
+def _pack_modelopt_words(
+    a0: Uint32, a1: Uint32, b0: Uint32, b1: Uint32, byte_index: Uint32,
+    *, loc=None, ip=None,
+) -> Uint32:
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [value.ir_value(loc=loc, ip=ip) for value in (a0, a1, b0, b1, byte_index)],
+        """
+        {
+            .reg .b32 sel, a, b, q, t, u;
+            mad.lo.u32 sel, $5, 17, 64;
+            prmt.b32 a, $1, $2, sel;
+            prmt.b32 b, $3, $4, sel;
+            prmt.b32 q, a, b, 0x5410;
+            shr.u32 t, q, 4;
+            xor.b32 t, t, q;
+            and.b32 t, t, 0x00f000f0;
+            shl.b32 u, t, 4;
+            xor.b32 q, q, t;
+            xor.b32 q, q, u;
+            prmt.b32 $0, q, q, 0x3120;
+        }
+        """,
+        "=r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    ))
+
+
 def _trellis256_execution_lut(
     device: torch.device | str, codebook: str
 ) -> torch.Tensor:
@@ -801,6 +834,7 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
             dynamic_down_scale=False,
             w4a16_mode=True,
             scale_format=scale_format,
+            e4m3_scale_layout="modelopt",
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -4031,6 +4065,11 @@ class W4A16GemmKernel:
         return source_n
 
     @cute.jit
+    def _modelopt_smem_permuted_offset(self, byte_offset: Int32) -> Int32:
+        # Distribute row gathers across banks while preserving 16-byte alignment.
+        return byte_offset ^ ((byte_offset >> Int32(3)) & Int32(0x70))
+
+    @cute.jit
     def _stage_b_tile_modelopt_native(
         self,
         b_u8_flat: cute.Tensor,
@@ -4089,44 +4128,6 @@ class W4A16GemmKernel:
             )
 
     @cute.jit
-    def _load_modelopt_shared_byte(
-        self,
-        smem_base: Int32,
-        pipe: Int32,
-        n_tile: Int32,
-        k_tile: Int32,
-        warp_id: Int32,
-        tc_col: Int32,
-        tc_row: Int32,
-        n_delta: cutlass.Constexpr[int],
-        k_delta: cutlass.Constexpr[int],
-    ) -> Uint32:
-        local_n = n_tile * Int32(64) + warp_id * Int32(16) + tc_col + Int32(n_delta)
-        local_k = k_tile * Int32(16) + tc_row + Int32(k_delta)
-        byte_offset = local_n * Int32(self.tile_k // 2) + local_k // Int32(2)
-        word_byte_offset = byte_offset - (byte_offset & Int32(3))
-        word = ld_shared_u32(
-            smem_base
-            + Int32(self.sh_b_off * 16)
-            + pipe * Int32(self.b_sh_stage * 16)
-            + word_byte_offset
-        )
-        shift = Uint32((byte_offset - word_byte_offset) * Int32(8))
-        return (word >> shift) & Uint32(0xFF)
-
-    @cute.jit
-    def _pack_modelopt_byte_pair(
-        self,
-        word: Uint32,
-        q: Uint32,
-        low_shift: cutlass.Constexpr[int],
-        high_shift: cutlass.Constexpr[int],
-    ) -> Uint32:
-        low = q & Uint32(0xF)
-        high = (q >> Uint32(4)) & Uint32(0xF)
-        return word | (low << Uint32(low_shift)) | (high << Uint32(high_shift))
-
-    @cute.jit
     def _load_modelopt_shared_packed_word_for_lane(
         self,
         smem_base: Int32,
@@ -4137,24 +4138,22 @@ class W4A16GemmKernel:
         tc_col: Int32,
         tc_row: Int32,
     ) -> Uint32:
-        q0 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 0
+        local_n = n_tile * Int32(64) + warp_id * Int32(16) + tc_col
+        byte_offset = local_n * Int32(self.tile_k // 2) + k_tile * Int32(8)
+        stage_base = (
+            smem_base
+            + Int32(self.sh_b_off * 16)
+            + pipe * Int32(self.b_sh_stage * 16)
         )
-        q1 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 0, 8
+        a0, a1 = ld_shared_v2_u32(
+            stage_base + self._modelopt_smem_permuted_offset(byte_offset)
         )
-        q2 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 0
+        b0, b1 = ld_shared_v2_u32(
+            stage_base + self._modelopt_smem_permuted_offset(
+                byte_offset + Int32(8 * (self.tile_k // 2))
+            )
         )
-        q3 = self._load_modelopt_shared_byte(
-            smem_base, pipe, n_tile, k_tile, warp_id, tc_col, tc_row, 8, 8
-        )
-        word = Uint32(0)
-        word = self._pack_modelopt_byte_pair(word, q0, 0, 16)
-        word = self._pack_modelopt_byte_pair(word, q1, 4, 20)
-        word = self._pack_modelopt_byte_pair(word, q2, 8, 24)
-        word = self._pack_modelopt_byte_pair(word, q3, 12, 28)
-        return word
+        return _pack_modelopt_words(a0, a1, b0, b1, Uint32(tc_row // Int32(2)))
 
     @cute.jit
     def _load_b_registers_modelopt_shared(
@@ -4490,6 +4489,14 @@ class W4A16GemmKernel:
                     get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
                 )
             else:
+                b_dst = (
+                    smem_base
+                    + Int32(self.sh_b_off * 16)
+                    + pipe * Int32(self.b_sh_stage * 16)
+                    + self._modelopt_smem_permuted_offset(
+                        (Int32(i * self.cta_threads) + tid) * Int32(16)
+                    )
+                )
                 self._stage_b_tile_modelopt_native(
                     b_i32_flat,
                     b_dst,
@@ -11995,8 +12002,7 @@ def run_w4a16_moe(
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
         if _small_m_direct_host_barrier_reset_enabled():
-            barrier_count.zero_()
-            barrier_epoch.zero_()
+            prepared.workspace[-2:].zero_()
         torch.ops.b12x.w4a16_small_m_direct_launch(
             a_input,
             prepared.w13.view(torch.uint8),
