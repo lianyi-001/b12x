@@ -233,7 +233,8 @@ separately.
 
 The `modelopt-nvfp4-auto` recipe races A4 and A16 over shared native NVFP4
 storage for SiLU. It selects precision at execution capacity, covers only
-exact measured capacities, and uses A4 heuristics on misses. It independently
+exact measured capacities, and falls back to native A16 direct decode at
+capacities 1–8 on SM120 and SM121 when supported, or A4 otherwise. It independently
 qualifies every capacity without coarse precision pruning. A16 wins confirmed
 median parity as well as speedups; each candidate uses its own precision oracle.
 See [MoE storage and precision planning](moe-execution-model.md#sharing-nvfp4-storage-across-activation-precisions).

@@ -2026,7 +2026,10 @@ def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_pa
     assert resolved.config.backend == "w4a16"
     miss = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**{**query, "num_tokens": 2, "routed_rows": 4}))
     assert miss.source is PolicySource.HEURISTIC
-    assert miss.config.backend != "w4a16"
+    assert miss.config.backend == "w4a16"
+    measured_a4 = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**query))
+    assert measured_a4.source is PolicySource.PREPLANNED
+    assert measured_a4.config.backend == "micro"
     heuristic = PolicyContext.for_identity(_DEVICE, mode=PolicyMode.HEURISTIC_ONLY, registry=registry)
     assert heuristic.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**query)).source is PolicySource.HEURISTIC
     generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
@@ -2066,3 +2069,32 @@ def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(p
     assert override.config == a4
     unknown = PolicyContext.for_identity(replace(profile.targets[0], product_name="Unmeasured GPU"))
     assert unknown.resolve(MOE_DECODE_POLICY, query).source is PolicySource.HEURISTIC
+    assert unknown.resolve(MOE_DECODE_POLICY, query).config.backend == "w4a16"
+
+
+@pytest.mark.parametrize("capability", [(12, 0), (12, 1)])
+@pytest.mark.parametrize("capacity", [1, 2, 4, 6, 8, 9, 16])
+def test_auto_precision_heuristic_promotes_supported_decode(capability, capacity):
+    from dataclasses import replace
+    from b12x.policy import PolicyContext, PolicyMode, PolicySource
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+
+    device = replace(_DEVICE, compute_capability=capability)
+    policy = PolicyContext.for_identity(device, mode=PolicyMode.HEURISTIC_ONLY)
+    query = MoeDecodeQuery(
+        quant_mode="nvfp4_auto", source_format="modelopt_nvfp4", activation="silu",
+        num_experts=256, hidden_size=6144, intermediate_size=256, top_k=8,
+        num_tokens=capacity, routed_rows=capacity * 8,
+    )
+    resolution = policy.resolve(MOE_DECODE_POLICY, query)
+    assert resolution.source is PolicySource.HEURISTIC
+    assert (resolution.config.backend == "w4a16") is (capacity <= 8)
+    for unsupported in (
+        replace(query, hidden_size=192),
+        replace(query, top_k=33, routed_rows=capacity * 33),
+        replace(query, quant_mode="nvfp4"),
+    ):
+        assert policy.resolve(MOE_DECODE_POLICY, unsupported).config.backend != "w4a16"
+    for other_device in (None, replace(device, compute_capability=(10, 0))):
+        other = PolicyContext.for_identity(other_device, mode=PolicyMode.HEURISTIC_ONLY)
+        assert other.resolve(MOE_DECODE_POLICY, query).config.backend != "w4a16"

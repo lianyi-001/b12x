@@ -126,8 +126,10 @@ medians. A16 is eligible when its aggregate is no slower than every qualified
 A4 candidate in both the initial paired race and an independent confirmation.
 Exact ties favor A16; there is no five-percent promotion margin.
 Confidence intervals and raw samples remain in local evidence. Precision
-choices cover exact measured capacities, with A4 heuristics for uncovered
-queries. Candidate losses at one capacity do not prune other capacities.
+choices cover exact measured capacities. For uncovered queries on SM120 and
+SM121, the heuristic selects native A16 direct decode at capacities 1–8 when
+the kernel supports the geometry, and A4 otherwise. Candidate losses at one
+capacity do not prune other capacities.
 
 **Qualified:** for GLM-5.2 layer 3, TP8 (H=6144, I=256, E=256, top-k=8),
 the embedded RTX PRO 6000 Blackwell Max-Q and GB10 profiles select A16 at
