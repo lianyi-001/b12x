@@ -61,16 +61,12 @@ def _validate(query, config, device):
 
 
 def _heuristic(query, device):
-    if (device is not None and device.compute_capability == (12, 0)
-            and query.recipe == "nvfp4" and query.in_features >= 4096
-            and query.in_features % 128 == 0 and query.out_features % 8 == 0):
-        output_tiles = (query.out_features + 127) // 128
-        # Four K slices fill between two thirds and one SM wave for this
-        # output grid. Short-K and wider grids retain quantized activations.
-        if output_tiles * 4 <= device.sm_count <= output_tiles * 6:
-            return BlockscaledConfig(a16_rows=tuple(
-                (m, 128, 64, 4) for m in range(1, 9)
-            ))
+    if (device is not None and device.compute_capability in ((12, 0), (12, 1))
+            and query.recipe in ("nvfp4", "mxfp8")
+            and query.in_features % 32 == 0 and query.out_features % 8 == 0):
+        return BlockscaledConfig(a16_rows=tuple(
+            (m, 128, 64, 4) for m in range(1, 9)
+        ))
     return BlockscaledConfig()
 
 

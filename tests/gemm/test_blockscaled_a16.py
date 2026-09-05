@@ -220,11 +220,11 @@ def test_quantized_nvfp4_activation_contract():
 def test_quantized_graph_and_dispatch(recipe):
     require_b12x()
     weight, _, _ = make_weight(recipe, 128, 256)
-    source = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(8, 128, device="cuda", dtype=torch.bfloat16)
+    source = torch.randn(9, 256, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(9, 128, device="cuda", dtype=torch.bfloat16)
     workspace = torch.empty(blockscaled.workspace_size(weight, 16), device="cuda", dtype=torch.uint8)
     options = {"activation_global_scale": torch.tensor([128.], device="cuda")} if recipe == "nvfp4" else {}
-    blockscaled.prewarm(weight, [1, 2, 8, 16], workspace=workspace, **options)
+    blockscaled.prewarm(weight, [1, 2, 8, 9, 16], workspace=workspace, **options)
     expected = blockscaled.mm(source, weight, mode="quantized", **options)
     actual = blockscaled.mm(source, weight, mode="auto", **options)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -121,13 +121,12 @@ an M threshold. M values omitted from that config retain quantized activation
 execution. Measurements establish a projection's end-to-end crossover; they
 do not isolate tensor-core instruction latency as its cause.
 
-For an uncovered device or model geometry, the registered component heuristic
-promotes NVFP4 to A16 at M=1 through 8 when K is at least 4096 and divisible by
-128, N is divisible by 8, and `ceil(N/128) * 4 <= SM_count <= ceil(N/128) * 6`.
-It chooses a 128-column, K=64 tile with four K slices. The output grid then
-occupies between two thirds and one SM wave. Other NVFP4 cases and MXFP8 retain
-quantized activations. This is a heuristic prediction, not a measured guarantee
-for an uncovered geometry or device.
+For an uncovered device or model geometry on SM120/SM121, the registered
+component heuristic promotes both NVFP4 and MXFP8 to A16 at M=1 through 8.
+It requires K divisible by 32 and N divisible by 8, and chooses a 128-column,
+K=64 tile with four K slices. Larger M retains quantized activations. This is
+a heuristic prediction, not a measured guarantee for an uncovered geometry
+or device.
 
 Autotuned entries take precedence over the heuristic, including an entry that
 selects quantized activation execution for every M. `B12X_POLICY_MODE` supports
@@ -246,7 +245,7 @@ NVFP4 and 62 MXFP8 A16 promotion routes under the 0% threshold:
 
 Every promoted route passed the latency comparison in both independent timing
 passes. All measured M values from 64 through 2048 retain quantized activations.
-The uncovered-geometry heuristic also retains quantized activations on GB10.
+The uncovered-geometry heuristic promotes to A16 at M=1 through 8 on GB10.
 Explicit `mode="a16"` is supported.
 
 For N=4096, K=5376, representative independent-confirmation cold-L2 graph

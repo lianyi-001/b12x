@@ -100,21 +100,24 @@ def test_exact_row_dispatch_and_policy_precedence():
     assert set(BLOCKSCALED_POLICY.encode_query(query)) == {"recipe", "in_features", "out_features"}
 
 
-def test_geometry_heuristic_and_autotuned_quantized_decision():
-    measured = _context({"a16_rows": []})
+@pytest.mark.parametrize("profile_id", ["nvidia.rtx.pro.6000.blackwell.max-q", "nvidia.gb10.48sm"])
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+def test_small_m_heuristic_and_autotuned_quantized_decision(profile_id, recipe):
+    measured = _context({"a16_rows": []}, EMBEDDED_REGISTRY.get(profile_id).targets[0])
     context = PolicyContext.for_identity(measured.device, mode=PolicyMode.HEURISTIC_ONLY)
-    query = BlockscaledQuery(recipe="nvfp4", in_features=5376, out_features=4096)
-    predicted = context.resolve(BLOCKSCALED_POLICY, query)
-    assert predicted.source is PolicySource.HEURISTIC
-    assert predicted.config.select(1) == predicted.config.select(8) == (128, 64, 4)
-    assert predicted.config.select(9) is None
-    assert measured.resolve(BLOCKSCALED_POLICY, query).config.select(1) is None
-    for other in (replace(query, recipe="mxfp8"), replace(query, in_features=1024),
-                  replace(query, out_features=17408)):
-        assert not context.resolve(BLOCKSCALED_POLICY, other).config.a16_rows
-    gb10 = PolicyContext.for_identity(EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0],
-                                     mode=PolicyMode.HEURISTIC_ONLY)
-    assert not gb10.resolve(BLOCKSCALED_POLICY, query).config.a16_rows
+    for k, n in ((5376, 4096), (1024, 17408), (2560, 3584), (2560, 640),
+                 (1536, 2560), (2560, 320)):
+        query = BlockscaledQuery(recipe=recipe, in_features=k, out_features=n)
+        predicted = context.resolve(BLOCKSCALED_POLICY, query)
+        assert predicted.source is PolicySource.HEURISTIC
+        assert all(predicted.config.select(m) == (128, 64, 4) for m in range(1, 9))
+        assert predicted.config.select(0) is None
+        assert predicted.config.select(9) is None
+        assert predicted.config.select(16) is None
+        assert measured.resolve(BLOCKSCALED_POLICY, query).config.select(1) is None
+    assert not context.resolve(BLOCKSCALED_POLICY, replace(query, out_features=7)).config.a16_rows
+    unsupported = replace(context.device, compute_capability=(9, 0))
+    assert not PolicyContext.for_identity(unsupported).resolve(BLOCKSCALED_POLICY, query).config.a16_rows
 
 
 def test_embedded_precision_coverage_is_exact_to_max_q_and_geometry():
