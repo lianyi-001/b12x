@@ -16,9 +16,10 @@ def _execute_impl(source, values, scales, global_scale, activation_scale, worksp
                                    input_k, values.shape[0])
     else:
         # This invocation consumes only the shared MMA scale storage.
+        scales = scales.view(torch.float8_e8m0fnu)
         weight = MXFP8LinearWeight(MXFP8Rows(values, None, scales), input_k,
                                    values.shape[1], values.shape[0])
-        if mode == "auto" and out is None and workspace is None and config is None:
+        if mode in ("auto", "quantized") and out is None and workspace is None and config is None:
             from ._a16 import _select_mode
             from ._linear import mxfp8_linear
             selected, _ = _select_mode(mode, source, weight)

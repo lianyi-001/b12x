@@ -279,16 +279,16 @@ def workspace_size(weight, max_tokens: int, *, _config=None) -> int:
 def _select_mode(mode, source, weight):
     if mode not in ("auto", "a16", "quantized"):
         raise ValueError("mode must be 'auto', 'a16', or 'quantized'")
-    if mode != "auto":
+    if mode == "quantized":
         return mode, None
     if (weight.in_features != weight.padded_in_features
             or not source.is_contiguous() or source.data_ptr() % 16):
-        return "quantized", None
+        return ("a16" if mode == "a16" else "quantized"), None
     from ._policy import resolve_precision
     recipe = "nvfp4" if isinstance(weight, NVFP4LinearWeight) else "mxfp8"
     resolution = resolve_precision(source.device, recipe, weight.in_features, weight.out_features)
     config = resolution.config.select(source.numel() // weight.in_features)
-    return ("a16", config) if config is not None else ("quantized", None)
+    return ("a16", config) if mode == "a16" or config is not None else ("quantized", None)
 
 
 def bf16_linear(source, weight, *, out=None, workspace=None, mode="auto",

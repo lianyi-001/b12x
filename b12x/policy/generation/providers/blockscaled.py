@@ -15,7 +15,7 @@ from b12x.policy.generation.reducer import DecisionRecord, build_axis_tree
 from b12x.policy.generation.sweep import DiscreteSweepGenerator, SweepCandidate, SweepCase, SweepMeasurement
 from b12x.policy.types import FrozenMapping
 
-GEOMETRIES = ((4096, 5376), (16384, 1024), (17408, 5120), (5120, 17408))
+GEOMETRIES = ((4096, 5376), (16384, 1024), (17408, 5120), (5120, 17408), (248320, 2560))
 ROW_COUNTS = (*range(1, 17), 24, 32, 64, 128, 256, 512, 1024, 2048)
 QUERY_FIELDS = ("recipe", "in_features", "out_features")
 
@@ -251,7 +251,7 @@ class BlockscaledPrecisionGenerator(DiscreteSweepGenerator):
         for record in records:
             key = tuple(record.query[field] for field in QUERY_FIELDS)
             grouped[key].extend(record.config["a16_rows"])
-        merged = tuple(DecisionRecord(query=FrozenMapping(dict(zip(QUERY_FIELDS, key))),
+        merged = tuple(DecisionRecord(query=FrozenMapping(dict(zip(QUERY_FIELDS, key, strict=False))),
                                       config=FrozenMapping({"a16_rows": sorted(rows)}))
                        for key, rows in grouped.items())
         return build_axis_tree(merged, field_order=QUERY_FIELDS, range_fields=frozenset())

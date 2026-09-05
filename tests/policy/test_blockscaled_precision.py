@@ -49,6 +49,8 @@ def test_sm121_accepts_measured_a16_routes():
     ("mxfp8", 16384, 1024, (*range(1, 15), 16, 24, 32)),
     ("mxfp8", 17408, 5120, (1, 2, 3, *range(7, 17))),
     ("mxfp8", 5120, 17408, tuple(range(1, 17))),
+    ("nvfp4", 248320, 2560, (1,)),
+    ("mxfp8", 248320, 2560, (1, 4)),
 ])
 def test_embedded_gb10_precision_selects_qualified_rows(recipe, n, k, rows):
     device = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0]
@@ -218,6 +220,8 @@ def test_auto_precision_preserves_explicit_mode_and_unqualified_source_layout(mo
     weight = SimpleNamespace(in_features=128, padded_in_features=128, out_features=128)
     source = torch.empty(8, 128, dtype=torch.bfloat16)
     assert _select_mode("auto", source, weight) == ("a16", (64, 64, 1))
+    assert _select_mode("a16", source, weight) == ("a16", (64, 64, 1))
+    assert _select_mode("a16", source[:1], weight) == ("a16", None)
     assert _select_mode("quantized", source, weight) == ("quantized", None)
     assert _select_mode("auto", source.T.contiguous().T, weight) == ("quantized", None)
     misaligned = torch.empty(8 * 128 + 1, dtype=torch.bfloat16)[1:].view(8, 128)

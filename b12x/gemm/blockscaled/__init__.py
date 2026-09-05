@@ -15,6 +15,8 @@ the same swizzled weight scales as NVFP4/MXFP8 GEMM. Packed BF16-input calls
 accept ``mode='auto'|'a16'|'quantized'``. AUTO prefers an autotuned profile and
 uses a conservative geometry heuristic for uncovered queries. A16 is a specialization
 of ``DenseGemmKernel``, with BF16 warp MMA and inline weight dequantization.
+Forced A16 also uses qualified profile tile configurations when available,
+and retains BF16 activations at unprofiled row counts with the default tile.
 Its packed BF16 conversions require a PTX 9.2 toolchain (CUDA 13.3).
 
 NVFP4 packed weights require ``pack_weight(..., recipe='nvfp4', global_scale=g,

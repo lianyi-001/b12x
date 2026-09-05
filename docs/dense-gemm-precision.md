@@ -92,7 +92,7 @@ The registered offline component is `gemm.blockscaled_precision`:
 ```
 
 The corpus covers `(N,K)` equal to `(4096,5376)`, `(16384,1024)`,
-`(17408,5120)`, and `(5120,17408)`, for both recipes at M=1 through 16 and
+`(17408,5120)`, `(5120,17408)`, and `(248320,2560)`, for both recipes at M=1 through 16 and
 24, 32, 64, 128, 256, 512, 1024, and 2048. Each case races the quantized path
 against sixteen A16 configurations. Small-M MXFP8 also includes the existing
 fused activation-quantization GEMM as a baseline.
@@ -131,7 +131,9 @@ or device.
 Autotuned entries take precedence over the heuristic, including an entry that
 selects quantized activation execution for every M. `B12X_POLICY_MODE` supports
 the existing `heuristic-only` and `preplanned-only` qualification modes. Explicit
-`mode="a16"` or `mode="quantized"` bypasses promotion policy. Already-quantized
+`mode="a16"` or `mode="quantized"` fixes activation precision. Forced A16 uses
+the profile's tile configuration when one exists, otherwise the default A16
+tile. An explicit `_config` overrides that tile selection. Already-quantized
 activation inputs retain their supplied precision. A16 promotion requires an
 eligible BF16 input layout; MXFP8's functional API retains its established
 handling of noncontiguous input.
@@ -294,3 +296,54 @@ With the embedded profile loaded, the A16 and precision-policy suites passed
 output on promoted decode routes and exact quantized output on retained
 M=2048 routes under PREPLANNED_ONLY resolution, with poisoned-buffer graph
 replay and frozen kernel resolution for both recipes.
+
+
+## GB10 vocabulary projection extension
+
+The September 5, 2026 head measurements add exact `(N,K)=(248320,2560)`
+coverage on GB10. The target verifier uses M=4 with MTP=3; the compacted draft
+head uses M=1. The profile also covers MXFP8 M=1 for non-speculative decode.
+
+| Recipe | M | A16 tile `(N,K,split)` | A16, µs | Quantized wrapper, µs |
+| --- | ---: | --- | ---: | ---: |
+| NVFP4 | 1 | `(128,128,4)` | 1605.5 | 1741.3 |
+| MXFP8 | 1 | `(64,128,8)` | 2729.2 | 2882.5 |
+| MXFP8 | 4 | `(64,128,1)` | 2870.9 | 2936.8 |
+
+These are full projection measurements using the checkpoint LM-head weights,
+BF16 random hidden states, CUPTI, CUDA graph replay, and cold L2. The NVFP4
+baseline includes its dynamic activation global-maximum reduction. Weight
+preparation is excluded. Four blocks alternate candidate order, with 40 samples
+per arm per block. The table retains complete balanced blocks passing P0,
+zero throttling, and at most 30 MHz SM-clock drift; rejected blocks remain in
+the raw artifact. At least two valid blocks support each promoted route.
+NVFP4 M=4 measured 1706.1 versus 1699.3 µs, so it remains unpromoted in AUTO.
+
+The GPU was `GPU-fceb76a4-e080-225e-f0e6-64ca5eaafd1f`, with 48 SMs,
+PyTorch 2.13.0, CUTLASS DSL 4.6.2, and PTXAS 13.3.73. Starting source was
+`3b668de5`, in `/home/luke/projects/b12x-lm-head-a16`, with the PLE fixes.
+Raw timings, clock snapshots, checkpoint identity, source manifests, and the
+real-wrapper benchmark are under
+`/home/luke/projects/vllm-upstream-main/.profiles/qwen38-gb10-decode-20260904/mtp-optimizations/a16/`.
+The embedded profile records the raw artifact's SHA256 and qualified medians.
+The initial 16-configuration shape sweep is reproducible with:
+
+```bash
+CUTE_DSL_ARCH=sm_121a .venv/bin/python benchmarks/benchmark_dense_gemm.py \
+  --dtype fp4-a16 --n 248320 --k 2560 --shape-name qwen38-lm-head \
+  --batch-sizes 1 4 --warmup 25 --iters 25 --tune-a16 \
+  --evidence /tmp/qwen38-head-nvfp4.jsonl
+```
+
+Repeat with `--dtype fp8-a16` and a fresh evidence filename for MXFP8.
+The actual-checkpoint comparison reduced relative logit error against the
+original BF16 weight by roughly 30% when preserving BF16 activations. This
+numerical diagnostic uses synthetic hidden states, not a language-model
+accuracy benchmark.
+
+The integration also qualifies the opaque custom-op boundary through AOT
+compilation. Its schema uses `activation_mode` to avoid PyTorch's reserved
+functionalization argument name, and passes UE8M0 scales as a zero-copy byte
+view across that boundary. Kernel-side interpretation and storage remain
+unchanged. Tests cover both functionalization versions, functional and
+caller-allocated outputs, workspace mutation, and both weight recipes.

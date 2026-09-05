@@ -119,6 +119,30 @@ def test_aot_functionalization_preserves_precision_and_output(recipe, mode, use_
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("allocated", [False, True])
+@pytest.mark.parametrize("functionalize_v2", [False, True])
+def test_a16_aot_compile_functionalizes_workspace(recipe, allocated, functionalize_v2):
+    require_b12x()
+    weight, decoded, _ = make_weight(recipe, 128, 256)
+    source = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+    scratch = torch.empty(blockscaled.workspace_size(weight, 4, _config=(64, 128, 2)),
+                          device="cuda", dtype=torch.uint8)
+    out = torch.empty(4, 128, device="cuda", dtype=torch.bfloat16) if allocated else None
+
+    def project(x):
+        return blockscaled.mm(x, weight, mode="a16", out=out,
+                              workspace=scratch, _config=(64, 128, 2))
+
+    project(source)
+    compiled = torch.compile(project, fullgraph=True, options={
+        "enable_auto_functionalized_v2": functionalize_v2,
+    }).aot_compile(((source,), {}))
+    for _ in range(2):
+        source.normal_()
+        assert_close(compiled(source), source.float() @ decoded.T)
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("m,n,k", [(1, 40, 128), (4, 128, 256), (8, 136, 256), (16, 64, 128), (19, 40, 160), (33, 4096, 128)])
 @pytest.mark.parametrize("split", [1, 2, 4, 8])
 def test_a16_reference(recipe, m, n, k, split):
