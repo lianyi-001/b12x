@@ -124,8 +124,8 @@ def _validate_source(source, k):
     _check_tensor("source", source, source.device, torch.bfloat16)
     if source.ndim < 2 or source.shape[-1] != k:
         raise ValueError(f"source must have shape [...,M,{k}]")
-    if torch.cuda.get_device_capability(source.device) != (12, 0):
-        raise ValueError("standalone blockscaled A16 kernels require SM120")
+    if torch.cuda.get_device_capability(source.device) not in ((12, 0), (12, 1)):
+        raise ValueError("standalone blockscaled A16 kernels require SM120/SM121")
 
 
 def _config(config):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import cutlass.cute as cute
 
 from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _a16, _quantize
@@ -232,6 +233,8 @@ def test_mxfp8_prewarm_covers_functional_and_out_under_frozen_resolution():
 
 def test_heuristic_promotes_inside_bf16_api_before_activation_quantization(monkeypatch):
     require_b12x()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("the geometry promotion heuristic is qualified on SM120")
     from b12x.gemm.blockscaled import _policy
     from b12x.policy import PolicyContext, PolicyMode, PolicySource
 

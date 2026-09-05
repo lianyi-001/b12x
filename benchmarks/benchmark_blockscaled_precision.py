@@ -138,6 +138,17 @@ def _ratio_interval(pairs, candidate, baseline):
 
 def _clock_checks(before, after):
     a, b = dict(zip(before["fields"], before["values"])), dict(zip(after["fields"], after["values"]))
+    if a["name"] == b["name"] == "NVIDIA GB10":
+        checks = {
+            "physical_identity": a["uuid"] == b["uuid"],
+            "p0": a["pstate"] == b["pstate"] == "P0",
+            "sm_clock_delta_le_30mhz": abs(float(a["clocks.sm"]) - float(b["clocks.sm"])) <= 30,
+            "throttle_mask_zero": all(int(row["clocks_event_reasons.active"], 16) == 0 for row in (a, b)),
+            "memory_clock": a["clocks.mem"] == b["clocks.mem"],
+        }
+        return dict(checks=checks, valid=all(checks.values()),
+                    memory_clock_reported=a["clocks.mem"] != "[N/A]",
+                    throttle_contract="GB10 diagnostic; zero throttle mask, P0, SM delta <=30MHz; NVML may not report memory clocks")
     checks = {
         "physical_identity": a["uuid"] == b["uuid"],
         "p1": a["pstate"] == b["pstate"] == "P1",
@@ -161,8 +172,8 @@ def run(args, specs, *, flashinfer_error):
         raise ValueError("A16 evidence requires --evidence FILE and enabled correctness checks")
     if args.iters < 20 or args.warmup < 3:
         raise ValueError("A16 evidence requires at least 20 trials and 3 warmups")
-    if torch.cuda.get_device_capability() != (12, 0):
-        raise ValueError("A16 evidence requires SM120")
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        raise ValueError("A16 evidence requires SM120/SM121")
     recipe = "nvfp4" if args.dtype == "fp4-a16" else "mxfp8"
     counts = args.batch_sizes or COUNTS
     if any(m <= 0 for m in counts):

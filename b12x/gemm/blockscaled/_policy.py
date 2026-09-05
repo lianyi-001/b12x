@@ -56,8 +56,8 @@ def _validate(query, config, device):
         raise ValueError("blockscaled A16 row counts must be unique and sorted")
     if rows and (query.in_features % 32 or query.out_features % 8):
         raise ValueError("A16 precision routes require K divisible by 32 and N by 8")
-    if rows and (device is None or device.compute_capability != (12, 0)):
-        raise ValueError("blockscaled A16 routes require SM120")
+    if rows and (device is None or device.compute_capability not in ((12, 0), (12, 1))):
+        raise ValueError("blockscaled A16 routes require SM120/SM121")
 
 
 def _heuristic(query, device):

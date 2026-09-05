@@ -16,8 +16,9 @@ from b12x.policy.generation.providers.blockscaled import BlockscaledPrecisionGen
 from b12x.policy.generation.reducer import DecisionRecord
 
 
-def _context(config):
-    device = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell").targets[0]
+def _context(config, device=None):
+    if device is None:
+        device = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell").targets[0]
     registry = ProfileRegistry()
     registry.register(GpuProfile(
         profile_id="test.blockscaled", targets=(device,), metadata=FrozenMapping(),
@@ -28,6 +29,33 @@ def _context(config):
     ))
     registry.freeze()
     return PolicyContext.for_identity(device, registry=registry)
+
+
+def test_sm121_accepts_measured_a16_routes():
+    device = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0]
+    context = _context({"a16_rows": [[8, 128, 64, 4]]}, device)
+    query = BlockscaledQuery(recipe="nvfp4", in_features=5376, out_features=4096)
+    resolution = context.resolve(BLOCKSCALED_POLICY, query)
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.select(8) == (128, 64, 4)
+
+
+def test_gb10_timing_gate_requires_p0_stable_sm_clock_and_no_throttling():
+    from benchmarks.benchmark_blockscaled_precision import _clock_checks
+
+    state = dict(name="NVIDIA GB10", uuid="GPU-test", pstate="P0",
+                 **{"clocks.sm": "2411", "clocks.mem": "[N/A]",
+                    "clocks_event_reasons.active": "0x0"})
+
+    def snapshot(values):
+        return dict(fields=list(values), values=list(values.values()))
+
+    before = snapshot(state)
+    result = _clock_checks(before, before)
+    assert result["valid"] and not result["memory_clock_reported"]
+    for change in (dict(pstate="P8"), dict(uuid="GPU-other"),
+                   {"clocks.sm": "2442"}, {"clocks_event_reasons.active": "0x4"}):
+        assert not _clock_checks(before, snapshot({**state, **change}))["valid"]
 
 
 def test_one_shot_profile_registration_does_not_create_a_planned_api():

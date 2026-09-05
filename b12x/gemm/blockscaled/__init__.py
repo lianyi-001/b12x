@@ -10,7 +10,7 @@ row-major or F8_128x4-swizzled UE8M0 scales. Pass swizzled storage flattened
 (or as its native 6D view); a 2D ``[M,K/32]`` scale is interpreted as compact.
 ``expected_m`` is a DeepGEMM-style regime hint (decode vs prefill tiles).
 
-On SM120, ``w4a16`` and ``w8a16`` accept BF16 activations and directly read
+On SM120/SM121, ``w4a16`` and ``w8a16`` accept BF16 activations and directly read
 the same swizzled weight scales as NVFP4/MXFP8 GEMM. Packed BF16-input calls
 accept ``mode='auto'|'a16'|'quantized'``. AUTO prefers an autotuned profile and
 uses a conservative geometry heuristic for uncovered queries. A16 is a specialization

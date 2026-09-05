@@ -1,6 +1,6 @@
 # Dense GEMM activation precision
 
-Status: implemented on SM120. `gemm.blockscaled` accepts BF16 activations with
+Status: implemented on SM120/SM121. `gemm.blockscaled` accepts BF16 activations with
 NVFP4 or MXFP8 weights and selects an activation precision for dense linear
 projections. MoE routing and expert GEMMs have separate implementations.
 
@@ -49,7 +49,7 @@ for its other supported layouts and devices.
 import torch
 from b12x.gemm import blockscaled
 
-# All tensors are already on the same SM120 device.
+# All tensors are already on the same SM120/SM121 device.
 weight = blockscaled.pack_weight(
     packed_w, swizzled_weight_scales, recipe="nvfp4",
     global_scale=weight_global_scale, global_scale_kind="multiplier",
@@ -183,5 +183,22 @@ checkpoints and emitted a byte-identical profile.
 Qualification covers the dense one-shot API. FlashInfer comparison checks were
 skipped because FlashInfer was unavailable. The Max-Q measurements do not
 qualify other RTX PRO 6000 product variants or SM121; those devices retain their
-own profile coverage and heuristic behavior. The precision generator requires
-SM120.
+own profile coverage and heuristic behavior. The precision generator supports
+SM120 and SM121.
+
+## SM121 qualification
+
+Status: correctness qualified on NVIDIA GB10, 48 SMs,
+`GPU-87533355-db2d-9b70-eeab-5a9159ee4bc1`. The BF16 specialization selects its
+architecture identity from the device and uses the same inline packed
+conversions as SM120. With `CUTE_DSL_ARCH=sm_121a`, PyTorch 2.12.0+cu130,
+CUTLASS DSL 4.6.2, and PTXAS 13.3.73, 58 targeted checks passed: exhaustive
+FP4/FP8 value and scale conversion, both weight formats, split-K variants,
+scale-tile tails, and graph replay under frozen kernel resolution.
+
+The embedded GB10 precision profile has no measured coverage yet, and its
+heuristic retains quantized activations. Explicit `mode="a16"` is supported.
+The profile generator races both precisions on GB10 with a device-specific
+timing gate: P0, zero throttle mask, and at most 30 MHz SM-clock change between
+snapshots. NVML does not report the GB10 memory clock; evidence records that
+limitation. SM120 Max-Q measurements retain their separate timing gate.

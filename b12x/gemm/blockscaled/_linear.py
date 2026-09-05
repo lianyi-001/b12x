@@ -1053,7 +1053,7 @@ def prewarm(
     if isinstance(rhs, NVFP4LinearWeight) or (
         isinstance(rhs, MXFP8LinearWeight) and rhs.out_features % 8 == 0
         and (input_dtype if input_dtype is not None else out_dtype) == torch.bfloat16
-        and torch.cuda.get_device_capability(rhs.weight.values.device) == (12, 0)
+        and torch.cuda.get_device_capability(rhs.weight.values.device) in ((12, 0), (12, 1))
     ):
         if input_dtype not in (None, torch.bfloat16) or out_dtype != torch.bfloat16:
             raise ValueError("NVFP4/MXFP8 BF16 warmup requires BF16 input/output")

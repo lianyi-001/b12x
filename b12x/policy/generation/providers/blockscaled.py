@@ -62,8 +62,8 @@ class _Session(AbstractContextManager):
         import torch
         self.device_context = torch.cuda.device(self.context.device_ordinal)
         self.device_context.__enter__()
-        if torch.cuda.get_device_capability() != (12, 0):
-            raise ValueError("blockscaled precision qualification requires SM120")
+        if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+            raise ValueError("blockscaled precision qualification requires SM120/SM121")
         return self
 
     def __exit__(self, *exc):
@@ -235,7 +235,7 @@ class BlockscaledPrecisionGenerator(DiscreteSweepGenerator):
                          query_schema_version=1, config_schema_version=1,
                          query_fields=(*QUERY_FIELDS, "measured_m"), range_fields=frozenset(),
                          cases=precision_cases() if cases is None else cases,
-                         benchmark_factory=_Factory(), coverage={}, candidate_contract_version=1)
+                         benchmark_factory=_Factory(), coverage={}, candidate_contract_version=2)
 
     def estimate(self, context):
         from dataclasses import replace
