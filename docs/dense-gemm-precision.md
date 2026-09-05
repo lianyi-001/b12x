@@ -139,56 +139,83 @@ handling of noncontiguous input.
 
 ## Qualified Max-Q coverage
 
-The embedded profile `nvidia.rtx.pro.6000.blackwell.max-q` matches the NVIDIA
-RTX PRO 6000 Blackwell Max-Q Workstation Edition with 188 SMs. Its precision
-table is qualified by 192 GPU cases using a 5% selection margin. Regeneration
-with the 0% rule is not qualified, so this embedded table has narrower promotion
-coverage than the parity selector permits. All 3,264 case/candidate combinations
-passed correctness, and the table contains 36 NVFP4 and 10 MXFP8 promotion routes:
+Status: qualified. The embedded profile
+`nvidia.rtx.pro.6000.blackwell.max-q` matches the NVIDIA RTX PRO 6000 Blackwell
+Max-Q Workstation Edition with 188 SMs. Its precision table uses the 0%
+promotion threshold. All 192 GPU cases passed timing qualification and all
+3,264 case/candidate combinations passed correctness. The table contains 61
+NVFP4 and 44 MXFP8 promotion routes:
 
 | Weight recipe | N | K | M values selecting A16 |
 | --- | ---: | ---: | --- |
-| NVFP4 | 4096 | 5376 | 1–15 |
-| NVFP4 | 16384 | 1024 | 15, 16 |
-| NVFP4 | 17408 | 5120 | 1, 3, 7 |
+| NVFP4 | 4096 | 5376 | 1–16 |
+| NVFP4 | 16384 | 1024 | 1–16 |
+| NVFP4 | 17408 | 5120 | 1, 3–14 |
 | NVFP4 | 5120 | 17408 | 1–16 |
-| MXFP8 | 4096 | 5376 | 14 |
-| MXFP8 | 16384 | 1024 | 13 |
-| MXFP8 | 17408 | 5120 | None |
-| MXFP8 | 5120 | 17408 | 9–16 |
+| MXFP8 | 4096 | 5376 | 2–16 |
+| MXFP8 | 16384 | 1024 | 8–14 |
+| MXFP8 | 17408 | 5120 | 1–5, 9–16 |
+| MXFP8 | 5120 | 17408 | 5, 9–16 |
 
 All measured M values from 24 through 2048 retain quantized activations.
 Representative independent-confirmation medians are:
 
-| Recipe | N | K | M | A16, µs | Quantized, µs | Latency reduction |
+| Recipe | N | K | M | A16, µs | Quantized, µs | A16 / quantized |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| NVFP4 | 4096 | 5376 | 1 | 16.992 | 20.384 | 16.6% |
-| NVFP4 | 4096 | 5376 | 8 | 15.040 | 18.336 | 18.0% |
-| NVFP4 | 5120 | 17408 | 8 | 36.768 | 40.960 | 10.2% |
-| MXFP8 | 5120 | 17408 | 16 | 57.248 | 62.048 | 7.7% |
+| NVFP4 | 4096 | 5376 | 1 | 16.288 | 19.136 | 0.8512 |
+| NVFP4 | 4096 | 5376 | 8 | 14.336 | 18.336 | 0.7818 |
+| NVFP4 | 5120 | 17408 | 8 | 35.520 | 40.864 | 0.8692 |
+| MXFP8 | 5120 | 17408 | 16 | 55.296 | 60.096 | 0.9201 |
 
-These are cold-L2 graph timings with supplied activation global scales and a
-325 W power limit. The toolchain was PyTorch 2.12.0+cu132, CUTLASS DSL 4.6.0,
-Triton 3.7.0, and PTXAS 13.3.73. The physical GPU UUID was
-`GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff`. Runtime source was held fixed during
-the qualifying run; the worktree was based on revision
-`f2e8cd9214666645c5ea4994a9e5c479c587b2e8`.
+The ratio is A16 latency divided by quantized latency; lower is faster. These
+are cold-L2 graph timings that include activation quantization, with supplied
+NVFP4 activation global scales and a 325 W power limit. The toolchain was
+PyTorch 2.12.0+cu132, CUTLASS DSL 4.6.0, Triton 3.7.0, and PTXAS 13.3.73.
+The physical GPU UUID was `GPU-f0121aa7-a898-82be-f537-a099d50ef7d8`.
+The source was held fixed at revision
+`214b37b36dfbe0af6c47bccc8860be8719d8506e` in
+`/home/luke/projects/b12x-research/rs-2` throughout qualification.
 
-Local evidence is `/tmp/b12x-precision-autotune.json`, its source manifest
-`/tmp/b12x-precision-autotune-source.json`, and the raw checkpoints in
-`/tmp/b12x-precision-autotune-work/`. The artifact SHA256 is
-`e107b92b4e3977ee5dadfe00eca8d3c2863926dc87eb89ccb20fd391e6177e9f`;
+```bash
+CUDA_VISIBLE_DEVICES=GPU-f0121aa7-a898-82be-f537-a099d50ef7d8 \
+.venv/bin/python scripts/generate_gpu_profile.py \
+  --components gemm.blockscaled_precision --warmup 25 \
+  --work-dir /tmp/b12x-maxq-gpu8-parity-work \
+  --output /tmp/b12x-maxq-gpu8-parity.json
+```
+
+Local evidence is `/tmp/b12x-maxq-gpu8-parity.json`, its source manifest
+`/tmp/b12x-maxq-gpu8-parity-source.json`, the selected-route audit
+`/tmp/b12x-maxq-gpu8-parity-audit.json`, and raw checkpoints in
+`/tmp/b12x-maxq-gpu8-parity-work/`. The artifact SHA256 is
+`16fab276312457dad4ca50677d9e8616a5e5d25215895773ba824d977c14a79b`;
 the source-manifest SHA256 is
-`19bf83e01aff2663aafe79f39d2ce5c06f6a2c81ab440653ce979c7d6f83143f`.
-The qualifying command used `--warmup 25`. Thirteen checkpoint resumes were
-needed to replace clock-rejected cases; their rejected samples are retained in
-`/tmp/b12x-precision-autotune-rejected/`. A completed resume reused all 192
-checkpoints and emitted a byte-identical profile.
+`51121ed2e9eee453574134ed66b310af2f35664d294bd0098930d42a56a5643b`.
 
-Qualification covers the dense one-shot API. FlashInfer comparison checks were
-skipped because FlashInfer was unavailable. The Max-Q measurements do not
-qualify other RTX PRO 6000 product variants or SM121; those devices retain their
-own profile coverage and heuristic behavior. The precision generator supports
+Eleven checkpoint resumes were required for SM-clock drift above 30 MHz.
+Rejected samples are preserved in `/tmp/b12x-maxq-gpu8-parity-rejected/`.
+One NVFP4 M=1 checkpoint required requeueing because its initial race passed
+but its confirmation clock gate failed; the accepted replacement passed both
+races. Every selected A16 route has valid clock and allocation checks in both
+passes and median latency no greater than every quantized baseline. The audit
+binds all 192 decisions to their raw samples, selected configurations, physical
+GPU identity, and source hashes.
+
+With the embedded profile loaded, `tests/gemm/test_blockscaled_a16.py`,
+`tests/policy/test_blockscaled_precision.py`, and
+`tests/policy/test_discrete_sweep_generator.py` passed 97 checks; four GB10-only
+checks were skipped. The vLLM integration at revision `1310d69c3d` passed all
+six `test_b12x_dense_precision_gpu_graph_replay` cases on the same physical GPU,
+using `/home/luke/projects/vllm-hh-rebase/.venv/bin/python` and
+`PYTHONPATH=/home/luke/projects/b12x-research/rs-2`. This checks `auto`, `a16`,
+and `quantized` for both recipes, shared weight storage, numerical output,
+frozen kernel resolution, stable output addresses, and allocation-free replay.
+That integration check used PyTorch 2.13.0 and CUTLASS DSL 4.6.2; the performance
+measurements use the separate toolchain recorded above.
+
+Qualification covers the dense one-shot API. These measurements do not qualify
+other RTX PRO 6000 product variants or SM121; those devices retain their own
+profile coverage and heuristic behavior. The precision generator supports
 SM120 and SM121.
 
 ## SM121 qualification
