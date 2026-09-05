@@ -74,6 +74,51 @@ def assert_close(actual, expected):
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
+@pytest.mark.parametrize("use_out", [False, True])
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_aot_functionalization_preserves_precision_and_output(recipe, mode, use_out, backend, monkeypatch):
+    require_b12x()
+    import torch._inductor.config as inductor_config
+    from b12x.gemm.blockscaled import _ops
+
+    torch._dynamo.reset()
+    weight, _, storage = make_weight(recipe, 128, 256)
+    saved_scales = storage.view(torch.uint8).clone()
+    execute = _ops._execute_impl
+
+    def check_storage(source, values, scales, *args):
+        assert scales.data_ptr() == storage.data_ptr()
+        if recipe == "mxfp8":
+            assert scales.dtype == torch.uint8
+            assert scales.shape == storage.shape
+            assert scales.stride() == storage.stride()
+        return execute(source, values, scales, *args)
+
+    monkeypatch.setattr(_ops, "_execute_impl", check_storage)
+    workspace = torch.empty(blockscaled.workspace_size(weight, 8), device="cuda", dtype=torch.uint8)
+    options = dict(activation_global_scale=torch.tensor([128.], device="cuda")) if recipe == "nvfp4" else {}
+
+    def run(source, output):
+        return blockscaled.mm(source, weight, mode=mode, expected_m=source.shape[0],
+                              out=output if use_out else None,
+                              workspace=workspace if use_out else None, **options)
+
+    with inductor_config.patch(enable_auto_functionalized_v2=False):
+        compiled = torch.compile(run, backend=backend, fullgraph=True, dynamic=True)
+        for m in (2, 8):
+            source = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
+            output = torch.full((m, 128), float("nan"), device="cuda", dtype=torch.bfloat16)
+            expected = blockscaled.mm(source, weight, mode=mode, **options)
+            actual = compiled(source, output)
+            if use_out:
+                assert actual is output
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(storage.view(torch.uint8), saved_scales, atol=0, rtol=0)
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("m,n,k", [(1, 40, 128), (4, 128, 256), (8, 136, 256), (16, 64, 128), (19, 40, 160), (33, 4096, 128)])
 @pytest.mark.parametrize("split", [1, 2, 4, 8])
 def test_a16_reference(recipe, m, n, k, split):

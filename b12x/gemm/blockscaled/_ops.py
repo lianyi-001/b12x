@@ -47,15 +47,15 @@ def _functional(
     source: torch.Tensor, values: torch.Tensor, scales: torch.Tensor,
     global_scale: torch.Tensor | None, activation_scale: torch.Tensor | None,
     workspace: torch.Tensor | None, fp4: bool, reciprocal: bool, input_k: int,
-    mode: str, expected_m: int | None, config: list[int] | None, stream: int | None,
+    activation_mode: str, expected_m: int | None, config: list[int] | None, stream: int | None,
 ) -> torch.Tensor:
     return _execute(source, values, scales, global_scale, activation_scale, workspace,
-                    None, fp4, reciprocal, input_k, mode, expected_m, config, stream)
+                    None, fp4, reciprocal, input_k, activation_mode, expected_m, config, stream)
 
 
 @_functional.register_fake
 def _functional_fake(source, values, scales, global_scale, activation_scale,
-                     workspace, fp4, reciprocal, input_k, mode, expected_m, config, stream):
+                     workspace, fp4, reciprocal, input_k, activation_mode, expected_m, config, stream):
     return source.new_empty((*source.shape[:-1], values.shape[0]), dtype=torch.bfloat16)
 
 
@@ -64,16 +64,16 @@ def _out(
     source: torch.Tensor, values: torch.Tensor, scales: torch.Tensor,
     global_scale: torch.Tensor | None, activation_scale: torch.Tensor | None,
     workspace: torch.Tensor | None, out: torch.Tensor, fp4: bool, reciprocal: bool,
-    input_k: int, mode: str, expected_m: int | None, config: list[int] | None,
+    input_k: int, activation_mode: str, expected_m: int | None, config: list[int] | None,
     stream: int | None,
 ) -> None:
     _execute(source, values, scales, global_scale, activation_scale, workspace,
-             out, fp4, reciprocal, input_k, mode, expected_m, config, stream)
+             out, fp4, reciprocal, input_k, activation_mode, expected_m, config, stream)
 
 
 @_out.register_fake
 def _out_fake(source, values, scales, global_scale, activation_scale,
-              workspace, out, fp4, reciprocal, input_k, mode, expected_m, config, stream):
+              workspace, out, fp4, reciprocal, input_k, activation_mode, expected_m, config, stream):
     return None
 
 
@@ -83,6 +83,9 @@ def linear(source, values, scales, global_scale, *, fp4, reciprocal=False,
     from b12x._lib.utils import cuda_stream_to_int
     input_k = values.shape[1] * (2 if fp4 else 1) if input_k is None else input_k
     config = None if _config is None else list(_config)
+    # Inductor cannot decompose auto-functionalization with UE8M0 inputs.
+    if scales.dtype == torch.float8_e8m0fnu:
+        scales = scales.view(torch.uint8)
     args = (source, values, scales, global_scale, activation_global_scale, workspace)
     options = (fp4, reciprocal, input_k, mode, expected_m, config, cuda_stream_to_int(stream))
     if out is None:
