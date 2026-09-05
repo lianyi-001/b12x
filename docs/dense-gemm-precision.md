@@ -104,10 +104,13 @@ timings. Separate GEMM-only benchmark records are diagnostic and do not decide
 precision promotion.
 
 Candidates must pass independent numerical oracles and poisoned-buffer graph
-replay before timing. A16 needs at least a 5% median advantage over every
-quantized baseline, with the bootstrapped 95% ratio interval excluding parity,
-in both an initial race and a separate confirmation pass. Paired replay order
-is balanced, L2 is flushed by default, and raw samples, clock snapshots,
+replay before timing. A16 must have median latency no greater than every
+quantized baseline in both an initial race and a separate confirmation pass.
+The promotion threshold is 0%; equal latency prefers A16 because it preserves
+BF16 activations. Bootstrapped 95% ratio intervals can be reconstructed from
+the retained samples; they do not impose a statistically significant speedup
+requirement. Paired replay order is balanced, L2 is flushed by default, and
+raw samples, clock snapshots,
 allocation checks, and source/toolchain identity are retained in checkpoints.
 The Max-Q diagnostic clock contract allows only throttle masks 0x0/0x4, P1,
 stable memory clocks, and a maximum 30 MHz SM-clock difference.
@@ -138,7 +141,9 @@ handling of noncontiguous input.
 
 The embedded profile `nvidia.rtx.pro.6000.blackwell.max-q` matches the NVIDIA
 RTX PRO 6000 Blackwell Max-Q Workstation Edition with 188 SMs. Its precision
-table is qualified by 192 GPU cases. All 3,264 case/candidate combinations
+table is qualified by 192 GPU cases using a 5% selection margin. Regeneration
+with the 0% rule is not qualified, so this embedded table has narrower promotion
+coverage than the parity selector permits. All 3,264 case/candidate combinations
 passed correctness, and the table contains 36 NVFP4 and 10 MXFP8 promotion routes:
 
 | Weight recipe | N | K | M values selecting A16 |
@@ -197,39 +202,69 @@ FP4/FP8 value and scale conversion, both weight formats, split-K variants,
 scale-tile tails, and graph replay under frozen kernel resolution.
 
 Status: performance qualified for the four weight geometries and 24 row counts
-listed above, for both recipes. All 192 cases selected quantized activations;
-none of the 3,264 candidate checks failed correctness or the timing gate.
-The smallest measured A16/quantized median ratios were 0.9583 for NVFP4 and
-0.9543 for MXFP8, which do not meet the 0.95 promotion threshold. The embedded
-GB10 profile therefore retains W4A4/W8A8 for these geometries. The uncovered
-geometry heuristic also retains quantized activations. Explicit `mode="a16"`
-is supported.
+listed above, for both recipes. All 3,264 candidate checks passed correctness;
+all 192 cases passed timing qualification. The embedded profile contains 32
+NVFP4 and 62 MXFP8 A16 promotion routes under the 0% threshold:
 
-For N=4096, K=5376, representative cold-L2 graph medians in microseconds are:
+| Weight recipe | N | K | M values selecting A16 |
+| --- | ---: | ---: | --- |
+| NVFP4 | 4096 | 5376 | 1–12, 14–16 |
+| NVFP4 | 16384 | 1024 | 1–14, 16 |
+| NVFP4 | 17408 | 5120 | 1, 2 |
+| NVFP4 | 5120 | 17408 | None |
+| MXFP8 | 4096 | 5376 | 1–16 |
+| MXFP8 | 16384 | 1024 | 1–14, 16, 24, 32 |
+| MXFP8 | 17408 | 5120 | 1–3, 7–16 |
+| MXFP8 | 5120 | 17408 | 1–16 |
 
-| Recipe | M | Best A16 candidate | Quantized |
-| --- | ---: | ---: | ---: |
-| NVFP4 | 1 | 61.312 | 61.504 |
-| NVFP4 | 8 | 61.440 | 61.440 |
-| MXFP8 | 1 | 108.480 | 106.912 |
-| MXFP8 | 8 | 107.552 | 108.544 |
+Every promoted route passed the latency comparison in both independent timing
+passes. All measured M values from 64 through 2048 retain quantized activations.
+The uncovered-geometry heuristic also retains quantized activations on GB10.
+Explicit `mode="a16"` is supported.
 
-The profile generator races both precisions on GB10 with a device-specific
-timing gate: P0, zero throttle mask, and at most 30 MHz SM-clock change between
-snapshots. NVML does not report the GB10 memory clock; evidence records that
-limitation. SM120 Max-Q measurements retain their separate timing gate.
+For N=4096, K=5376, representative independent-confirmation cold-L2 graph
+medians in microseconds are:
 
-The 25-warmup, 25-trial run completed without checkpoint retries in 11m25s.
-Evidence on `chroniton.local` is `/tmp/b12x-sm121-precision.json`, the source
-manifest `/tmp/b12x-sm121-precision-source.json`, and raw checkpoints under
-`/tmp/b12x-sm121-precision-work/`. The artifact SHA256 is
-`f03e0b958ced5dc825d558ba0a8d5ce131382630645e9dfa9b5f49c16b21d422`;
+| Recipe | M | Selected A16 | Fastest quantized baseline | A16 / quantized |
+| --- | ---: | ---: | ---: | ---: |
+| NVFP4 | 1 | 59.456 | 61.408 | 0.9682 |
+| NVFP4 | 8 | 59.424 | 61.440 | 0.9672 |
+| MXFP8 | 1 | 104.448 | 106.496 | 0.9808 |
+| MXFP8 | 8 | 107.808 | 108.544 | 0.9932 |
+
+The ratio is A16 latency divided by quantized latency; lower is faster. Timings
+include activation quantization under the API contract described above.
+The device-specific timing gate requires P0, zero throttle mask, and at most
+30 MHz SM-clock change between snapshots. NVML does not report the GB10 memory
+clock; evidence records that limitation. SM120 Max-Q measurements retain their
+separate timing gate.
+
+The 25-warmup, 25-trial run completed without checkpoint retries in 11m06s.
+The command was:
+
+```bash
+CUTE_DSL_ARCH=sm_121a \
+CUDA_VISIBLE_DEVICES=GPU-87533355-db2d-9b70-eeab-5a9159ee4bc1 \
+/home/luke/projects/vllm/.venv/bin/python scripts/generate_gpu_profile.py \
+  --components gemm.blockscaled_precision --warmup 25 \
+  --work-dir /tmp/b12x-sm121-parity-work \
+  --output /tmp/b12x-sm121-parity.json
+```
+
+Evidence on `chroniton.local` is `/tmp/b12x-sm121-parity.json`, the source
+manifest `/tmp/b12x-sm121-parity-source.json`, the selected-route audit
+`/tmp/b12x-sm121-parity-audit.json`, and raw checkpoints under
+`/tmp/b12x-sm121-parity-work/`. The artifact SHA256 is
+`87f8ead04a89c27ee12993c7f80ca51462ea1fef073600c0b23ec936b1f3af49`;
 the source-manifest SHA256 is
-`2ea19c566c604b623d5871798555fa91c7cff4a8a02330dffb078d09cfba2116`.
+`ae7f817a3b0ba2d5b72c505b82daeba676eada8d6536ae0aebf0322af45ff3cc`.
+The isolated source directory is `/home/luke/projects/b12x-precision-parity`,
+based on revision `6698bee5f4793ac0139884439e1b4a0c621a39ba` with the
+manifest-bound parity selection changes. The manifest records the source and
+toolchain independently of installed package-version metadata.
+
 With the embedded profile loaded, the A16 and precision-policy suites passed
-86 checks; three SM120-specific checks were skipped. This includes exact
-quantized output under PREPLANNED_ONLY resolution and poisoned-buffer graph
-replay for both recipes.
-The isolated source directory is
-`/home/luke/projects/b12x-precision-sm121-e0b844ec`. The manifest binds its
-source files and toolchain independently of installed package-version metadata.
+96 checks; three SM120-specific checks were skipped. This includes BF16-reference
+output on promoted decode routes and exact quantized output on retained
+M=2048 routes under PREPLANNED_ONLY resolution, with poisoned-buffer graph
+replay and frozen kernel resolution for both recipes.

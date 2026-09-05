@@ -50,7 +50,7 @@ def qualifies(pairs, candidate, baseline):
     from benchmarks.benchmark_blockscaled_precision import _ratio_interval
     ratio = statistics.median(p[candidate] for p in pairs) / statistics.median(p[baseline] for p in pairs)
     interval = _ratio_interval(pairs, candidate, baseline)
-    return ratio <= 0.95 and interval[1] < 1.0, ratio, interval
+    return ratio <= 1.0, ratio, interval
 
 
 class _Session(AbstractContextManager):
@@ -201,7 +201,7 @@ class _Session(AbstractContextManager):
             if index and (name not in eligible or confirmation is None or
                           not confirmation_clocks["valid"] or
                           not all(qualifies(confirmation, name, base)[0] for base in baseline_names)):
-                error = error or "independently confirmed 5% precision benefit was not established"
+                error = error or "A16 was slower than a quantized baseline or lacked valid independent confirmation"
             result.append(SweepMeasurement(
                 candidate=candidate, correct=True,
                 latency_us=statistics.median(p[name] for p in pairs), error=error,
@@ -235,13 +235,14 @@ class BlockscaledPrecisionGenerator(DiscreteSweepGenerator):
                          query_schema_version=1, config_schema_version=1,
                          query_fields=(*QUERY_FIELDS, "measured_m"), range_fields=frozenset(),
                          cases=precision_cases() if cases is None else cases,
-                         benchmark_factory=_Factory(), coverage={}, candidate_contract_version=2)
+                         benchmark_factory=_Factory(), coverage={}, candidate_contract_version=3,
+                         candidate_tie_breaker=lambda candidate: int(not candidate.config["a16_rows"]))
 
     def estimate(self, context):
         from dataclasses import replace
         estimate = super().estimate(context)
         return replace(estimate,
-                       description="17 candidates per row count; balanced graph timing, correctness, and independent 5% confirmation",
+                       description="17 candidates per row count; balanced graph timing, correctness, and independent latency-parity confirmation",
                        dimensions={**estimate.dimensions, "candidates_per_case": 17,
                                    "maximum_candidate_measurements": 17 * len(self._cases)})
 

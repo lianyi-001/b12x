@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -40,15 +40,24 @@ def test_sm121_accepts_measured_a16_routes():
     assert resolution.config.select(8) == (128, 64, 4)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
-def test_embedded_gb10_precision_retains_quantized_activations(recipe):
+@pytest.mark.parametrize("recipe,n,k,rows", [
+    ("nvfp4", 4096, 5376, (*range(1, 13), 14, 15, 16)),
+    ("nvfp4", 16384, 1024, (*range(1, 15), 16)),
+    ("nvfp4", 17408, 5120, (1, 2)),
+    ("nvfp4", 5120, 17408, ()),
+    ("mxfp8", 4096, 5376, tuple(range(1, 17))),
+    ("mxfp8", 16384, 1024, (*range(1, 15), 16, 24, 32)),
+    ("mxfp8", 17408, 5120, (1, 2, 3, *range(7, 17))),
+    ("mxfp8", 5120, 17408, tuple(range(1, 17))),
+])
+def test_embedded_gb10_precision_selects_qualified_rows(recipe, n, k, rows):
     device = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0]
     context = PolicyContext.for_identity(device, mode=PolicyMode.PREPLANNED_ONLY)
-    for n, k in ((4096, 5376), (16384, 1024), (17408, 5120), (5120, 17408)):
-        query = BlockscaledQuery(recipe=recipe, in_features=k, out_features=n)
-        resolution = context.resolve(BLOCKSCALED_POLICY, query)
-        assert resolution.source is PolicySource.PREPLANNED
-        assert resolution.config.a16_rows == ()
+    query = BlockscaledQuery(recipe=recipe, in_features=k, out_features=n)
+    resolution = context.resolve(BLOCKSCALED_POLICY, query)
+    assert resolution.source is PolicySource.PREPLANNED
+    assert tuple(row[0] for row in resolution.config.a16_rows) == rows
+    assert resolution.config.select(2048) is None
 
 
 def test_gb10_timing_gate_requires_p0_stable_sm_clock_and_no_throttling():
@@ -144,10 +153,55 @@ def test_generator_aggregates_measured_rows_without_putting_m_in_runtime_query()
     assert all(case.metadata["source_toolchain_sha256"] for case in cases)
 
 
-def test_precision_promotion_requires_margin_and_interval_excluding_parity():
+def test_precision_promotion_accepts_parity_and_any_speedup():
     assert qualifies([{"a": 9, "q": 10}] * 30, "a", "q")[0]
-    assert not qualifies([{"a": 9.6, "q": 10}] * 30, "a", "q")[0]
+    assert qualifies([{"a": 9.6, "q": 10}] * 30, "a", "q")[0]
+    assert qualifies([{"a": 9.999, "q": 10}] * 30, "a", "q")[0]
+    assert qualifies([{"a": 10, "q": 10}] * 30, "a", "q")[0]
+    assert not qualifies([{"a": 10.001, "q": 10}] * 30, "a", "q")[0]
     assert not qualifies([{"a": 9 if i % 2 else 12, "q": 10} for i in range(30)], "a", "q")[0]
+
+
+def test_precision_parity_keeps_confidence_interval_as_evidence():
+    samples = [{"a": 9 if i % 2 else 11, "q": 10} for i in range(30)]
+    accepted, ratio, interval = qualifies(samples, "a", "q")
+    assert accepted and ratio == 1.0
+    assert interval[0] < 1.0 < interval[1]
+
+
+def test_precision_generator_prefers_a16_at_equal_latency(tmp_path):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from b12x.gemm.blockscaled._policy import A16_CONFIGS
+    from b12x.policy.generation import CheckpointStore, GenerationContext, GenerationSettings, SweepCandidate, SweepMeasurement
+    from b12x.policy.generation.progress import NullProgressReporter
+    from b12x.policy.serialization import profile_from_dict
+
+    cases = precision_cases(geometries=((4096, 5376),), counts=(8,), recipes=("nvfp4",))
+    generator = BlockscaledPrecisionGenerator(cases=cases)
+    quantized = SweepCandidate.create({"a16_rows": []})
+    a16 = max((SweepCandidate.create({"a16_rows": [[8, *config]]}) for config in A16_CONFIGS),
+              key=lambda candidate: candidate.candidate_id)
+    assert quantized.candidate_id < a16.candidate_id
+    session = SimpleNamespace(
+        candidates=lambda case: (quantized, a16),
+        measure=lambda case, candidates: tuple(SweepMeasurement(
+            candidate=candidate, latency_us=10.0, correct=True,
+        ) for candidate in candidates),
+    )
+    generator._benchmark_factory = lambda *args: nullcontext(session)
+    device = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0]
+    context = GenerationContext(device=device, device_ordinal=0, work_dir=tmp_path,
+                                source_revision="test", settings=GenerationSettings())
+    result = generator.generate(context, progress=NullProgressReporter(),
+                                checkpoints=CheckpointStore(tmp_path))
+    profile = profile_from_dict(dict(
+        profile_id="test.precision-parity", targets=[asdict(device)],
+        components=[result.component],
+    ))
+    leaf = profile.component(BLOCKSCALED_PRECISION).lookup(
+        dict(recipe="nvfp4", in_features=5376, out_features=4096))
+    assert leaf.config == a16.config
 
 
 def test_auto_precision_preserves_explicit_mode_and_unqualified_source_layout(monkeypatch):
