@@ -225,11 +225,24 @@ whether an integrator calls the corresponding multi-token transaction
 speculative verification.
 
 MoE measures every token count from 1 through 8 and additional anchors through
-128. Reduction fills the bounded 1--128 serving domain from the nearest valid
+128. Fixed-precision reduction fills the bounded 1--128 serving domain from the nearest valid
 measured anchor. It never extends micro beyond eight tokens or Triton route
 packing beyond 256 routed rows, and it does not extrapolate outside the recorded
 domain. Profile coverage reports measured and synthesized runtime query counts
 separately.
+
+The `modelopt-nvfp4-auto` recipe races A4 and A16 over shared native NVFP4
+storage for SiLU. It selects precision at execution capacity, covers only
+exact measured capacities, and uses A4 heuristics on misses. It independently
+qualifies every capacity without coarse precision pruning. A16 wins confirmed
+median parity as well as speedups; each candidate uses its own precision oracle.
+See [MoE storage and precision planning](moe-execution-model.md#sharing-nvfp4-storage-across-activation-precisions).
+
+`benchmarks/benchmark_moe_precision_policy.py` runs this registered provider for
+one reviewed geometry and a bounded set of capacities. Its default input is
+the generator's synthetic corpus; `--input-snapshot` instead races the exact
+checkpoint operands exported by `benchmark_nvfp4_decode_precisions.py`.
+The manifest distinguishes those inputs and preserves tensor identities.
 
 Corpus definitions live in generator code and are not repeated or referenced in
 JSON. The full local artifact retains the device, settings, aggregate winners,

@@ -45,6 +45,7 @@ from benchmarks.benchmark_w4a16_nvfp4_layouts import (
     _weight_hashes,
 )
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
+from benchmarks.moe_checkpoint_snapshot import load_snapshot, save_snapshot, tensor_digest
 
 
 def main() -> None:
@@ -61,6 +62,9 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--output", type=Path, required=True)
+    snapshots = parser.add_mutually_exclusive_group()
+    snapshots.add_argument("--input-snapshot", type=Path)
+    snapshots.add_argument("--export-input-snapshot", type=Path)
     args = parser.parse_args()
     if not os.environ.get("CUDA_VISIBLE_DEVICES") or "," in os.environ["CUDA_VISIBLE_DEVICES"]:
         parser.error("set CUDA_VISIBLE_DEVICES to the single assigned GPU")
@@ -96,6 +100,7 @@ def main() -> None:
                 Path("benchmarks/benchmark_w4a16_nvfp4_layouts.py"),
                 Path("benchmarks/benchmark_moe.py"),
                 Path("benchmarks/common.py"),
+                Path("benchmarks/moe_checkpoint_snapshot.py"),
                 Path("b12x/moe/fused_moe/_impl.py"),
                 Path("b12x/moe/_shared/kernels/w4a16/kernel.py"),
                 Path("b12x/moe/_shared/kernels/w4a16/prepare.py"),
@@ -133,10 +138,36 @@ def main() -> None:
 
     save()
     print(f"Loading {args.model_path}, layer={args.layer_idx}, {spec}", flush=True)
-    weights = load_expert_weights(
-        args.model_path, layer_idx=args.layer_idx,
-        checkpoint_family=profile.checkpoint_family, spec=spec, activation="silu",
-    )
+    snapshot_metadata = {
+        "checkpoint_metadata_sha256": report["checkpoint_metadata_sha256"],
+        "shape": asdict(spec), "layer": args.layer_idx,
+        "routing": profile.default_routing, "seed": 42,
+    }
+    if args.input_snapshot:
+        weights, inputs, digests = load_snapshot(
+            args.input_snapshot, device=device, expected_metadata=snapshot_metadata,
+        )
+        if weights.spec != spec or weights.layer_idx != args.layer_idx:
+            raise ValueError("snapshot shape or layer does not match the benchmark")
+        if any(m not in inputs for m in args.batch_sizes):
+            raise ValueError("snapshot must contain every requested token count")
+        report["input_snapshot_sha256"] = _sha256(args.input_snapshot)
+        report["snapshot_tensor_digests"] = digests
+    else:
+        weights = load_expert_weights(
+            args.model_path, layer_idx=args.layer_idx,
+            checkpoint_family=profile.checkpoint_family, spec=spec, activation="silu",
+        )
+        inputs = {
+            m: make_profile_routed_inputs(profile, weights, spec, m, 42, device)
+            for m in args.batch_sizes
+        }
+        if args.export_input_snapshot:
+            save_snapshot(
+                args.export_input_snapshot, weights=weights, inputs=inputs,
+                metadata=snapshot_metadata,
+            )
+            report["input_snapshot_sha256"] = _sha256(args.export_input_snapshot)
     if weights.source_format != "modelopt_nvfp4":
         raise ValueError(f"expected ModelOpt NVFP4, got {weights.source_format}")
     raw_params = get_quant_mode_params(weights, "shared", "w4a16")
@@ -198,10 +229,14 @@ def main() -> None:
     replay_cases = []
     failures = []
     for m in args.batch_sizes:
-        x, ids, route_weights = make_profile_routed_inputs(profile, weights, spec, m, 42, device)
+        x, ids, route_weights = inputs[m]
         case = {
             "tokens": m, "plans": {}, "oracle_metrics": {}, "cache": {},
             "active_experts": int(ids.unique().numel()),
+            "input_digests": {
+                name: tensor_digest(value) for name, value in
+                (("x", x), ("ids", ids), ("route_weights", route_weights))
+            },
         }
         report["cases"].append(case)
         replays = {}

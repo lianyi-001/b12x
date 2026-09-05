@@ -76,7 +76,10 @@ _DEVICE = DeviceIdentity(
 
 def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
 ) -> None:
-    cases = expand_sweep_cases()
+    cases = tuple(
+        case for case in expand_sweep_cases()
+        if case.geometry.recipe.quant_mode != "nvfp4_auto"
+    )
     queries = {tuple(sorted(case.query().items())): case.query() for case in cases}
     base_queries = {}
     for case in cases:
@@ -1278,7 +1281,7 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
                 "components": [
                     {
                         "component_id": "moe.decode",
-                        "query_schema_version": 3,
+                        "query_schema_version": 4,
                         "config_schema_version": 3,
                         "planner": decision_node_to_dict(planner),
                     }
@@ -1950,3 +1953,116 @@ def test_production_moe_resume_does_not_start_a_gpu_worker(tmp_path) -> None:
         assert candidates
         assert session.eligible_candidates(case, candidates)
         assert session._process is None
+
+
+@pytest.mark.parametrize("ratio,expected", [(1.0, True), (0.999, True), (0.97, True), (1.001, False)])
+def test_moe_precision_prefers_measured_parity_without_a_five_percent_margin(ratio, expected):
+    from b12x.policy.generation.providers.moe_precision import qualifies
+
+    pairs = [{"a4": 10.0, "a16": 10.0 * ratio} for _ in range(20)]
+    assert qualifies(pairs, "a16", "a4")[0] is expected
+
+
+@pytest.mark.parametrize("confirmed,backend", [(True, "w4a16"), (False, "micro")])
+def test_precision_reduction_confirms_aggregate_without_per_route_veto(confirmed, backend):
+    from b12x.policy.generation.providers.moe_precision import select_winner
+
+    a4 = _Session([], quant_mode="nvfp4").candidates[0]
+    a16 = _Session([], quant_mode="w4a16").candidates[1]
+    grouped = []
+    for initial in (10.005, 8.0):
+        confirmation = initial if confirmed else 12.0
+        grouped.append((None, (
+            MoeMeasurement(candidate=a4, latency_us=10.0, cosine=1.0,
+                           metrics={"initial_latency_us": 10.0, "confirmation_latency_us": 10.0}),
+            MoeMeasurement(candidate=a16, latency_us=confirmation, cosine=1.0,
+                           metrics={"initial_latency_us": initial, "confirmation_latency_us": confirmation}),
+        )))
+    assert select_winner(grouped, 0.999).config["backend"] == backend
+
+
+def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_path):
+    from b12x.policy import PolicyContext, PolicyMode, PolicySource, ProfileRegistry
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+
+    calls = []
+    class Session(_Session):
+        def __init__(self):
+            super().__init__(calls, quant_mode="nvfp4")
+            self._candidates = (self._candidates[0], _Session([], quant_mode="w4a16").candidates[1])
+
+        def measure(self, case, candidates, *, correctness=False):
+            assert not correctness
+            calls.append(case.case_id)
+            return tuple(MoeMeasurement(
+                candidate=candidate, latency_us=10.0, cosine=1.0,
+                metrics={field: (11.0 if case.num_tokens == 1 and candidate.config["backend"] == "w4a16" else 10.0)
+                         for field in ("initial_latency_us", "confirmation_latency_us")},
+            ) for candidate in candidates)
+
+    generator = _generator(calls, quant_mode="nvfp4_auto")
+    generator._benchmark_factory = lambda geometry, context: Session()
+    context = _context(tmp_path)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    result = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert len(calls) == 4
+    profile = profile_from_dict({
+        "profile_id": "nvidia.synthetic.48sm",
+        "targets": [{"vendor": "nvidia", "compute_capability": [12, 1], "sm_count": 48,
+                     "product_name": "Synthetic GPU"}],
+        "components": [result.component],
+    })
+    component = profile.component("moe.decode")
+    query = generator._cases[0].query()
+    for count, backend in ((1, "micro"), (4, "w4a16")):
+        hit = component.lookup({**query, "num_tokens": count, "routed_rows": 2 * count})
+        assert hit.config["backend"] == backend
+    assert component.lookup({**query, "num_tokens": 2, "routed_rows": 4}) is None
+    registry = ProfileRegistry()
+    registry.register(profile)
+    policy = PolicyContext.for_identity(_DEVICE, registry=registry)
+    resolved = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**{**query, "num_tokens": 4, "routed_rows": 8}))
+    assert resolved.source is PolicySource.PREPLANNED
+    assert resolved.config.backend == "w4a16"
+    miss = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**{**query, "num_tokens": 2, "routed_rows": 4}))
+    assert miss.source is PolicySource.HEURISTIC
+    assert miss.config.backend != "w4a16"
+    heuristic = PolicyContext.for_identity(_DEVICE, mode=PolicyMode.HEURISTIC_ONLY, registry=registry)
+    assert heuristic.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**query)).source is PolicySource.HEURISTIC
+    generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert len(calls) == 4
+    generator._precision_identity = "different-source-or-toolchain"
+    generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    assert len(calls) == 8
+
+
+@pytest.mark.parametrize("profile_id,route", [
+    ("nvidia.gb10.48sm", "packed"),
+    ("nvidia.rtx.pro.6000.blackwell.max-q", "direct"),
+])
+def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(profile_id, route):
+    from dataclasses import replace
+    from b12x.policy import MOE_DECODE, PolicyContext, PolicyMode, PolicySource
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery, MoeDecodeConfig
+
+    profile = EMBEDDED_REGISTRY.get(profile_id)
+    context = PolicyContext.for_identity(profile.targets[0], mode=PolicyMode.PREPLANNED_ONLY)
+    query = MoeDecodeQuery(
+        quant_mode="nvfp4_auto", source_format="modelopt_nvfp4", activation="silu",
+        num_experts=256, hidden_size=6144, intermediate_size=256, top_k=8, num_tokens=1, routed_rows=8,
+    )
+    for count in range(1, 9):
+        resolution = context.resolve(MOE_DECODE_POLICY, replace(query, num_tokens=count, routed_rows=count * 8))
+        assert resolution.source is PolicySource.PREPLANNED
+        assert resolution.config.backend == "w4a16"
+        assert resolution.config.w4a16_route_mode == route
+    automatic = PolicyContext.for_identity(profile.targets[0])
+    miss = automatic.resolve(MOE_DECODE_POLICY, replace(query, num_tokens=9, routed_rows=72))
+    assert miss.source is PolicySource.HEURISTIC
+    assert miss.config.backend != "w4a16"
+    a4 = MoeDecodeConfig(backend="micro", route_planner="internal", max_active_clusters=None)
+    override = automatic.with_override(MOE_DECODE, a4).resolve(MOE_DECODE_POLICY, query)
+    assert override.source is PolicySource.OVERRIDE
+    assert override.config == a4
+    unknown = PolicyContext.for_identity(replace(profile.targets[0], product_name="Unmeasured GPU"))
+    assert unknown.resolve(MOE_DECODE_POLICY, query).source is PolicySource.HEURISTIC

@@ -104,6 +104,49 @@ global scales for both modes; A4 preparation derives its runtime alphas from tho
 globals and the reciprocal activation scales. A16 preparation supplies unit
 activation scales and retains the raw weight globals for decode.
 
+**Implemented:** `ActivationMode.AUTO` prepares both consumers from one
+`PackedWeights` bundle and selects precision through `moe.decode` during
+`plan_execution`. It requires ModelOpt NVFP4, BF16 IO, SiLU, source-native
+packing, and up/gate (`W13Layout.W13`) row order. Supply raw weight globals
+and both reciprocal activation scales. The A16 consumer retains raw weight
+globals and performs no activation-scale arithmetic.
+
+Precision is fixed for each `ExecutionCapacity.max_tokens`; it is exposed as
+`ExecutionPlan.activation_mode`, with policy provenance in
+`ExecutionPlan.precision_resolution`. Separate decode and prefill capacity
+plans can share one prepared expert owner. Binding and replay perform no
+precision policy lookup. AUTO prewarming compiles the declared warmup counts
+for both route-ID dtypes before kernel resolution is frozen. Explicit A4 and
+A16 modes retain their requested precision.
+
+The offline generator races real A4 and native A16 plans. Every candidate must
+pass its precision-specific oracle, poisoned-output graph replay, and allocation
+and clock checks. The reducer scores the geometric mean of route-pattern
+medians. A16 is eligible when its aggregate is no slower than every qualified
+A4 candidate in both the initial paired race and an independent confirmation.
+Exact ties favor A16; there is no five-percent promotion margin.
+Confidence intervals and raw samples remain in local evidence. Precision
+choices cover exact measured capacities, with A4 heuristics for uncovered
+queries. Candidate losses at one capacity do not prune other capacities.
+
+**Qualified:** for GLM-5.2 layer 3, TP8 (H=6144, I=256, E=256, top-k=8),
+the embedded RTX PRO 6000 Blackwell Max-Q and GB10 profiles select A16 at
+capacities 1–8. RTX uses direct routes; GB10 uses packed routes with native
+weight bytes and the tensor-core consumer's additional scale metadata. The
+checkpoint benchmark uses synthetic activations/routes and precision-specific
+oracles, rather than measuring full-model inference.
+
+The GB10 profile follows cold-L2 generation. At M=1 with cached weights, direct
+A16 measured 40.13 µs versus 64.64 µs for packed-route A16 and 46.30 µs for A4
+micro; callers qualifying that workload can override the route configuration.
+Cold M=1 measured 118.75 µs for packed-route A16. No runtime cache-residency
+prediction participates in precision selection.
+
+The existing GB10 dynamic A4 configuration failed the checkpoint NVFP4 cosine
+gate at M=2–8 (0.999868–0.999529 versus 0.9999). Those candidates are excluded
+from checkpoint timing qualification. Passing A4 micro and A16 candidates
+retain their measured comparison; the fixed-A4 profile is unchanged.
+
 The direct native decode kernel supports one through eight tokens subject to its
 model-geometry contract. Plan an A16 decode capacity within that range. The
 canonical scratch plan retains the routing policy selected for its capacity; a

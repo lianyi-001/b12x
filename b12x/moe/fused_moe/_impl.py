@@ -2522,6 +2522,8 @@ def _heuristic_moe_decode_config(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> MoeDecodeConfig:
+    if query.quant_mode == "nvfp4_auto":
+        return _heuristic_moe_decode_config(replace(query, quant_mode="nvfp4"), device)
     if query.quant_mode == "w4a16":
         return MoeDecodeConfig(
             backend="w4a16",
