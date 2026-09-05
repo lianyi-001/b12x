@@ -49,6 +49,14 @@ runtime-policy and generator registrations. Package loading rejects an embedded
 profile that omits a registered component. The component schema is validated
 before a matching config is returned; invalid matching data fails closed.
 
+One-shot `gemm.blockscaled` participates through the separate catalog inventory
+`ONESHOT_COMPONENTS`. Its `gemm.blockscaled_precision` policy resolves static
+weight geometry during prewarm; live M selects a precision route from
+that cached config. Graph replay retains the captured route. This does not
+introduce a public GEMM planning API. See
+[dense GEMM activation precision](dense-gemm-precision.md) for shared weight
+storage, workspace, and qualification contracts.
+
 ## Precedence and overrides
 
 Resolution order is:
