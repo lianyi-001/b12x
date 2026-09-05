@@ -196,9 +196,40 @@ CUTLASS DSL 4.6.2, and PTXAS 13.3.73, 58 targeted checks passed: exhaustive
 FP4/FP8 value and scale conversion, both weight formats, split-K variants,
 scale-tile tails, and graph replay under frozen kernel resolution.
 
-The embedded GB10 precision profile has no measured coverage yet, and its
-heuristic retains quantized activations. Explicit `mode="a16"` is supported.
+Status: performance qualified for the four weight geometries and 24 row counts
+listed above, for both recipes. All 192 cases selected quantized activations;
+none of the 3,264 candidate checks failed correctness or the timing gate.
+The smallest measured A16/quantized median ratios were 0.9583 for NVFP4 and
+0.9543 for MXFP8, which do not meet the 0.95 promotion threshold. The embedded
+GB10 profile therefore retains W4A4/W8A8 for these geometries. The uncovered
+geometry heuristic also retains quantized activations. Explicit `mode="a16"`
+is supported.
+
+For N=4096, K=5376, representative cold-L2 graph medians in microseconds are:
+
+| Recipe | M | Best A16 candidate | Quantized |
+| --- | ---: | ---: | ---: |
+| NVFP4 | 1 | 61.312 | 61.504 |
+| NVFP4 | 8 | 61.440 | 61.440 |
+| MXFP8 | 1 | 108.480 | 106.912 |
+| MXFP8 | 8 | 107.552 | 108.544 |
+
 The profile generator races both precisions on GB10 with a device-specific
 timing gate: P0, zero throttle mask, and at most 30 MHz SM-clock change between
 snapshots. NVML does not report the GB10 memory clock; evidence records that
 limitation. SM120 Max-Q measurements retain their separate timing gate.
+
+The 25-warmup, 25-trial run completed without checkpoint retries in 11m25s.
+Evidence on `chroniton.local` is `/tmp/b12x-sm121-precision.json`, the source
+manifest `/tmp/b12x-sm121-precision-source.json`, and raw checkpoints under
+`/tmp/b12x-sm121-precision-work/`. The artifact SHA256 is
+`f03e0b958ced5dc825d558ba0a8d5ce131382630645e9dfa9b5f49c16b21d422`;
+the source-manifest SHA256 is
+`2ea19c566c604b623d5871798555fa91c7cff4a8a02330dffb078d09cfba2116`.
+With the embedded profile loaded, the A16 and precision-policy suites passed
+86 checks; three SM120-specific checks were skipped. This includes exact
+quantized output under PREPLANNED_ONLY resolution and poisoned-buffer graph
+replay for both recipes.
+The isolated source directory is
+`/home/luke/projects/b12x-precision-sm121-e0b844ec`. The manifest binds its
+source files and toolchain independently of installed package-version metadata.

@@ -40,6 +40,17 @@ def test_sm121_accepts_measured_a16_routes():
     assert resolution.config.select(8) == (128, 64, 4)
 
 
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+def test_embedded_gb10_precision_retains_quantized_activations(recipe):
+    device = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm").targets[0]
+    context = PolicyContext.for_identity(device, mode=PolicyMode.PREPLANNED_ONLY)
+    for n, k in ((4096, 5376), (16384, 1024), (17408, 5120), (5120, 17408)):
+        query = BlockscaledQuery(recipe=recipe, in_features=k, out_features=n)
+        resolution = context.resolve(BLOCKSCALED_POLICY, query)
+        assert resolution.source is PolicySource.PREPLANNED
+        assert resolution.config.a16_rows == ()
+
+
 def test_gb10_timing_gate_requires_p0_stable_sm_clock_and_no_throttling():
     from benchmarks.benchmark_blockscaled_precision import _clock_checks
 

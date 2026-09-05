@@ -343,6 +343,43 @@ def test_native_weight_pairs_exhaustive(fp4):
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+def test_gb10_embedded_precision_captures_quantized_route(recipe, monkeypatch):
+    require_b12x()
+    from b12x.gemm.blockscaled import _policy
+    from b12x.policy import PolicyContext, PolicyMode, PolicySource
+
+    policy = PolicyContext.for_device("cuda", mode=PolicyMode.PREPLANNED_ONLY)
+    if policy.device.product_name != "nvidia gb10":
+        pytest.skip("GB10 precision profile qualification")
+    monkeypatch.setattr(_policy, "get_auto_policy", lambda device: policy)
+    _policy.resolve_precision.cache_clear()
+    weight, _, _ = make_weight(recipe, 4096, 5376)
+    source = torch.randn(8, 5376, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(8, 4096, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(blockscaled.workspace_size(weight, 8), device="cuda", dtype=torch.uint8)
+    options = dict(activation_global_scale=torch.tensor([128.], device="cuda")) if recipe == "nvfp4" else {}
+    blockscaled.prewarm(weight, [1, 8], workspace=workspace, **options)
+    resolution = _policy.resolve_precision(source.device, recipe, 5376, 4096)
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.a16_rows == ()
+    monkeypatch.setattr(_a16, "_a16", lambda *a, **kw: pytest.fail("GB10 auto unexpectedly promoted to A16"))
+    freeze_kernel_resolution("GB10 embedded quantized precision")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            blockscaled.mm(source, weight, out=output, workspace=workspace, **options)
+        source.normal_()
+        expected = blockscaled.mm(source, weight, mode="quantized", **options)
+        workspace.fill_(255)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    finally:
+        unfreeze_kernel_resolution()
+        _policy.resolve_precision.cache_clear()
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("k", [32, 96, 160])
 def test_a16_short_scale_tile_tail(recipe, k):
     require_b12x()
