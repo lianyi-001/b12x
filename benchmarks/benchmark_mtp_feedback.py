@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Benchmark Qwen3.8 Flash Next MTP feedback through its public API.
 
-The corpus fixes the production geometry at four residual streams and hidden
+The benchmark matrix fixes the production geometry at four residual streams and hidden
 size 2560, then covers single-token decode, a four-token speculative step, and
-three prefill sizes.  Every case validates the seeded PyTorch oracle before
-recording eager-launch and CUDA-graph-replay samples.
+four prefill sizes including a padded-row boundary. Every case validates the
+seeded PyTorch oracle before recording eager-launch and CUDA-graph-replay
+samples.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ class Profile:
 PROFILES = (
     Profile(name="decode-t1", phase="decode", tokens=1),
     Profile(name="spec-t4", phase="spec", tokens=4),
+    Profile(name="prefill-t17", phase="prefill", tokens=17),
     Profile(name="prefill-t128", phase="prefill", tokens=128),
     Profile(name="prefill-t512", phase="prefill", tokens=512),
     Profile(name="prefill-t4096", phase="prefill", tokens=4096),
@@ -135,7 +137,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--list-profiles",
         action="store_true",
-        help="print the profile corpus as JSON and exit without requiring CUDA",
+        help="print the profile set as JSON and exit without requiring CUDA",
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=100)
@@ -208,6 +210,7 @@ def _make_binding(
     seed: int,
     device: torch.device,
     capacity_tokens: int,
+    policy=None,
 ) -> mtp.Binding:
     """Allocate and bind one case exclusively through the public lifecycle."""
 
@@ -218,7 +221,7 @@ def _make_binding(
         streams=_STREAMS,
         dtype=_DTYPE,
     )
-    planned = mtp.plan(caps)
+    planned = mtp.plan(caps, policy=policy)
     (scratch_spec,) = planned.scratch_specs()
     generator = torch.Generator(device=device).manual_seed(seed)
     scratch = torch.empty(
@@ -247,29 +250,41 @@ def _make_binding(
             generator=generator,
             device=device,
         ),
-        token_norm_weight=_randn_bf16(
-            (_HIDDEN_SIZE,),
-            scale=0.05,
-            generator=generator,
-            device=device,
+        token_norm_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_HIDDEN_SIZE,),
+                scale=0.05,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
-        state_norm_weight=_randn_bf16(
-            (_STREAMS * _HIDDEN_SIZE,),
-            scale=0.05,
-            generator=generator,
-            device=device,
+        state_norm_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_STREAMS * _HIDDEN_SIZE,),
+                scale=0.05,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
-        embedding_fc_weight=_randn_bf16(
-            (_HIDDEN_SIZE, _HIDDEN_SIZE),
-            scale=_HIDDEN_SIZE**-0.5,
-            generator=generator,
-            device=device,
+        embedding_fc_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_HIDDEN_SIZE, _HIDDEN_SIZE),
+                scale=_HIDDEN_SIZE**-0.5,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
-        hidden_fc_weight=_randn_bf16(
-            (_HIDDEN_SIZE, _HIDDEN_SIZE),
-            scale=_HIDDEN_SIZE**-0.5,
-            generator=generator,
-            device=device,
+        hidden_fc_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_HIDDEN_SIZE, _HIDDEN_SIZE),
+                scale=_HIDDEN_SIZE**-0.5,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
         output=output,
         tokens=profile.tokens,
@@ -363,12 +378,14 @@ def _benchmark_profile(
     samples: int,
     l2_flush,
     capacity_tokens: int,
+    policy=None,
 ) -> dict[str, Any]:
     binding = _make_binding(
         profile,
         seed=seed,
         device=device,
         capacity_tokens=capacity_tokens,
+        policy=policy,
     )
     reference = mtp.reference.feedback(
         binding.token_embedding,
@@ -525,9 +542,6 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
     device = torch.device("cuda", torch.cuda.current_device())
-    major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) not in ((12, 0), (12, 1)):
-        raise SystemExit(f"SM120/SM121 is required, got SM{major}{minor}")
 
     properties = torch.cuda.get_device_properties(device)
     mode_before = nvidia_smi_gpu_mode_snapshot()
@@ -571,6 +585,9 @@ def main(argv: list[str] | None = None) -> None:
             "hidden_size": _HIDDEN_SIZE,
             "dtype": "bfloat16",
             "reference": "b12x.sequence.mtp_feedback.reference.feedback",
+            "projection_backend": "cutedsl",
+            "projection_specialization": "fixed_capacity_runtime_live_rows",
+            "triton_role": "normalization_and_reduction_auxiliaries",
             "eager_timed": True,
             "cuda_graph_replay_timed": True,
             "raw_samples_preserved": True,

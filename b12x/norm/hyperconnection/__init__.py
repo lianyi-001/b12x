@@ -26,6 +26,8 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "HyperConnectionConfig",
+        "HyperConnectionQuery",
         "plan",
         "bind",
         "run_grouped_rmsnorm",
@@ -46,8 +48,11 @@ META = OpMeta(
     test_path="tests/norm/test_hyperconnection.py",
     since="1.3.0",
     notes=(
-        "Triton correctness reference for S=4, H=2560, R=320, BF16; not "
-        "throughput-qualified."
+        "The Qwen3.8 Flash Next S=4, H=2560, R=320 BF16 contract uses the "
+        "CuTeDSL combine+norm kernel for every non-empty live token count. "
+        "Unsupported geometry or layout fails instead of falling back. Triton "
+        "is used only for the auxiliary normalization, "
+        "activation, gate-reduction, and final residual-injection stages."
     ),
 )
 
@@ -55,6 +60,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        HyperConnectionConfig,
+        HyperConnectionQuery,
         Plan,
         bind,
         is_supported,

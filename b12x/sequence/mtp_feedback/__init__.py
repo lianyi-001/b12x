@@ -24,6 +24,8 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "MtpFeedbackConfig",
+        "MtpFeedbackQuery",
         "plan",
         "bind",
         "run",
@@ -40,9 +42,10 @@ META = OpMeta(
     test_path="tests/sequence/test_mtp_feedback.py",
     since="1.3.0",
     notes=(
-        "Qualified SM120 Qwen token counts use Triton normalization and "
-        "CuTeDSL projection GEMMs. Unqualified counts and layouts retain the "
-        "Triton projection implementation."
+        "Qualified Qwen S=4,H=2560 uses mandatory capacity-specialized "
+        "CuTeDSL projection GEMMs with runtime live-row grids. Triton is used "
+        "only by the normalization and reduction auxiliaries feeding those "
+        "projections. Other geometries or tensor contracts are unsupported."
     ),
 )
 
@@ -50,6 +53,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        MtpFeedbackConfig,
+        MtpFeedbackQuery,
         Plan,
         bind,
         is_supported,

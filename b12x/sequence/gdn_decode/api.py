@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from ..._lib.gating import default_is_supported
-from . import META
+from ..._lib.gating import has_cutlass_dsl, has_triton
 
 from . import reference
 from ._impl import (
@@ -17,23 +16,27 @@ from ._impl import (
     run,
     run_kda,
 )
+from ._policy import GdnConfig, GdnQuery
 
 
 def is_supported(device=None) -> bool:
-    """True when the registered b12x architecture can run this Triton op."""
-    return default_is_supported(device, requires=META.requires)
+    """True when mandatory Qwen CuTe and its Triton auxiliaries are usable."""
+    del device
+    return has_cutlass_dsl() and has_triton()
 
 
 __all__ = [
-    "Caps",
-    "Plan",
     "Binding",
+    "Caps",
+    "GdnConfig",
+    "GdnQuery",
     "KdaBinding",
-    "plan",
+    "Plan",
     "bind",
     "bind_kda",
+    "is_supported",
+    "plan",
+    "reference",
     "run",
     "run_kda",
-    "reference",
-    "is_supported",
 ]

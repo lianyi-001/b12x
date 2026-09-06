@@ -9,6 +9,11 @@ outside this package.
 ``bind`` / ``run`` implements scalar per-head Qwen GDN decay. ``bind_kda`` /
 ``run_kda`` implements GLM/Kimi lower-bounded KDA decay from a per-key-coordinate
 raw gate while preserving the same state, transaction, and serving lifecycle.
+KDA bindings accept live tensor capacities within the plan, so serving runtimes
+can bind projection, metadata, and output tensors directly without staging.
+``Caps.kda_metadata_validation="trusted"`` disables device-side validation when
+the runtime already guarantees packed-request geometry, unique active state
+ownership, and in-range state indices.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
@@ -48,17 +53,19 @@ META = OpMeta(
     group="sequence",
     api_style="planned",
     entry_points=(
-        "Caps",
-        "Plan",
         "Binding",
+        "Caps",
+        "GdnConfig",
+        "GdnQuery",
         "KdaBinding",
-        "plan",
+        "Plan",
         "bind",
         "bind_kda",
+        "is_supported",
+        "plan",
+        "reference",
         "run",
         "run_kda",
-        "reference",
-        "is_supported",
     ),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("silu", "sigmoid", "lower_bounded_kda"),
@@ -74,12 +81,12 @@ META = OpMeta(
     test_path="tests/sequence/test_gdn_decode.py",
     since="1.3.0",
     notes=(
-        "Qualified for 128-wide K/V heads, value/key ratios 1,2,3,4,8, "
-        "BF16 model tensors, BF16 or FP32 norm weights, and BF16 or FP32 "
-        "recurrent state. Lower-bounded KDA is qualified for equal 128-wide "
-        "Q/K/V head counts, per-key decay gates, scalar update gates, and a "
-        "sigmoid output gate. The Triton implementation is a correctness "
-        "reference and is not throughput-qualified."
+        "Qwen3.8 Flash Next uses the CuTeDSL recurrence for any planned "
+        "capacity with three value heads per Q/K head. BF16 and FP32 recurrent "
+        "state and int32 or int64 state indices are supported. Triton is used "
+        "only for metadata validation and gated RMSNorm auxiliaries. The "
+        "separately named GLM/KDA API retains its dedicated Triton recurrence "
+        "for equal 128-wide Q/K/V head counts."
     ),
 )
 
@@ -87,6 +94,8 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        GdnConfig,
+        GdnQuery,
         KdaBinding,
         Plan,
         bind,
