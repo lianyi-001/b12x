@@ -7,7 +7,57 @@ import torch
 from safetensors.torch import save_file
 
 from b12x.loader._checkpoint import DirectWeightSession
-from b12x.loader._pool import shared_pool
+from b12x.loader._pool import shared_pool, weight_pool
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_tp_column_slices_preserve_padding_and_expand_bf16(
+    tmp_path, rank, padded, dtype
+):
+    """TP rows must read the selected columns without overwriting row padding."""
+    expected = torch.arange(2 * 128 * 256, dtype=torch.float32).to(torch.bfloat16)
+    expected = expected.reshape(2, 128, 256)
+    path = tmp_path / "tp.safetensors"
+    save_file({"weight": expected}, path)
+    with shared_pool(allocation="pinned_wc"), DirectWeightSession() as session:
+        source = dict(session.weights([path]))["weight"][
+            :, :, rank * 128 : (rank + 1) * 128
+        ]
+        backing = torch.full(
+            (2, 128, 130 if padded else 128), -17.0, dtype=dtype, device="cuda"
+        )
+        target = backing[:, :, 1:-1] if padded else backing
+        assert session(target, source)
+        stats = session.stats()
+        if not padded:
+            assert stats["strided_copy_bytes"] == source.nbytes
+            assert stats["reads"] < 8
+        assert stats["descriptors"] == 2
+    torch.testing.assert_close(
+        target.cpu(),
+        expected[:, :, rank * 128 : (rank + 1) * 128].to(dtype),
+        rtol=0,
+        atol=0,
+    )
+    if padded:
+        assert torch.all(backing[:, :, 0] == -17)
+        assert torch.all(backing[:, :, -1] == -17)
+
+
+def test_transform_materialization_owns_values_after_session_close(tmp_path):
+    expected = torch.arange(4096, dtype=torch.float32).reshape(32, 128)
+    path = tmp_path / "transform.safetensors"
+    save_file({"weight": expected}, path)
+    with (
+        weight_pool(allocation="pinned_wc") as allocator,
+        DirectWeightSession(allocation_scope=allocator) as session,
+    ):
+        source = dict(session.weights([path]))["weight"][:, 64:]
+        actual = session.materialize(source)
+    path.unlink()
+    torch.testing.assert_close(actual.cpu(), expected[:, 64:], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("offset", [0, 4103, 2**32 + 4103])

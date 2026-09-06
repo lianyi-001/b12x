@@ -16,8 +16,8 @@ Preparation may reuse weight storage in place, but shared weights are read-only
 during inference. New preparation outputs use ordinary CUDA storage. A final
 allocation audit rejects shared non-persistent buffers before serving starts.
 
-To use the GB10 loader validated with Qwen 3.8 Flash Next,
-install the matching vLLM weight-transfer hooks:
+Initial serving checks cover Qwen 3.8 Flash Next with TP=1 and GLM 5.3 Flash
+with TP=2 and MTP off. Install the matching vLLM weight-transfer hooks:
 
 ```sh
 VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
@@ -29,8 +29,9 @@ pinned storage for weights; no `allocation` option is needed or accepted.
 Write combining changes the CPU cache policy, not the ownership or direct-I/O
 contract.
 
-The adapter records contiguous destination views and submits packed native
-descriptors `(fd, offset, bytes, destination, operation)` in batches. Operations
+The adapter records destination views and submits packed native descriptors
+`(fd, offset, row_bytes, destination, operation, rows, source_stride, destination_stride)`
+in batches. Strides are measured in bytes; contiguous ranges have one row. Operations
 cover direct file reads, in-place BF16 expansion, and copies of owned CPU control
 metadata. For the latter, the offset field contains the source address. C validates
 ownership and non-overlap, orders jobs by file offset, splits large ranges, and
@@ -44,6 +45,8 @@ Explicit fences precede online quantization, composed weight transforms, PLE
 scale validation, and final weight preparation. A failed batch drains all workers
 before reporting failure. Arbitrary consumers of queued parameter values require
 an explicit completion fence; this is an initial-load integration contract.
+Numerical loading callbacks use `materialize_weight` to read owned inputs before
+operating on them, including GLM's paired selector weights and scales.
 
 Weight destinations use `cudaHostAllocMapped | cudaHostAllocWriteCombined` and
 are explicitly `mlock`ed. Failure to lock final storage fails the allocation.
@@ -61,13 +64,16 @@ Aligned file/address ranges read straight into the destination. Large misaligned
 ranges also read into the destination, then realign in place with `memmove`.
 Each aligned read window fits within the remaining destination bytes. Only
 small edges need a worker's fixed, locked 8 MiB alignment buffer and a CPU copy.
-In-place moves and edge copies are counted separately. This path bypasses the
+For TP slices with rows smaller than 4 KiB, C reads adjacent rows together into
+that same fixed scratch buffer and scatters selected bytes into the destination.
+Larger rows use the direct range path. In-place moves, edge copies and strided
+copies are counted separately. This path bypasses the
 page cache but does not promise zero copying for every safetensors layout.
 Scalar and explicitly declared control metadata are coalesced into owned CPU
 spans, with a 64 MiB aggregate span limit per session, including intervening bytes.
 
 Logs distinguish physical reads, bytes read into destinations, in-place alignment,
-edge copies, in-place conversions, other casts, and final parameter ownership. Existing b12x
+edge and strided copies, in-place conversions, other casts, and final parameter ownership. Existing b12x
 weight-preparation policies retain or reuse source storage; the loader does not
 make a second packed-weight copy. Existing quantization callbacks can still
 allocate full tensors, so these counters do not establish an aggregate transform

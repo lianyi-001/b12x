@@ -1,6 +1,7 @@
 """The adapter preserves vLLM's indexed source selection and owned inputs."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -114,3 +115,90 @@ def test_loader_policy_keeps_hyperconnection_workspaces_out_of_shared_weights(tm
         buffer.fill_(7)
     torch.cuda.synchronize()
     torch.testing.assert_close(norm.weight.cpu(), expected)
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("quantization", ["mxfp8", "block_fp8"])
+def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
+    tmp_path, scale_first, quantization
+):
+    """Numerical projection transforms must consume payloads, not meta views."""
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.model_executor.weight_transfer import allocate_weights, weight_transfer
+    from vllm.models.glm5next.nvidia.model import Glm5NextModel
+
+    prefix = "layers.3.self_attn"
+    if quantization == "mxfp8":
+        projection = target = "indexer.weights_proj"
+        scale_name = "weight_scale"
+        scale = torch.full((1, 1), 128, dtype=torch.uint8)
+    else:
+        projection, target = "q_a_proj", "fused_qkv_a_proj"
+        scale_name = "weight_scale_inv"
+        scale = torch.full((1, 1), 2.0, dtype=torch.float32)
+    parameter_name = f"{prefix}.{target}.weight"
+    weight = torch.arange(32).reshape(1, 32).to(torch.float8_e4m3fn)
+    expected = weight.float() * 2
+    path = tmp_path / "attention.safetensors"
+    save_file(
+        {
+            f"{prefix}.{projection}.weight": weight,
+            f"{prefix}.{projection}.{scale_name}": scale,
+        },
+        path,
+    )
+
+    class Projection(torch.nn.Module):
+        config = SimpleNamespace(
+            is_moe=False, is_linear_attn=True, mla_nope=False, qk_rope_head_dim=0
+        )
+
+        def named_parameters(self):
+            return iter([(parameter_name, param)])
+
+    with (
+        weight_pool(allocation="pinned_wc") as allocator,
+        DirectWeightSession(allocation_scope=allocator) as session,
+        weight_transfer(session, allocator=allocator),
+    ):
+        param = torch.nn.Parameter(
+            allocate_weights(torch.empty, (1, 32), dtype=torch.float32, device="cuda")
+        )
+        param.weight_loader = lambda p, value, shard_id=None: default_weight_loader(
+            p, value
+        )
+        sources = sorted(
+            session.weights([path]),
+            key=lambda pair: pair[0].endswith(".weight") == scale_first,
+        )
+        loaded = Glm5NextModel.load_weights(Projection(), iter(sources))
+        assert loaded == {parameter_name}
+        assert owns_tensor(param)
+    torch.testing.assert_close(param.cpu(), expected)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_kda_convolution_loads_each_tp_shard_into_fused_wc_weights(tmp_path, rank):
+    from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+        _make_fused_conv1d_weight_loader,
+    )
+    from vllm.model_executor.weight_transfer import allocate_weights, weight_transfer
+
+    path = tmp_path / "kda.safetensors"
+    weights = {
+        name: (torch.arange(32).reshape(8, 1, 4) + i * 64).to(torch.bfloat16)
+        for i, name in enumerate(("q", "k", "v"))
+    }
+    save_file(weights, path)
+    with (
+        weight_pool(allocation="pinned_wc") as allocator,
+        DirectWeightSession() as session,
+        weight_transfer(session, allocator=allocator),
+    ):
+        param = allocate_weights(torch.empty, (12, 1, 4), device="cuda")
+        loader = _make_fused_conv1d_weight_loader([8, 8, 8], 2, rank)
+        sources = dict(session.weights([path]))
+        for i, name in enumerate(("q", "k", "v")):
+            loader(param, sources[name], i)
+    expected = torch.cat([weights[name][rank * 4 : (rank + 1) * 4] for name in weights])
+    torch.testing.assert_close(param.cpu(), expected.float())
