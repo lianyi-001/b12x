@@ -3489,6 +3489,104 @@ def test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+@pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+def test_w4a16_fc2_resident_bounds_reuse_frozen_kernel(
+    intermediate_size: int,
+    route_ids_dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import b12x
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    hidden_size, capacity_m = 128, 9
+    prepared = []
+    for num_experts in (2, 5):
+        w2 = torch.full(
+            (num_experts, hidden_size, intermediate_size // 2),
+            0x11,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        scales = torch.full(
+            (num_experts, hidden_size, intermediate_size // 32),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        prepared.append(prepare_w4a16_fc2_e8m0(w2, scales))
+
+    monkeypatch.setattr(w4a16_kernel, "_FC2_DIRECT_CACHE", {})
+    prewarm_w4a16_fc2_e8m0(prepared[0], route_ids_dtype=route_ids_dtype)
+    (launch,) = w4a16_kernel._FC2_DIRECT_CACHE.values()
+    intermediate = torch.empty(
+        (capacity_m, intermediate_size), dtype=torch.bfloat16, device="cuda"
+    )
+    route_ids = torch.empty(capacity_m, dtype=route_ids_dtype, device="cuda")
+    route_weights = torch.empty(capacity_m, dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        (capacity_m, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else 5
+    mutated_ids = [0, 2, -1, 4, 5, invalid_upper, 1, 0, 4]
+    ids_source = torch.tensor(mutated_ids, dtype=route_ids_dtype, device="cuda")
+    buffers = (intermediate, route_ids, route_weights, output)
+    addresses = tuple(buffer.data_ptr() for buffer in buffers)
+    workspace_contracts = [
+        (item.workspace.data_ptr(), item.workspace.numel()) for item in prepared
+    ]
+
+    b12x.freeze_kernel_resolution("FC2 resident bounds and live row reuse")
+    try:
+        for experts in prepared:
+            prewarm_w4a16_fc2_e8m0(experts, route_ids_dtype=route_ids_dtype)
+            for m in (1, 3, capacity_m):
+                intermediate.fill_(1)
+                route_ids.zero_()
+                route_weights.fill_(0.25)
+                args = (intermediate[:m], experts, route_ids[:m], route_weights[:m])
+                live_output = output[:m]
+                valid_expected = torch.full_like(live_output, intermediate_size / 8)
+                values = [
+                    intermediate_size / 2 if 0 <= i < experts.num_experts else 0
+                    for i in mutated_ids[:m]
+                ]
+                mutated_expected = torch.tensor(
+                    values, dtype=torch.bfloat16, device="cuda"
+                )[:, None].expand_as(live_output)
+                eager = run_w4a16_fc2_e8m0(*args, output=live_output)
+                assert eager is live_output
+                torch.testing.assert_close(eager, valid_expected, rtol=0, atol=0)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = run_w4a16_fc2_e8m0(*args, output=live_output)
+                intermediate.fill_(2)
+                route_weights.fill_(0.5)
+                route_ids.copy_(ids_source)
+                output.fill_(float("nan"))
+                allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                allocated_bytes = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert torch.cuda.memory_allocated() == allocated_bytes
+                assert captured is live_output
+                torch.testing.assert_close(captured, mutated_expected, rtol=0, atol=0)
+                torch.testing.assert_close(route_ids, ids_source, rtol=0, atol=0)
+                assert bool((route_weights == 0.5).all().item())
+                assert tuple(buffer.data_ptr() for buffer in buffers) == addresses
+                graph.reset()
+            (cached,) = w4a16_kernel._FC2_DIRECT_CACHE.values()
+            assert cached.compiled is launch.compiled
+        assert [
+            (item.workspace.data_ptr(), item.workspace.numel()) for item in prepared
+        ] == workspace_contracts
+    finally:
+        b12x.unfreeze_kernel_resolution()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     experts, hidden_size, intermediate_size, routes = 5, 128, 256, 7
     w2 = torch.empty(
