@@ -25,12 +25,7 @@ class B12xModelLoader(DefaultModelLoader):
 
     def __init__(self, load_config):
         options = dict(load_config.model_loader_extra_config)
-        self.allocation = options.pop("allocation", "registered")
         self.io_threads = options.pop("io_threads", 8)
-        if self.allocation not in ("registered", "pinned", "pinned_wc", "managed"):
-            raise ValueError(
-                "b12x allocation must be registered, pinned, pinned_wc or managed"
-            )
         if options.get("enable_multithread_load"):
             raise ValueError("b12x currently uses synchronous checkpoint routing")
         if load_config.safetensors_load_strategy not in (None, "lazy"):
@@ -58,7 +53,7 @@ class B12xModelLoader(DefaultModelLoader):
             raise ValueError("the initial b12x loader requires a CUDA device")
         index = torch.cuda.current_device() if device.index is None else device.index
         with (
-            weight_pool(allocation=self.allocation, device=index) as allocator,
+            weight_pool(allocation="pinned_wc", device=index) as allocator,
             DirectWeightSession(
                 index, io_threads=self.io_threads, allocation_scope=allocator
             ) as session,
@@ -87,7 +82,7 @@ class B12xModelLoader(DefaultModelLoader):
         parameter_bytes = sum(p.nbytes for p in model.parameters())
         shared_bytes = sum(p.nbytes for p in model.parameters() if owns_tensor(p))
         model._b12x_loader_storage = {
-            "allocation": self.allocation,
+            "allocation": "pinned_wc",
             "parameter_bytes": parameter_bytes,
             "shared_parameter_bytes": shared_bytes,
             "shared_runtime_buffers": shared_runtime_buffers,
@@ -97,11 +92,10 @@ class B12xModelLoader(DefaultModelLoader):
         logger.info("b12x O_DIRECT I/O counters: %s", io_stats)
         logger.info("b12x allocation audit: no shared non-persistent runtime buffers")
         logger.info(
-            "b12x final parameters: %.3f / %.3f GiB in %s shared storage; "
+            "b12x final parameters: %.3f / %.3f GiB in write-combined shared storage; "
             "pool backing %.3f GiB",
             shared_bytes / 2**30,
             parameter_bytes / 2**30,
-            self.allocation,
             storage_stats()["live_bytes"] / 2**30,
         )
         return model

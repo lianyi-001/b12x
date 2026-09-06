@@ -37,14 +37,13 @@ def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
     )
     config = LoadConfig(
         load_format="b12x",
-        model_loader_extra_config={"allocation": "registered"},
         use_tqdm_on_load=show_progress,
     )
     loader = B12xModelLoader(config)
     source = DefaultModelLoader.Source(
         str(tmp_path), revision=None, prefix="draft.", weight_name_prefixes=("mtp.",)
     )
-    with shared_pool(), DirectWeightSession() as session:
+    with shared_pool(allocation="pinned_wc"), DirectWeightSession() as session:
         loader._session = session
         retained = dict(loader._get_weights_iterator(source))
         assert set(retained) == {"draft.mtp.weight", "draft.mtp.bias"}
@@ -56,7 +55,7 @@ def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
     torch.testing.assert_close(values["draft.mtp.weight"].cpu(), torch.arange(16))
     torch.testing.assert_close(values["draft.mtp.bias"].cpu(), torch.arange(4) + 100)
     assert config.load_format == "b12x"
-    assert config.model_loader_extra_config == {"allocation": "registered"}
+    assert config.model_loader_extra_config == {}
     progress = capsys.readouterr().err
     if show_progress:
         assert "Loading safetensors checkpoint shards (b12x)" in progress
@@ -97,7 +96,7 @@ def test_loader_policy_keeps_hyperconnection_workspaces_out_of_shared_weights(tm
     path = tmp_path / "norm.safetensors"
     save_file({"weight": expected}, path)
     with (
-        weight_pool() as allocator,
+        weight_pool(allocation="pinned_wc") as allocator,
         DirectWeightSession() as session,
         weight_transfer(session, allocator=allocator),
         torch.device("cuda"),

@@ -16,17 +16,18 @@ Preparation may reuse weight storage in place, but shared weights are read-only
 during inference. New preparation outputs use ordinary CUDA storage. A final
 allocation audit rejects shared non-persistent buffers before serving starts.
 
-To use the GB10 decode configuration validated with Qwen 3.8 Flash Next,
-install the matching vLLM weight-transfer hooks and select write-combined storage:
+To use the GB10 loader validated with Qwen 3.8 Flash Next,
+install the matching vLLM weight-transfer hooks:
 
 ```sh
-VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x \
-  --model-loader-extra-config '{"allocation":"pinned_wc","io_threads":8}'
+VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 ```
 
 The adapter uses vLLM's standard checkpoint-shard progress format and honors
-`use_tqdm_on_load` and rank-zero output. Write-combined storage remains pinned;
-it changes the CPU cache policy, not the ownership or direct-I/O contract.
+`use_tqdm_on_load` and rank-zero output. The loader always uses write-combined
+pinned storage for weights; no `allocation` option is needed or accepted.
+Write combining changes the CPU cache policy, not the ownership or direct-I/O
+contract.
 
 The adapter records contiguous destination views and submits packed native
 descriptors `(fd, offset, bytes, destination, operation)` in batches. Operations
@@ -44,13 +45,10 @@ scale validation, and final weight preparation. A failed batch drains all worker
 before reporting failure. Arbitrary consumers of queued parameter values require
 an explicit completion fence; this is an initial-load integration contract.
 
-`registered` uses anonymous mappings plus `cudaHostRegisterMapped`; `pinned`,
-`pinned_wc` and `managed` select separate allocation experiments. `pinned_wc`
-uses `cudaHostAllocMapped | cudaHostAllocWriteCombined` for weight destinations;
-select it with `--model-loader-extra-config '{"allocation":"pinned_wc"}'`.
-All pool allocations are also explicitly `mlock`ed. CUDA host registration on a host-page-table platform
-does not itself guarantee OS page locking. Failure to lock final storage fails
-the allocation. The initial adapter
+Weight destinations use `cudaHostAllocMapped | cudaHostAllocWriteCombined` and
+are explicitly `mlock`ed. Failure to lock final storage fails the allocation.
+Alternative mappings remain available to the allocation-qualification tools,
+outside the serving configuration. The initial adapter
 requires GPU host page tables and PyTorch's native CUDA allocator, and does
 not support vLLM sleep mode. It preserves index/prefix filtering, including
 MTP. Byte-preserving contiguous routes read into the CPU alias after synchronizing
